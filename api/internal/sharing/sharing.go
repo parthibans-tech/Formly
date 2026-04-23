@@ -7,7 +7,11 @@ import (
 	"net/http"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
+
+	"github.com/docforge/api/internal/audit"
 	"github.com/docforge/api/internal/auth"
+	"github.com/docforge/api/internal/events"
 	"github.com/docforge/api/internal/storage"
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -23,16 +27,23 @@ func New(db *pgxpool.Pool, s *storage.Client) *Handler {
 }
 
 type shareDTO struct {
-	ID        string     `json:"id"`
-	Token     string     `json:"token"`
-	Role      string     `json:"role"`
-	ExpiresAt *time.Time `json:"expiresAt,omitempty"`
-	CreatedAt time.Time  `json:"createdAt"`
+	ID               string     `json:"id"`
+	Token            string     `json:"token"`
+	Role             string     `json:"role"`
+	ExpiresAt        *time.Time `json:"expiresAt,omitempty"`
+	CreatedAt        time.Time  `json:"createdAt"`
+	PasswordProtect  bool       `json:"passwordProtected"`
+	OneTime          bool       `json:"oneTime"`
+	DownloadLimit    *int       `json:"downloadLimit,omitempty"`
+	DownloadCount    int        `json:"downloadCount"`
 }
 
 type createReq struct {
-	Role       string `json:"role"`       // viewer | downloader
-	ExpiresIn  int    `json:"expiresIn"`  // seconds; 0 = no expiry
+	Role          string `json:"role"`          // viewer | downloader
+	ExpiresIn     int    `json:"expiresIn"`     // seconds; 0 = no expiry
+	Password      string `json:"password"`      // optional; empty = no password
+	OneTime       bool   `json:"oneTime"`       // single-use link
+	DownloadLimit int    `json:"downloadLimit"` // 0 = unlimited
 }
 
 // Create issues a new share link for a file. The token is a URL-safe random string.
@@ -73,26 +84,62 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		expires = &t
 	}
 
+	var passwordHash *string
+	if req.Password != "" {
+		h2, err := bcrypt.GenerateFromPassword([]byte(req.Password), 12)
+		if err != nil {
+			writeErr(w, 500, "hash", err.Error())
+			return
+		}
+		s := string(h2)
+		passwordHash = &s
+	}
+	var dlLimit *int
+	if req.DownloadLimit > 0 {
+		n := req.DownloadLimit
+		dlLimit = &n
+	}
+
 	var id string
 	err = h.DB.QueryRow(r.Context(),
-		`INSERT INTO share_links (org_id, file_id, token, role, expires_at, created_by)
-		 VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+		`INSERT INTO share_links
+		   (org_id, file_id, token, role, expires_at, created_by,
+		    password_hash, one_time, download_limit)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
 		c.OrgID, fileID, token, req.Role, expires, c.UserID,
+		passwordHash, req.OneTime, dlLimit,
 	).Scan(&id)
 	if err != nil {
 		writeErr(w, 500, "db_error", err.Error())
 		return
 	}
-	writeJSON(w, 200, shareDTO{ID: id, Token: token, Role: req.Role, ExpiresAt: expires, CreatedAt: time.Now()})
+	audit.LogHTTP(r, h.DB, "share.create", "share", id, map[string]any{
+		"fileId":            fileID,
+		"role":              req.Role,
+		"expiresIn":         req.ExpiresIn,
+		"passwordProtected": passwordHash != nil,
+		"oneTime":           req.OneTime,
+		"downloadLimit":     req.DownloadLimit,
+	})
+	writeJSON(w, 200, shareDTO{
+		ID: id, Token: token, Role: req.Role,
+		ExpiresAt: expires, CreatedAt: time.Now(),
+		PasswordProtect: passwordHash != nil,
+		OneTime:         req.OneTime,
+		DownloadLimit:   dlLimit,
+	})
 }
 
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	c := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
 	fileID := chi.URLParam(r, "id")
 	rows, err := h.DB.Query(r.Context(),
-		`SELECT id, token, role, expires_at, created_at FROM share_links
-		 WHERE file_id=$1 AND org_id=$2 AND revoked_at IS NULL
-		 ORDER BY created_at DESC`, fileID, c.OrgID,
+		`SELECT id, token, role, expires_at, created_at,
+		        (password_hash IS NOT NULL), one_time,
+		        download_limit, download_count
+		   FROM share_links
+		  WHERE file_id=$1 AND org_id=$2 AND revoked_at IS NULL
+		  ORDER BY created_at DESC`, fileID, c.OrgID,
 	)
 	if err != nil {
 		writeErr(w, 500, "db_error", err.Error())
@@ -102,7 +149,10 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	out := []shareDTO{}
 	for rows.Next() {
 		var s shareDTO
-		if err := rows.Scan(&s.ID, &s.Token, &s.Role, &s.ExpiresAt, &s.CreatedAt); err != nil {
+		if err := rows.Scan(
+			&s.ID, &s.Token, &s.Role, &s.ExpiresAt, &s.CreatedAt,
+			&s.PasswordProtect, &s.OneTime, &s.DownloadLimit, &s.DownloadCount,
+		); err != nil {
 			writeErr(w, 500, "db_error", err.Error())
 			return
 		}
@@ -137,19 +187,100 @@ type publicResolveResp struct {
 	Role        string `json:"role"`
 }
 
-// Resolve is unauthenticated — resolves a share token into a pre-signed download URL.
-func (h *Handler) Resolve(w http.ResponseWriter, r *http.Request) {
+type publicInfoResp struct {
+	FileName           string     `json:"fileName"`
+	Mime               string     `json:"mime"`
+	Size               int64      `json:"size"`
+	Role               string     `json:"role"`
+	ExpiresAt          *time.Time `json:"expiresAt,omitempty"`
+	PasswordProtect    bool       `json:"passwordProtected"`
+	OneTime            bool       `json:"oneTime"`
+	DownloadsRemaining *int       `json:"downloadsRemaining,omitempty"`
+	Consumed           bool       `json:"consumed"`
+}
+
+// Info returns non-sensitive metadata about a share token (is a password
+// required? is it one-time? already used?). Does NOT return a download URL.
+func (h *Handler) Info(w http.ResponseWriter, r *http.Request) {
 	token := chi.URLParam(r, "token")
 	var (
+		name, mime, role string
+		size             int64
+		expiresAt, used  *time.Time
+		hasPassword      bool
+		oneTime          bool
+		dlLimit          *int
+		dlCount          int
+	)
+	err := h.DB.QueryRow(r.Context(), `
+		SELECT f.name, f.mime, f.size, s.role, s.expires_at, s.used_at,
+		       (s.password_hash IS NOT NULL),
+		       s.one_time, s.download_limit, s.download_count
+		  FROM share_links s JOIN files f ON f.id=s.file_id
+		 WHERE s.token=$1 AND s.revoked_at IS NULL AND f.trashed_at IS NULL`,
+		token,
+	).Scan(&name, &mime, &size, &role, &expiresAt, &used,
+		&hasPassword, &oneTime, &dlLimit, &dlCount)
+	if err != nil {
+		writeErr(w, 404, "not_found", "share not found or revoked")
+		return
+	}
+	resp := publicInfoResp{
+		FileName: name, Mime: mime, Size: size, Role: role,
+		ExpiresAt: expiresAt, PasswordProtect: hasPassword,
+		OneTime: oneTime, Consumed: oneTime && used != nil,
+	}
+	if dlLimit != nil {
+		remaining := *dlLimit - dlCount
+		if remaining < 0 {
+			remaining = 0
+		}
+		resp.DownloadsRemaining = &remaining
+	}
+	writeJSON(w, 200, resp)
+}
+
+type resolveReq struct {
+	Password string `json:"password"`
+	Action   string `json:"action"` // "view" | "download"
+}
+
+// Resolve is unauthenticated — resolves a share token into a pre-signed download URL.
+// Accepts an optional POST body with password + action.
+func (h *Handler) Resolve(w http.ResponseWriter, r *http.Request) {
+	token := chi.URLParam(r, "token")
+
+	var req resolveReq
+	if r.Method == http.MethodPost {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	} else {
+		req.Password = r.URL.Query().Get("password")
+		req.Action = r.URL.Query().Get("action")
+	}
+	if req.Action != "download" {
+		req.Action = "view"
+	}
+
+	var (
+		shareID, orgID, fileID       string
 		name, mime, storageKey, role string
 		size                         int64
-		expiresAt                    *time.Time
+		expiresAt, usedAt            *time.Time
+		passwordHash                 *string
+		oneTime                      bool
+		dlLimit                      *int
+		dlCount                      int
 	)
-	err := h.DB.QueryRow(r.Context(),
-		`SELECT f.name, f.mime, f.size, f.storage_key, s.role, s.expires_at
-		 FROM share_links s JOIN files f ON f.id=s.file_id
-		 WHERE s.token=$1 AND s.revoked_at IS NULL AND f.trashed_at IS NULL`, token,
-	).Scan(&name, &mime, &size, &storageKey, &role, &expiresAt)
+	err := h.DB.QueryRow(r.Context(), `
+		SELECT s.id, f.org_id, f.id, f.name, f.mime, f.size, f.storage_key,
+		       s.role, s.expires_at, s.used_at, s.password_hash,
+		       s.one_time, s.download_limit, s.download_count
+		  FROM share_links s JOIN files f ON f.id=s.file_id
+		 WHERE s.token=$1 AND s.revoked_at IS NULL AND f.trashed_at IS NULL`,
+		token,
+	).Scan(&shareID, &orgID, &fileID, &name, &mime, &size, &storageKey,
+		&role, &expiresAt, &usedAt, &passwordHash,
+		&oneTime, &dlLimit, &dlCount)
 	if err != nil {
 		writeErr(w, 404, "not_found", "share not found or revoked")
 		return
@@ -158,12 +289,76 @@ func (h *Handler) Resolve(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 410, "expired", "share link has expired")
 		return
 	}
+	if oneTime && usedAt != nil {
+		writeErr(w, 410, "consumed", "one-time link has already been used")
+		return
+	}
+	if dlLimit != nil && dlCount >= *dlLimit {
+		writeErr(w, 410, "limit_reached", "download limit reached")
+		return
+	}
+	if passwordHash != nil {
+		if req.Password == "" {
+			writeErr(w, 401, "password_required", "this link is password-protected")
+			return
+		}
+		if bcrypt.CompareHashAndPassword([]byte(*passwordHash), []byte(req.Password)) != nil {
+			writeErr(w, 401, "bad_password", "incorrect password")
+			return
+		}
+	}
+
 	url, err := h.Storage.PresignGet(r.Context(), storageKey, name, 10*time.Minute)
 	if err != nil {
 		writeErr(w, 500, "presign", err.Error())
 		return
 	}
+
+	// Log access + bump counters for download actions.
+	_, _ = h.DB.Exec(r.Context(),
+		`INSERT INTO share_access_log (share_id, file_id, ip_addr, user_agent, action)
+		 VALUES ($1, $2, $3::inet, NULLIF($4,''), $5)`,
+		shareID, fileID, cleanIP(clientIP(r)), r.UserAgent(), req.Action)
+
+	if req.Action == "download" {
+		_, _ = h.DB.Exec(r.Context(),
+			`UPDATE share_links
+			    SET download_count = download_count + 1,
+			        used_at = COALESCE(used_at, CASE WHEN one_time THEN now() END)
+			  WHERE id = $1`,
+			shareID)
+	}
+
+	events.Publish(r.Context(), events.ShareAccessed, orgID, map[string]interface{}{
+		"shareId":   shareID,
+		"fileId":    fileID,
+		"fileName":  name,
+		"role":      role,
+		"action":    req.Action,
+		"ip":        clientIP(r),
+		"userAgent": r.UserAgent(),
+	})
 	writeJSON(w, 200, publicResolveResp{FileName: name, Mime: mime, Size: size, DownloadURL: url, Role: role})
+}
+
+func cleanIP(ip string) string {
+	if ip == "" {
+		return "0.0.0.0"
+	}
+	// Strip port
+	for i := len(ip) - 1; i >= 0; i-- {
+		if ip[i] == ':' {
+			return ip[:i]
+		}
+	}
+	return ip
+}
+
+func clientIP(r *http.Request) string {
+	if v := r.Header.Get("X-Forwarded-For"); v != "" {
+		return v
+	}
+	return r.RemoteAddr
 }
 
 func randomToken(n int) (string, error) {

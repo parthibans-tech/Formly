@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/docforge/api/internal/auth"
+	"github.com/docforge/api/internal/events"
 	"github.com/docforge/api/internal/storage"
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -118,18 +119,56 @@ func (h *Handler) Complete(w http.ResponseWriter, r *http.Request) {
 			resp["templateId"] = tplID
 		}
 	}
+	events.Publish(r.Context(), events.FileUploaded, c.OrgID, map[string]interface{}{
+		"fileId":     id,
+		"name":       name,
+		"mime":       mime,
+		"size":       info.Size,
+		"templateId": resp["templateId"],
+	})
 	writeJSON(w, 200, resp)
 }
 
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	c := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
-	folder := r.URL.Query().Get("folder") // "" = root
-	rows, err := h.DB.Query(r.Context(),
-		`SELECT id, name, mime, size, status, template_id, folder_id, created_at FROM files
-		 WHERE org_id=$1 AND trashed_at IS NULL
-		   AND (($2='' AND folder_id IS NULL) OR folder_id::text=$2)
-		 ORDER BY created_at DESC`, c.OrgID, folder,
-	)
+	q := r.URL.Query()
+	view := q.Get("view")
+
+	var sql string
+	var args []any
+	switch view {
+	case "trashed":
+		sql = `SELECT id, name, mime, size, status, template_id, folder_id, created_at
+		       FROM files
+		       WHERE org_id=$1 AND trashed_at IS NOT NULL
+		       ORDER BY created_at DESC
+		       LIMIT 200`
+		args = []any{c.OrgID}
+	case "templates":
+		sql = `SELECT id, name, mime, size, status, template_id, folder_id, created_at
+		       FROM files
+		       WHERE org_id=$1 AND trashed_at IS NULL AND template_id IS NOT NULL
+		       ORDER BY created_at DESC
+		       LIMIT 200`
+		args = []any{c.OrgID}
+	case "recent":
+		sql = `SELECT id, name, mime, size, status, template_id, folder_id, created_at
+		       FROM files
+		       WHERE org_id=$1 AND trashed_at IS NULL
+		       ORDER BY created_at DESC
+		       LIMIT 50`
+		args = []any{c.OrgID}
+	default:
+		folder := q.Get("folder") // "" = root
+		sql = `SELECT id, name, mime, size, status, template_id, folder_id, created_at
+		       FROM files
+		       WHERE org_id=$1 AND trashed_at IS NULL
+		         AND (($2='' AND folder_id IS NULL) OR folder_id::text=$2)
+		       ORDER BY created_at DESC`
+		args = []any{c.OrgID, folder}
+	}
+
+	rows, err := h.DB.Query(r.Context(), sql, args...)
 	if err != nil {
 		writeErr(w, 500, "db_error", err.Error())
 		return
@@ -145,6 +184,26 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 		out = append(out, f)
 	}
 	writeJSON(w, 200, map[string]any{"files": out})
+}
+
+// Restore un-trashes a file that was soft-deleted via the Delete endpoint.
+func (h *Handler) Restore(w http.ResponseWriter, r *http.Request) {
+	c := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
+	id := chi.URLParam(r, "id")
+	tag, err := h.DB.Exec(r.Context(),
+		`UPDATE files SET trashed_at=NULL, updated_at=now()
+		 WHERE id=$1 AND org_id=$2 AND trashed_at IS NOT NULL`,
+		id, c.OrgID,
+	)
+	if err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		writeErr(w, 404, "not_found", "file not found or not trashed")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
 func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {

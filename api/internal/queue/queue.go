@@ -9,8 +9,9 @@ import (
 )
 
 const (
-	TaskGenerateOne   = "generate:one"
-	TaskGenerateBatch = "generate:batch"
+	TaskGenerateOne    = "generate:one"
+	TaskGenerateBatch  = "generate:batch"
+	TaskWebhookDeliver = "webhook:deliver"
 )
 
 // RedisAddr returns the Redis connection string (from env, default to localhost).
@@ -36,13 +37,16 @@ type GenerateOnePayload struct {
 	Flatten    bool                   `json:"flatten"`
 }
 
-// GenerateBatchPayload references a previously-uploaded CSV via MinIO key.
+// GenerateBatchPayload references a previously-uploaded tabular input via
+// MinIO key. `Kind` describes the format (csv | xlsx | tsv) so the worker
+// knows how to parse it.
 type GenerateBatchPayload struct {
 	JobID      string `json:"jobId"`
 	OrgID      string `json:"orgId"`
 	UserID     string `json:"userId"`
 	TemplateID string `json:"templateId"`
 	CSVKey     string `json:"csvKey"`
+	Kind       string `json:"kind,omitempty"` // csv (default) | xlsx | tsv
 	OutputName string `json:"outputName"`
 }
 
@@ -60,4 +64,22 @@ func NewGenerateBatch(p GenerateBatchPayload) (*asynq.Task, error) {
 		return nil, err
 	}
 	return asynq.NewTask(TaskGenerateBatch, b, asynq.MaxRetry(1)), nil
+}
+
+// WebhookDeliverPayload describes a single outgoing webhook attempt. The task
+// handler signs the body, POSTs it, records the result, and asynq's MaxRetry
+// mechanism drives exponential backoff on non-2xx responses.
+type WebhookDeliverPayload struct {
+	WebhookID string          `json:"webhookId"`
+	Event     string          `json:"event"`
+	Body      json.RawMessage `json:"body"`
+}
+
+func NewWebhookDeliver(p WebhookDeliverPayload) (*asynq.Task, error) {
+	b, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	// 5 retries with asynq's default exponential backoff (≈ 1m, 5m, 30m, 2h, 12h).
+	return asynq.NewTask(TaskWebhookDeliver, b, asynq.MaxRetry(5)), nil
 }

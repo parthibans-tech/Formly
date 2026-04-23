@@ -10,9 +10,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/docforge/api/internal/compute"
+	"github.com/docforge/api/internal/events"
 	"github.com/docforge/api/internal/generate/acroform"
 	ghtml "github.com/docforge/api/internal/generate/html"
+	gmarkdown "github.com/docforge/api/internal/generate/markdown"
 	gstatic "github.com/docforge/api/internal/generate/static"
+	"github.com/docforge/api/internal/i18n"
+	"github.com/docforge/api/internal/layout"
 	"github.com/docforge/api/internal/storage"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -52,6 +57,13 @@ func (r *Runner) Run(ctx context.Context, orgID, userID, templateID string, data
 		return nil, fmt.Errorf("load source pdf: %w", err)
 	}
 
+	pageLayout := layout.FromConfig(cfgRaw)
+	i18nCfg := i18n.FromConfig(cfgRaw)
+	locale := i18n.ResolveLocale(i18nCfg, data)
+
+	// Expand computed fields on top of the caller's data payload.
+	data, _ = compute.Eval(compute.FromConfig(cfgRaw), data)
+
 	var output []byte
 	switch mode {
 	case "acroform":
@@ -75,15 +87,20 @@ func (r *Runner) Run(ctx context.Context, orgID, userID, templateID string, data
 		if err != nil {
 			return nil, err
 		}
-		output, err = gstatic.Fill(pdfBytes, widgets, data)
+		output, err = gstatic.Fill(pdfBytes, widgets, data, pageLayout)
 		if err != nil {
 			return nil, fmt.Errorf("static fill: %w", err)
 		}
 	case "html":
 		// Source file contains the HTML template (pdfBytes is actually HTML bytes here).
-		output, err = ghtml.Render(ctx, string(pdfBytes), data)
+		output, err = ghtml.RenderWithLocale(ctx, string(pdfBytes), data, pageLayout, locale, i18nCfg)
 		if err != nil {
 			return nil, fmt.Errorf("html render: %w", err)
+		}
+	case "markdown":
+		output, err = gmarkdown.RenderWithLocale(ctx, string(pdfBytes), data, pageLayout, locale, i18nCfg)
+		if err != nil {
+			return nil, fmt.Errorf("markdown render: %w", err)
 		}
 	default:
 		return nil, fmt.Errorf("unsupported mode %q", mode)
@@ -106,6 +123,14 @@ func (r *Runner) Run(ctx context.Context, orgID, userID, templateID string, data
 	if err := r.Storage.PutBytes(ctx, outKey, "application/pdf", output); err != nil {
 		return nil, fmt.Errorf("upload output: %w", err)
 	}
+
+	events.Publish(ctx, events.GenerateCompleted, orgID, map[string]interface{}{
+		"templateId":   templateID,
+		"templateName": tplName,
+		"outputFileId": outFileID,
+		"outputName":   outName,
+		"bytes":        len(output),
+	})
 
 	return &Result{OutputFileID: outFileID, OutputKey: outKey, OutputName: outName, Bytes: len(output)}, nil
 }

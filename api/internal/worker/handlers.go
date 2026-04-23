@@ -5,11 +5,11 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
-	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 
+	"github.com/docforge/api/internal/batchdata"
 	"github.com/docforge/api/internal/generate"
 	"github.com/docforge/api/internal/jobs"
 	"github.com/docforge/api/internal/queue"
@@ -17,6 +17,7 @@ import (
 	"github.com/hibiken/asynq"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
 
 type Handlers struct {
 	DB      *pgxpool.Pool
@@ -58,23 +59,20 @@ func (h *Handlers) generateBatch(ctx context.Context, t *asynq.Task) error {
 	h.Log.Info("job started", "kind", "batch", "job", p.JobID)
 	_ = jobs.MarkRunning(ctx, h.DB, p.JobID)
 
-	csvBytes, err := h.Storage.GetBytes(ctx, p.CSVKey)
+	body, err := h.Storage.GetBytes(ctx, p.CSVKey)
 	if err != nil {
-		_ = jobs.MarkFailed(ctx, h.DB, p.JobID, "read csv: "+err.Error())
+		_ = jobs.MarkFailed(ctx, h.DB, p.JobID, "read input: "+err.Error())
 		return err
 	}
-	reader := csv.NewReader(bytes.NewReader(csvBytes))
-	rows, err := reader.ReadAll()
-	if err != nil || len(rows) < 2 {
-		msg := "csv must have a header row and at least one data row"
-		if err != nil {
-			msg = "parse csv: " + err.Error()
-		}
-		_ = jobs.MarkFailed(ctx, h.DB, p.JobID, msg)
-		return fmt.Errorf(msg)
+	kind := p.Kind
+	if kind == "" {
+		kind = "csv"
 	}
-	headers := rows[0]
-	dataRows := rows[1:]
+	headers, dataRows, err := batchdata.Parse(kind, body)
+	if err != nil {
+		_ = jobs.MarkFailed(ctx, h.DB, p.JobID, err.Error())
+		return err
+	}
 
 	_, _ = h.DB.Exec(ctx, `UPDATE generation_jobs SET total=$1 WHERE id=$2`, len(dataRows), p.JobID)
 

@@ -4,11 +4,14 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/docforge/api/internal/db"
 	"github.com/docforge/api/internal/generate"
 	"github.com/docforge/api/internal/queue"
+	"github.com/docforge/api/internal/scheduled"
 	"github.com/docforge/api/internal/storage"
+	"github.com/docforge/api/internal/webhooks"
 	"github.com/docforge/api/internal/worker"
 	"github.com/hibiken/asynq"
 	"github.com/joho/godotenv"
@@ -40,6 +43,34 @@ func main() {
 	})
 	mux := asynq.NewServeMux()
 	h.Register(mux)
+
+	// Webhook delivery task (retries via asynq exponential backoff).
+	whh := &webhooks.Handler{DB: pool}
+	mux.HandleFunc(queue.TaskWebhookDeliver, whh.ProcessDelivery)
+
+	// Scheduled-jobs tick: every minute, fan due schedules into generate tasks.
+	qc := asynq.NewClient(queue.ClientOpt())
+	sch := scheduled.New(pool, qc)
+	go func() {
+		ctx := context.Background()
+		tick := time.NewTicker(60 * time.Second)
+		defer tick.Stop()
+		// Fire immediately once at boot so short-interval schedules don't
+		// have to wait a full minute.
+		if n, err := sch.Tick(ctx); err == nil && n > 0 {
+			logger.Info("schedules fired", "count", n)
+		}
+		for range tick.C {
+			n, err := sch.Tick(ctx)
+			if err != nil {
+				logger.Error("schedule tick", "err", err)
+				continue
+			}
+			if n > 0 {
+				logger.Info("schedules fired", "count", n)
+			}
+		}
+	}()
 
 	logger.Info("worker listening", "redis", queue.RedisAddr())
 	if err := srv.Run(mux); err != nil {

@@ -22,12 +22,35 @@ type Claims struct {
 	UserID string `json:"uid"`
 	OrgID  string `json:"oid"`
 	Email  string `json:"email"`
+	Role   string `json:"role,omitempty"` // admin | editor | viewer
 	jwt.RegisteredClaims
 }
+
+// Role constants. Kept as exported values so other packages can reference them
+// without re-typing strings.
+const (
+	RoleAdmin  = "admin"
+	RoleEditor = "editor"
+	RoleViewer = "viewer"
+)
+
+// IsAdmin is a common gate — admin-only settings routes call this on the
+// claims attached to the request context.
+func (c *Claims) IsAdmin() bool { return c != nil && c.Role == RoleAdmin }
 
 type Handler struct {
 	DB     *pgxpool.Pool
 	Secret []byte
+
+	// Set by cmd/api after wiring up the security packages. Optional — if nil,
+	// MFA/sessions/audit are simply skipped (keeps tests/local dev working
+	// before the security migration is applied).
+	MFAChallengeRequired func(ctx context.Context, userID string) (bool, error)
+	MFAVerifyChallenge   func(ctx context.Context, userID, code string) bool
+	OnLogin              func(ctx context.Context, userID, orgID, token, ip, ua string)
+	OnLogout             func(ctx context.Context, token string)
+	SessionRevokedCheck  func(ctx context.Context, token string) bool
+	AuditFn              func(ctx context.Context, action, userID, orgID, email, ip, ua string, meta map[string]any)
 }
 
 func New(db *pgxpool.Pool) *Handler {
@@ -55,6 +78,7 @@ type user struct {
 	Email string `json:"email"`
 	Name  string `json:"name"`
 	OrgID string `json:"orgId"`
+	Role  string `json:"role,omitempty"`
 }
 
 func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
@@ -88,7 +112,8 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 	}
 	var userID string
 	if err := tx.QueryRow(ctx,
-		`INSERT INTO users (org_id, email, password_hash, name) VALUES ($1,$2,$3,$4) RETURNING id`,
+		`INSERT INTO users (org_id, email, password_hash, name, role)
+		 VALUES ($1,$2,$3,$4,'admin') RETURNING id`,
 		orgID, req.Email, string(hash), req.Name,
 	).Scan(&userID); err != nil {
 		writeErr(w, 400, "user_create", err.Error())
@@ -98,13 +123,16 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "commit", err.Error())
 		return
 	}
-	token, _ := h.issueToken(userID, orgID, req.Email)
-	writeJSON(w, 200, authResp{Token: token, User: user{ID: userID, Email: req.Email, Name: req.Name, OrgID: orgID}})
+	token, _ := h.issueToken(userID, orgID, req.Email, RoleAdmin)
+	writeJSON(w, 200, authResp{Token: token, User: user{
+		ID: userID, Email: req.Email, Name: req.Name, OrgID: orgID, Role: RoleAdmin,
+	}})
 }
 
 type loginReq struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
+	MFACode  string `json:"mfaCode"` // optional; supplied after a mfa_required challenge
 }
 
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
@@ -114,31 +142,94 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var (
-		id, orgID, name, hash string
+		id, orgID, name, hash, role string
 	)
 	err := h.DB.QueryRow(r.Context(),
-		`SELECT id, org_id, name, password_hash FROM users WHERE email=$1`, req.Email,
-	).Scan(&id, &orgID, &name, &hash)
+		`SELECT id, org_id, name, password_hash, COALESCE(role,'editor')
+		   FROM users WHERE email=$1`, req.Email,
+	).Scan(&id, &orgID, &name, &hash, &role)
 	if err != nil {
 		writeErr(w, 401, "invalid_credentials", "bad email or password")
 		return
 	}
 	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)) != nil {
+		h.audit(r, "auth.login.failed", "", "", req.Email,
+			map[string]any{"reason": "bad_password"})
 		writeErr(w, 401, "invalid_credentials", "bad email or password")
 		return
 	}
-	token, _ := h.issueToken(id, orgID, req.Email)
-	writeJSON(w, 200, authResp{Token: token, User: user{ID: id, Email: req.Email, Name: name, OrgID: orgID}})
+
+	// MFA challenge, if enrolled.
+	if h.MFAChallengeRequired != nil {
+		required, _ := h.MFAChallengeRequired(r.Context(), id)
+		if required {
+			if req.MFACode == "" {
+				writeJSON(w, 200, map[string]any{
+					"mfaRequired": true,
+					"userId":      id,
+				})
+				return
+			}
+			if h.MFAVerifyChallenge == nil || !h.MFAVerifyChallenge(r.Context(), id, req.MFACode) {
+				h.audit(r, "auth.login.mfa_failed", id, orgID, req.Email, nil)
+				writeErr(w, 401, "invalid_mfa", "invalid MFA code")
+				return
+			}
+		}
+	}
+
+	token, _ := h.issueToken(id, orgID, req.Email, role)
+	if h.OnLogin != nil {
+		h.OnLogin(r.Context(), id, orgID, token, clientIP(r), r.UserAgent())
+	}
+	h.audit(r, "auth.login", id, orgID, req.Email, nil)
+	writeJSON(w, 200, authResp{Token: token, User: user{
+		ID: id, Email: req.Email, Name: name, OrgID: orgID, Role: role,
+	}})
+}
+
+// Logout revokes the current session token (best-effort audit log too).
+func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
+	c, _ := r.Context().Value(UserCtxKey).(*Claims)
+	authz := r.Header.Get("Authorization")
+	token := strings.TrimPrefix(authz, "Bearer ")
+	if h.OnLogout != nil {
+		h.OnLogout(r.Context(), token)
+	}
+	if c != nil {
+		h.audit(r, "auth.logout", c.UserID, c.OrgID, c.Email, nil)
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+func (h *Handler) audit(r *http.Request, action, uid, oid, email string, meta map[string]any) {
+	if h.AuditFn == nil {
+		return
+	}
+	h.AuditFn(r.Context(), action, uid, oid, email, clientIP(r), r.UserAgent(), meta)
+}
+
+func clientIP(r *http.Request) string {
+	if v := r.Header.Get("X-Forwarded-For"); v != "" {
+		if i := strings.IndexByte(v, ','); i > 0 {
+			return strings.TrimSpace(v[:i])
+		}
+		return strings.TrimSpace(v)
+	}
+	if v := r.Header.Get("X-Real-IP"); v != "" {
+		return v
+	}
+	return r.RemoteAddr
 }
 
 func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
 	c, _ := r.Context().Value(UserCtxKey).(*Claims)
-	writeJSON(w, 200, user{ID: c.UserID, Email: c.Email, OrgID: c.OrgID})
+	writeJSON(w, 200, user{ID: c.UserID, Email: c.Email, OrgID: c.OrgID, Role: c.Role})
 }
 
-func (h *Handler) issueToken(uid, oid, email string) (string, error) {
+func (h *Handler) issueToken(uid, oid, email, role string) (string, error) {
 	c := Claims{
-		UserID: uid, OrgID: oid, Email: email,
+		UserID: uid, OrgID: oid, Email: email, Role: role,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
@@ -148,6 +239,30 @@ func (h *Handler) issueToken(uid, oid, email string) (string, error) {
 	return t.SignedString(h.Secret)
 }
 
+// IssueTokenForUser is used by the team-invite accept handler to hand the new
+// user a session token in the same shape Login produces.
+func (h *Handler) IssueTokenForUser(uid, oid, email, role string) (string, error) {
+	return h.issueToken(uid, oid, email, role)
+}
+
+// APIKeyVerifier resolves a raw API key into (userID, orgID, email, role).
+// Supplied by `cmd/api` to avoid an import cycle between auth and apikeys.
+type APIKeyVerifier func(r *http.Request, rawKey string) (userID, orgID, email, role string, err error)
+
+// APIKeyVerifier is registered at boot by cmd/api. Zero value means API-key
+// auth is disabled and only JWTs are accepted.
+var apiKeyVerifier APIKeyVerifier
+
+// RegisterAPIKeyVerifier installs the function the middleware will call to
+// validate API keys. Must be called before Middleware handles any request.
+func RegisterAPIKeyVerifier(fn APIKeyVerifier) {
+	apiKeyVerifier = fn
+}
+
+// APIKeyPrefix is the stable label that tells the middleware to dispatch to
+// the API key verifier instead of parsing as JWT.
+const APIKeyPrefix = "fk_"
+
 func (h *Handler) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authz := r.Header.Get("Authorization")
@@ -156,6 +271,25 @@ func (h *Handler) Middleware(next http.Handler) http.Handler {
 			return
 		}
 		raw := strings.TrimPrefix(authz, "Bearer ")
+
+		// API key path — short-circuit JWT parsing.
+		if strings.HasPrefix(raw, APIKeyPrefix) {
+			if apiKeyVerifier == nil {
+				writeErr(w, 401, "apikey_disabled", "api keys are not enabled")
+				return
+			}
+			uid, oid, email, role, err := apiKeyVerifier(r, raw)
+			if err != nil {
+				writeErr(w, 401, "invalid_api_key", err.Error())
+				return
+			}
+			claims := &Claims{UserID: uid, OrgID: oid, Email: email, Role: role}
+			ctx := context.WithValue(r.Context(), UserCtxKey, claims)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
+
+		// JWT path.
 		claims := &Claims{}
 		_, err := jwt.ParseWithClaims(raw, claims, func(t *jwt.Token) (interface{}, error) {
 			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
@@ -165,6 +299,11 @@ func (h *Handler) Middleware(next http.Handler) http.Handler {
 		})
 		if err != nil {
 			writeErr(w, 401, "invalid_token", err.Error())
+			return
+		}
+		// Session revocation check (short-circuits JWT validity).
+		if h.SessionRevokedCheck != nil && h.SessionRevokedCheck(r.Context(), raw) {
+			writeErr(w, 401, "session_revoked", "session has been revoked")
 			return
 		}
 		ctx := context.WithValue(r.Context(), UserCtxKey, claims)

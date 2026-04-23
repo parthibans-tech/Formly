@@ -1,2 +1,11 @@
+# env
 api/.env
-api/.env.example
+web/.env.local
+
+# node / next
+web/node_modules/
+web/.next/
+web/tsconfig.tsbuildinfo
+
+# misc
+.DS_Store

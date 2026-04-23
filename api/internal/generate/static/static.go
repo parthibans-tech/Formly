@@ -10,9 +10,16 @@ package static
 import (
 	"bytes"
 	"fmt"
+	"image/png"
 	"os"
 	"strings"
 
+	"github.com/boombuler/barcode"
+	"github.com/boombuler/barcode/code128"
+	"github.com/boombuler/barcode/code39"
+	"github.com/boombuler/barcode/ean"
+	"github.com/boombuler/barcode/qr"
+	"github.com/docforge/api/internal/layout"
 	"github.com/go-pdf/fpdf"
 	pdfcpuapi "github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/types"
@@ -31,8 +38,9 @@ type Widget struct {
 	Props   map[string]interface{} `json:"props"`
 }
 
-// Fill composites widget values onto the supplied source PDF.
-func Fill(pdfBytes []byte, widgets []Widget, data map[string]interface{}) ([]byte, error) {
+// Fill composites widget values onto the supplied source PDF. If layout has a
+// text watermark enabled, it is stamped on top of the output.
+func Fill(pdfBytes []byte, widgets []Widget, data map[string]interface{}, l *layout.Layout) ([]byte, error) {
 	pageDims, err := pageDimensions(pdfBytes)
 	if err != nil {
 		return nil, fmt.Errorf("probe pages: %w", err)
@@ -46,7 +54,54 @@ func Fill(pdfBytes []byte, widgets []Widget, data map[string]interface{}) ([]byt
 		return nil, fmt.Errorf("build overlay: %w", err)
 	}
 
-	return stampOverlay(pdfBytes, overlayBytes)
+	out, err := stampOverlay(pdfBytes, overlayBytes)
+	if err != nil {
+		return nil, err
+	}
+	if l != nil && l.Watermark.Enabled && l.Watermark.Text != "" {
+		out, err = stampTextWatermark(out, l.Watermark)
+		if err != nil {
+			return nil, fmt.Errorf("watermark: %w", err)
+		}
+	}
+	return out, nil
+}
+
+// stampTextWatermark adds a text watermark to every page using pdfcpu.
+func stampTextWatermark(src []byte, w layout.Watermark) ([]byte, error) {
+	srcPath, err := writeTemp("df-wm-src-*.pdf", src)
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(srcPath)
+	outPath, err := tempName("df-wm-out-*.pdf")
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(outPath)
+
+	op := w.Opacity
+	if op <= 0 {
+		op = 0.12
+	}
+	angle := w.Angle
+	if angle == 0 {
+		angle = -30
+	}
+	size := w.FontSize
+	if size <= 0 {
+		size = 120
+	}
+	// pdfcpu watermark description — keep concise, see pdfcpu docs for grammar.
+	desc := fmt.Sprintf("points:%d, rot:%d, opacity:%.2f, pos:c, sc:1", size, angle, op)
+	wmDef, err := pdfcpuapi.TextWatermark(w.Text, desc, true, false, types.POINTS)
+	if err != nil {
+		return nil, err
+	}
+	if err := pdfcpuapi.AddWatermarksFile(srcPath, outPath, nil, wmDef, nil); err != nil {
+		return nil, err
+	}
+	return os.ReadFile(outPath)
 }
 
 type pageDim struct {
@@ -134,6 +189,27 @@ func drawWidget(pdf *fpdf.Fpdf, wd Widget, p pageDim, data map[string]interface{
 			pdf.Line(wd.X+2, topY+2, wd.X+wd.W-2, topY+wd.H-2)
 			pdf.Line(wd.X+wd.W-2, topY+2, wd.X+2, topY+wd.H-2)
 		}
+	case "qr":
+		if value == "" {
+			return
+		}
+		imageName := fmt.Sprintf("qr-%s", wd.ID)
+		if err := registerQRImage(pdf, imageName, value); err != nil {
+			return
+		}
+		pdf.ImageOptions(imageName, wd.X, topY, wd.W, wd.H, false,
+			fpdf.ImageOptions{ImageType: "png"}, 0, "")
+	case "barcode":
+		if value == "" {
+			return
+		}
+		kind := stringProp(props, "barcodeKind", "code128")
+		imageName := fmt.Sprintf("bc-%s", wd.ID)
+		if err := registerBarcodeImage(pdf, imageName, value, kind, int(wd.W*4), int(wd.H*4)); err != nil {
+			return
+		}
+		pdf.ImageOptions(imageName, wd.X, topY, wd.W, wd.H, false,
+			fpdf.ImageOptions{ImageType: "png"}, 0, "")
 	default:
 		// Unknown type: render as text so authors can see the raw value and fix it.
 		pdf.SetXY(wd.X, topY)
@@ -248,6 +324,61 @@ func stringProp(p map[string]interface{}, key, def string) string {
 		return v
 	}
 	return def
+}
+
+// registerQRImage encodes a QR for `value` and registers it with fpdf under
+// `name` so drawWidget can stamp it onto the overlay. Image size is derived
+// from the widget; fpdf rescales on Image().
+func registerQRImage(pdf *fpdf.Fpdf, name, value string) error {
+	if pdf.ImageTypeFromMime(name) != "" {
+		// Already registered.
+		return nil
+	}
+	code, err := qr.Encode(value, qr.M, qr.Auto)
+	if err != nil {
+		return err
+	}
+	scaled, err := barcode.Scale(code, 400, 400)
+	if err != nil {
+		return err
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, scaled); err != nil {
+		return err
+	}
+	pdf.RegisterImageOptionsReader(name,
+		fpdf.ImageOptions{ImageType: "png", ReadDpi: false},
+		bytes.NewReader(buf.Bytes()))
+	return nil
+}
+
+// registerBarcodeImage encodes a 1-D barcode image and registers it with fpdf.
+func registerBarcodeImage(pdf *fpdf.Fpdf, name, value, kind string, w, h int) error {
+	var code barcode.Barcode
+	var err error
+	switch strings.ToLower(kind) {
+	case "code39":
+		code, err = code39.Encode(strings.ToUpper(value), true, true)
+	case "ean13", "ean8":
+		code, err = ean.Encode(value)
+	default:
+		code, err = code128.Encode(value)
+	}
+	if err != nil {
+		return err
+	}
+	scaled, err := barcode.Scale(code, w, h)
+	if err != nil {
+		return err
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, scaled); err != nil {
+		return err
+	}
+	pdf.RegisterImageOptionsReader(name,
+		fpdf.ImageOptions{ImageType: "png", ReadDpi: false},
+		bytes.NewReader(buf.Bytes()))
+	return nil
 }
 
 func hexToRGB(h string) (int, int, int) {

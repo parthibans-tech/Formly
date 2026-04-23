@@ -1,2 +1,8 @@
 /** @type {import('next').NextConfig} */
-module.exports = { reactStrictMode: true };
+module.exports = {
+  reactStrictMode: true,
+  webpack: (config) => {
+    config.resolve.alias.canvas = false;
+    return config;
+  },
+};

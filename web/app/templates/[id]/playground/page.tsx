@@ -2,11 +2,38 @@
 import { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
+import {
+  ArrowLeft,
+  PencilLine,
+  PlayCircle,
+  Save,
+  Sparkles,
+  Trash2,
+  Wand2,
+} from "lucide-react";
 import { api, getToken } from "@/lib/api";
 import { useToast } from "@/components/toast";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Separator } from "@/components/ui/separator";
+import { Skeleton } from "@/components/ui/skeleton";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { useConfirm } from "@/components/ui/confirm";
+import { usePrompt } from "@/components/ui/prompt";
 
 type Field = { name: string; type: string; page: number };
-type Mapping = { dataKey: string; default?: string; required?: boolean; transform?: string };
+type Mapping = {
+  dataKey: string;
+  default?: string;
+  required?: boolean;
+  transform?: string;
+};
 type Template = {
   id: string;
   name: string;
@@ -20,6 +47,8 @@ export default function PlaygroundPage() {
   const router = useRouter();
   const params = useParams<{ id: string }>();
   const toast = useToast();
+  const confirm = useConfirm();
+  const prompt = usePrompt();
 
   const [tpl, setTpl] = useState<Template | null>(null);
   const [sets, setSets] = useState<MockSet[]>([]);
@@ -49,7 +78,9 @@ export default function PlaygroundPage() {
   }, [params.id, router]);
 
   function dataKeys(t: Template) {
-    return t.fields.map((f) => t.config?.mappings?.[f.name]?.dataKey || f.name);
+    return t.fields.map(
+      (f) => t.config?.mappings?.[f.name]?.dataKey || f.name
+    );
   }
 
   function skeleton(t: Template) {
@@ -70,10 +101,10 @@ export default function PlaygroundPage() {
     setRunning(true);
     try {
       const data = JSON.parse(jsonText);
-      const res = await api<{ downloadUrl: string }>(`/v1/templates/${tpl.id}/generate`, {
-        method: "POST",
-        body: JSON.stringify({ data }),
-      });
+      const res = await api<{ downloadUrl: string }>(
+        `/v1/templates/${tpl.id}/generate`,
+        { method: "POST", body: JSON.stringify({ data }) }
+      );
       setPreviewUrl(res.downloadUrl);
       toast.show("success", "Rendered");
     } catch (e: any) {
@@ -91,7 +122,14 @@ export default function PlaygroundPage() {
 
   async function savePreset() {
     if (!tpl) return;
-    const name = prompt("Preset name", "Sample 1");
+    const name = await prompt({
+      title: "Save preset",
+      label: "Preset name",
+      placeholder: "e.g. Sample invoice",
+      defaultValue: "Sample 1",
+      confirmLabel: "Save",
+      validate: (v) => (v.trim().length < 1 ? "Name is required" : null),
+    });
     if (!name) return;
     try {
       const data = JSON.parse(jsonText);
@@ -99,7 +137,9 @@ export default function PlaygroundPage() {
         method: "POST",
         body: JSON.stringify({ name, data }),
       });
-      const s = await api<{ sets: MockSet[] }>(`/v1/templates/${tpl.id}/mock-data`);
+      const s = await api<{ sets: MockSet[] }>(
+        `/v1/templates/${tpl.id}/mock-data`
+      );
       setSets(s.sets);
       toast.show("success", `Saved "${name}"`);
     } catch (e: any) {
@@ -109,9 +149,17 @@ export default function PlaygroundPage() {
 
   async function deletePreset() {
     if (!tpl || !selectedSet) return;
-    if (!confirm("Delete this preset?")) return;
+    const ok = await confirm({
+      title: "Delete this preset?",
+      description: "This can't be undone.",
+      confirmLabel: "Delete",
+      destructive: true,
+    });
+    if (!ok) return;
     try {
-      await api(`/v1/templates/${tpl.id}/mock-data/${selectedSet}`, { method: "DELETE" });
+      await api(`/v1/templates/${tpl.id}/mock-data/${selectedSet}`, {
+        method: "DELETE",
+      });
       setSets(sets.filter((s) => s.id !== selectedSet));
       setSelectedSet("");
       toast.show("success", "Preset deleted");
@@ -125,67 +173,115 @@ export default function PlaygroundPage() {
     setJsonText(JSON.stringify(fakeFor(tpl), null, 2));
   }
 
-  if (!tpl) return <div className="min-h-screen grid place-items-center text-gray-500">Loading…</div>;
+  if (!tpl) {
+    return (
+      <div className="mx-auto max-w-7xl space-y-4 px-6 py-10">
+        <Skeleton className="h-8 w-64" />
+        <Skeleton className="h-96 w-full" />
+      </div>
+    );
+  }
 
   return (
-    <div className="min-h-screen flex flex-col">
-      <header className="bg-white border-b px-6 py-3 flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <Link href="/drive" className="text-blue-600 hover:underline text-sm">← Drive</Link>
-          <h1 className="font-semibold">{tpl.name}</h1>
-          <span className="text-xs uppercase tracking-wide bg-gray-100 px-2 py-0.5 rounded">Playground</span>
+    <div className="flex min-h-screen flex-col">
+      <header className="sticky top-0 z-40 border-b bg-background/80 px-4 md:px-6 py-3 backdrop-blur supports-[backdrop-filter]:bg-background/60">
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3 min-w-0">
+            <Button variant="ghost" size="sm" asChild>
+              <Link href="/drive">
+                <ArrowLeft className="h-4 w-4" />
+                Drive
+              </Link>
+            </Button>
+            <Separator orientation="vertical" className="h-6" />
+            <div className="min-w-0">
+              <h1 className="truncate text-sm font-semibold">{tpl.name}</h1>
+              <div className="flex items-center gap-2">
+                <Badge variant="outline" className="uppercase text-[10px]">
+                  <Sparkles className="h-3 w-3" />
+                  Playground
+                </Badge>
+              </div>
+            </div>
+          </div>
+          <Button variant="ghost" size="sm" asChild>
+            <Link href={`/templates/${tpl.id}/designer`}>
+              <PencilLine className="h-4 w-4" />
+              Open designer
+            </Link>
+          </Button>
         </div>
-        <Link href={`/templates/${tpl.id}/designer`} className="text-sm text-blue-600 hover:underline">
-          Open designer
-        </Link>
       </header>
 
-      <div className="flex-1 flex min-h-0">
-        <section className="w-1/2 flex flex-col border-r bg-white min-h-0">
-          <div className="px-4 py-2 border-b flex items-center gap-2 text-sm">
-            <select
-              value={selectedSet}
-              onChange={(e) => loadPreset(e.target.value)}
-              className="border rounded px-2 py-1 text-sm"
-            >
-              <option value="">Load preset…</option>
-              {sets.map((s) => (
-                <option key={s.id} value={s.id}>{s.name}</option>
-              ))}
-            </select>
-            <button onClick={savePreset} className="px-2 py-1 border rounded hover:bg-gray-50">Save as…</button>
+      <div className="flex flex-1 min-h-0">
+        <section className="flex w-1/2 flex-col border-r bg-background min-h-0">
+          <div className="flex flex-wrap items-center gap-2 border-b px-4 py-2 text-sm">
+            <Select value={selectedSet} onValueChange={loadPreset}>
+              <SelectTrigger className="w-[200px] h-8">
+                <SelectValue placeholder="Load preset…" />
+              </SelectTrigger>
+              <SelectContent>
+                {sets.length === 0 ? (
+                  <div className="px-2 py-1.5 text-xs text-muted-foreground">
+                    No presets saved yet
+                  </div>
+                ) : (
+                  sets.map((s) => (
+                    <SelectItem key={s.id} value={s.id}>
+                      {s.name}
+                    </SelectItem>
+                  ))
+                )}
+              </SelectContent>
+            </Select>
+            <Button size="sm" variant="outline" onClick={savePreset}>
+              <Save className="h-4 w-4" />
+              Save as…
+            </Button>
             {selectedSet && (
-              <button onClick={deletePreset} className="px-2 py-1 text-red-600 border rounded hover:bg-red-50">
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={deletePreset}
+                className="text-destructive hover:text-destructive"
+              >
+                <Trash2 className="h-4 w-4" />
                 Delete
-              </button>
+              </Button>
             )}
-            <button onClick={fillFake} className="px-2 py-1 border rounded hover:bg-gray-50">
-              Fill with fake data
-            </button>
+            <Button size="sm" variant="ghost" onClick={fillFake}>
+              <Wand2 className="h-4 w-4" />
+              Fake data
+            </Button>
             <div className="flex-1" />
-            <button
-              onClick={run}
-              disabled={running}
-              className="px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
-            >
-              {running ? "Rendering…" : "Run ▶"}
-            </button>
+            <Button size="sm" onClick={run} loading={running}>
+              <PlayCircle className="h-4 w-4" />
+              Run
+            </Button>
           </div>
           <textarea
             value={jsonText}
             onChange={(e) => setJsonText(e.target.value)}
             spellCheck={false}
-            className="flex-1 font-mono text-xs p-4 resize-none outline-none"
+            className="flex-1 resize-none bg-background p-4 font-mono text-xs outline-none"
             placeholder='{"field": "value"}'
           />
         </section>
 
-        <section className="w-1/2 bg-gray-100 min-h-0">
+        <section className="w-1/2 bg-muted/40 min-h-0">
           {previewUrl ? (
-            <iframe src={previewUrl} className="w-full h-full bg-white" title="Preview" />
+            <iframe
+              src={previewUrl}
+              className="h-full w-full bg-background"
+              title="Preview"
+            />
           ) : (
-            <div className="h-full grid place-items-center text-sm text-gray-500">
-              Press <kbd className="mx-1 px-1.5 py-0.5 bg-white rounded border">Run ▶</kbd> to render preview
+            <div className="grid h-full place-items-center px-6 text-center text-sm text-muted-foreground">
+              Press{" "}
+              <kbd className="mx-1 rounded border bg-background px-1.5 py-0.5">
+                Run
+              </kbd>{" "}
+              to render a preview
             </div>
           )}
         </section>

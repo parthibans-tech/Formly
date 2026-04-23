@@ -7,6 +7,10 @@ import "react-pdf/dist/esm/Page/TextLayer.css";
 import { api, pollJob } from "@/lib/api";
 import { useToast } from "@/components/toast";
 import { browserToPdf, pdfToBrowser, PageInfo } from "@/lib/pdf-coords";
+import { PageLayoutDialog } from "@/components/page-layout-dialog";
+import { BatchDialog } from "@/components/batch-dialog";
+import type { PageLayout } from "@/lib/layout";
+import { Settings2 } from "lucide-react";
 
 pdfjs.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.js`;
 
@@ -29,6 +33,7 @@ type Template = {
   mode: string;
   version: number;
   widgets: Widget[];
+  config?: { pageLayout?: PageLayout; [key: string]: any };
 };
 
 type Props = {
@@ -43,6 +48,8 @@ const PALETTE: { type: Widget["type"]; label: string; defaultW: number; defaultH
   { type: "number", label: "Number", defaultW: 90, defaultH: 18 },
   { type: "currency", label: "Currency", defaultW: 120, defaultH: 18 },
   { type: "checkbox", label: "Checkbox", defaultW: 16, defaultH: 16 },
+  { type: "qr", label: "QR code", defaultW: 80, defaultH: 80 },
+  { type: "barcode", label: "Barcode", defaultW: 160, defaultH: 48 },
 ];
 
 const SCALE = 1.5;
@@ -60,6 +67,28 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
   const [genBusy, setGenBusy] = useState(false);
   const [genProgress, setGenProgress] = useState<string | null>(null);
   const [batchBusy, setBatchBusy] = useState<string | null>(null);
+  const [batchOpen, setBatchOpen] = useState(false);
+  const [layoutOpen, setLayoutOpen] = useState(false);
+  const [savingLayout, setSavingLayout] = useState(false);
+  const [currentConfig, setCurrentConfig] = useState(tpl.config || {});
+
+  async function savePageLayout(next: PageLayout) {
+    setSavingLayout(true);
+    try {
+      const merged = { ...currentConfig, pageLayout: next };
+      await api(`/v1/templates/${tpl.id}/config`, {
+        method: "PUT",
+        body: JSON.stringify({ config: merged }),
+      });
+      setCurrentConfig(merged);
+      toast.show("success", "Page layout saved");
+      setLayoutOpen(false);
+    } catch (e: any) {
+      toast.show("error", e.message);
+    } finally {
+      setSavingLayout(false);
+    }
+  }
 
   const pageRefs = useRef<Record<number, HTMLDivElement | null>>({});
 
@@ -333,7 +362,19 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
           <Link href={`/templates/${tpl.id}/playground`} className="text-sm text-blue-600 hover:underline">
             Playground
           </Link>
-          <StaticBatchButton busy={batchBusy} onFile={runBatch} />
+          <button
+            onClick={() => setBatchOpen(true)}
+            className="inline-flex items-center gap-1.5 px-3 py-2 text-sm border rounded hover:bg-gray-50"
+          >
+            Batch
+          </button>
+          <button
+            onClick={() => setLayoutOpen(true)}
+            className="inline-flex items-center gap-1.5 px-3 py-2 text-sm border rounded hover:bg-gray-50"
+          >
+            <Settings2 className="h-4 w-4" />
+            Layout
+          </button>
           <button onClick={save} disabled={saving} className="px-4 py-2 text-sm border rounded hover:bg-gray-50 disabled:opacity-50">
             {saving ? "Saving…" : "Save layout"}
           </button>
@@ -362,7 +403,7 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
             {Array.from({ length: numPages }, (_, i) => i + 1).map((pageNum) => (
               <div
                 key={pageNum}
-                ref={(el) => (pageRefs.current[pageNum] = el)}
+                ref={(el) => { pageRefs.current[pageNum] = el; }}
                 onDragOver={onPageDragOver}
                 onDrop={(e) => onPageDrop(e, pageNum)}
                 className="relative mx-auto mb-6 shadow-lg"
@@ -455,34 +496,65 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
                 </Field>
               </div>
 
-              {selected.type !== "checkbox" && (
-                <>
-                  <Field label="Font size">
-                    <NumInput
-                      value={selected.props?.fontSize ?? 12}
-                      onChange={(v) => updateSelectedProp("fontSize", v)}
-                    />
-                  </Field>
-                  <Field label="Color">
-                    <input
-                      type="color"
-                      className="w-full h-8 border rounded"
-                      value={selected.props?.color || "#111827"}
-                      onChange={(e) => updateSelectedProp("color", e.target.value)}
-                    />
-                  </Field>
-                  <Field label="Alignment">
-                    <select
-                      className="w-full border rounded px-2 py-1 text-sm"
-                      value={selected.props?.align || "L"}
-                      onChange={(e) => updateSelectedProp("align", e.target.value)}
-                    >
-                      <option value="L">Left</option>
-                      <option value="C">Center</option>
-                      <option value="R">Right</option>
-                    </select>
-                  </Field>
-                </>
+              {selected.type !== "checkbox" &&
+                selected.type !== "qr" &&
+                selected.type !== "barcode" && (
+                  <>
+                    <Field label="Font size">
+                      <NumInput
+                        value={selected.props?.fontSize ?? 12}
+                        onChange={(v) => updateSelectedProp("fontSize", v)}
+                      />
+                    </Field>
+                    <Field label="Color">
+                      <input
+                        type="color"
+                        className="w-full h-8 border rounded"
+                        value={selected.props?.color || "#111827"}
+                        onChange={(e) =>
+                          updateSelectedProp("color", e.target.value)
+                        }
+                      />
+                    </Field>
+                    <Field label="Alignment">
+                      <select
+                        className="w-full border rounded px-2 py-1 text-sm"
+                        value={selected.props?.align || "L"}
+                        onChange={(e) =>
+                          updateSelectedProp("align", e.target.value)
+                        }
+                      >
+                        <option value="L">Left</option>
+                        <option value="C">Center</option>
+                        <option value="R">Right</option>
+                      </select>
+                    </Field>
+                  </>
+                )}
+
+              {selected.type === "barcode" && (
+                <Field label="Barcode kind">
+                  <select
+                    className="w-full border rounded px-2 py-1 text-sm"
+                    value={selected.props?.barcodeKind || "code128"}
+                    onChange={(e) =>
+                      updateSelectedProp("barcodeKind", e.target.value)
+                    }
+                  >
+                    <option value="code128">Code 128</option>
+                    <option value="code39">Code 39</option>
+                    <option value="ean13">EAN-13</option>
+                    <option value="ean8">EAN-8</option>
+                  </select>
+                </Field>
+              )}
+
+              {(selected.type === "qr" || selected.type === "barcode") && (
+                <p className="rounded bg-muted/30 p-2 text-[10px] text-muted-foreground">
+                  The <code>dataKey</code> value in the payload encodes the{" "}
+                  {selected.type === "qr" ? "QR" : "barcode"} image at render
+                  time.
+                </p>
               )}
 
               <button
@@ -544,6 +616,21 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
           </div>
         </div>
       )}
+
+      <PageLayoutDialog
+        open={layoutOpen}
+        onOpenChange={setLayoutOpen}
+        value={currentConfig?.pageLayout}
+        onSave={savePageLayout}
+        supportsHeaderFooter={false}
+        busy={savingLayout}
+      />
+
+      <BatchDialog
+        open={batchOpen}
+        onOpenChange={setBatchOpen}
+        templateId={tpl.id}
+      />
     </div>
   );
 }
@@ -578,6 +665,10 @@ function defaultProps(type: string): Record<string, any> {
       return { color: "#111827" };
     case "multiline":
       return { fontSize: 11, fontFamily: "Helvetica", color: "#111827", align: "L" };
+    case "qr":
+      return {};
+    case "barcode":
+      return { barcodeKind: "code128" };
     default:
       return { fontSize: 12, fontFamily: "Helvetica", color: "#111827", align: "L" };
   }

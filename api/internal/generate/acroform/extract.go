@@ -33,15 +33,15 @@ func Extract(data []byte) ([]Field, error) {
 			page = f.Pages[0]
 		}
 		var opts []string
-		if f.Options != "" {
-			opts = []string{f.Options}
+		if f.Opts != "" {
+			opts = []string{f.Opts}
 		}
 		out = append(out, Field{
 			Name:    f.Name,
 			Type:    fmt.Sprint(f.Typ),
 			Page:    page,
-			Default: f.Default,
-			Value:   f.Value,
+			Default: f.Dv,
+			Value:   f.V,
 			Options: opts,
 			Locked:  f.Locked,
 		})

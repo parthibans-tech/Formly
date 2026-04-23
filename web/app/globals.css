@@ -2,4 +2,146 @@
 @tailwind components;
 @tailwind utilities;
 
-body { font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; }
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 222 47% 11%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+
+    --primary: 160 84% 36%;
+    --primary-foreground: 150 100% 98%;
+
+    --secondary: 210 20% 97%;
+    --secondary-foreground: 222 47% 11%;
+
+    --muted: 210 20% 97%;
+    --muted-foreground: 215 16% 47%;
+
+    --accent: 210 20% 96%;
+    --accent-foreground: 222 47% 11%;
+
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+
+    --success: 142 71% 40%;
+    --success-foreground: 0 0% 100%;
+
+    --warning: 32 95% 44%;
+    --warning-foreground: 30 100% 12%;
+
+    --border: 214 32% 91%;
+    --input: 214 32% 91%;
+    --ring: 160 84% 36%;
+
+    --radius: 0.5rem;
+
+    --shadow-subtle: 0 1px 2px 0 rgb(15 23 42 / 0.04);
+    --shadow-card: 0 1px 3px 0 rgb(15 23 42 / 0.06),
+      0 1px 2px -1px rgb(15 23 42 / 0.04);
+    --shadow-elevated: 0 10px 38px -10px rgb(15 23 42 / 0.12),
+      0 10px 20px -15px rgb(15 23 42 / 0.08);
+  }
+
+  .dark {
+    --background: 224 40% 6%;
+    --foreground: 210 20% 96%;
+
+    --card: 224 38% 8%;
+    --card-foreground: 210 20% 96%;
+
+    --popover: 224 40% 7%;
+    --popover-foreground: 210 20% 96%;
+
+    --primary: 160 84% 45%;
+    --primary-foreground: 160 100% 8%;
+
+    --secondary: 222 30% 14%;
+    --secondary-foreground: 210 20% 96%;
+
+    --muted: 222 30% 14%;
+    --muted-foreground: 217 14% 64%;
+
+    --accent: 222 30% 16%;
+    --accent-foreground: 210 20% 96%;
+
+    --destructive: 0 72% 55%;
+    --destructive-foreground: 0 0% 100%;
+
+    --success: 142 60% 50%;
+    --success-foreground: 0 0% 100%;
+
+    --warning: 38 92% 55%;
+    --warning-foreground: 30 100% 12%;
+
+    --border: 222 30% 18%;
+    --input: 222 30% 18%;
+    --ring: 160 84% 45%;
+
+    --shadow-subtle: 0 1px 2px 0 rgb(0 0 0 / 0.3);
+    --shadow-card: 0 1px 3px 0 rgb(0 0 0 / 0.4), 0 1px 2px -1px rgb(0 0 0 / 0.3);
+    --shadow-elevated: 0 10px 38px -10px rgb(0 0 0 / 0.6),
+      0 10px 20px -15px rgb(0 0 0 / 0.4);
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  html,
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "cv11", "ss01";
+  }
+  :focus-visible {
+    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
+  }
+}
+
+@layer utilities {
+  .scrollbar-thin {
+    scrollbar-width: thin;
+  }
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: hsl(var(--border));
+    border-radius: 4px;
+  }
+
+  .shadow-subtle {
+    box-shadow: var(--shadow-subtle);
+  }
+  .shadow-card {
+    box-shadow: var(--shadow-card);
+  }
+  .shadow-elevated {
+    box-shadow: var(--shadow-elevated);
+  }
+
+  /* Kbd-style keyboard hint */
+  .kbd {
+    @apply inline-flex h-5 min-w-5 items-center justify-center rounded border border-border bg-muted px-1 font-mono text-[10px] font-medium text-muted-foreground shadow-subtle;
+  }
+
+  /* Subtle surface gradient used for hero/stat cards */
+  .surface-gradient {
+    background-image: radial-gradient(
+        circle at 0% 0%,
+        hsl(var(--primary) / 0.06),
+        transparent 50%
+      ),
+      radial-gradient(
+        circle at 100% 100%,
+        hsl(var(--primary) / 0.04),
+        transparent 40%
+      );
+  }
+}

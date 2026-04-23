@@ -1,38 +1,29 @@
 "use client";
-import { createContext, useCallback, useContext, useEffect, useState } from "react";
+// Backward-compatible shim over the shadcn toast system.
+// Existing call sites `useToast().show("success" | "error" | "info", text)` continue to work.
 
-type Toast = { id: number; kind: "success" | "error" | "info"; text: string };
-type Ctx = { show: (kind: Toast["kind"], text: string) => void };
+import { toast as shadcnToast } from "@/hooks/use-toast";
 
-const ToastCtx = createContext<Ctx>({ show: () => {} });
+type Kind = "success" | "error" | "info";
+
+const kindToVariant = {
+  success: "success",
+  error: "destructive",
+  info: "info",
+} as const;
 
 export function ToastProvider({ children }: { children: React.ReactNode }) {
-  const [toasts, setToasts] = useState<Toast[]>([]);
-  const show = useCallback((kind: Toast["kind"], text: string) => {
-    const id = Date.now() + Math.random();
-    setToasts((prev) => [...prev, { id, kind, text }]);
-    setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 3500);
-  }, []);
-  return (
-    <ToastCtx.Provider value={{ show }}>
-      {children}
-      <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-2">
-        {toasts.map((t) => (
-          <div
-            key={t.id}
-            className={
-              "rounded-md shadow-lg px-4 py-2 text-sm text-white " +
-              (t.kind === "success" ? "bg-green-600" : t.kind === "error" ? "bg-red-600" : "bg-gray-800")
-            }
-          >
-            {t.text}
-          </div>
-        ))}
-      </div>
-    </ToastCtx.Provider>
-  );
+  return <>{children}</>;
 }
 
 export function useToast() {
-  return useContext(ToastCtx);
+  return {
+    show(kind: Kind, text: string, opts?: { description?: string }) {
+      shadcnToast({
+        variant: kindToVariant[kind],
+        title: text,
+        description: opts?.description,
+      });
+    },
+  };
 }
