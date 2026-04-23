@@ -10,6 +10,7 @@ import {
   Mail,
   PencilLine,
   Plus,
+  ShieldOff,
   Trash2,
   Users,
 } from "lucide-react";
@@ -167,6 +168,31 @@ export default function TeamSettingsPage() {
     }
   }
 
+  async function resetMFA(m: Member) {
+    const ok = await confirm({
+      title: `Reset 2FA for ${m.name || m.email}?`,
+      description:
+        "Their current authenticator and recovery codes will stop working. They'll sign in with just their password and can re-enroll from Security settings. Use only when they've lost access to their device.",
+      confirmLabel: "Reset 2FA",
+      destructive: true,
+    });
+    if (!ok) return;
+    try {
+      const r = await api<{ hadMFA: boolean }>(
+        `/v1/team/members/${m.id}/reset-mfa`,
+        { method: "POST" }
+      );
+      toast.show(
+        "success",
+        r.hadMFA
+          ? `2FA reset for ${m.email}`
+          : `${m.email} didn't have 2FA enabled`
+      );
+    } catch (e: any) {
+      toast.show("error", e.message);
+    }
+  }
+
   async function removeMember(m: Member) {
     const ok = await confirm({
       title: `Remove ${m.name || m.email}?`,
@@ -297,6 +323,16 @@ export default function TeamSettingsPage() {
                             ))}
                           </SelectContent>
                         </Select>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          onClick={() => resetMFA(m)}
+                          aria-label="Reset two-factor authentication"
+                          title="Reset 2FA (use when a teammate has lost their authenticator device)"
+                          className="text-muted-foreground hover:text-amber-600"
+                        >
+                          <ShieldOff className="h-4 w-4" />
+                        </Button>
                         <Button
                           variant="ghost"
                           size="icon"

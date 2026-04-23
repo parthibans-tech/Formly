@@ -12,6 +12,8 @@ import {
   Globe,
   Globe2,
   History,
+  Keyboard,
+  LayoutGrid,
   Mail,
   PlayCircle,
   Save,
@@ -52,6 +54,11 @@ import { CollabDrawer } from "@/components/collab-drawer";
 import type { PageLayout } from "@/lib/layout";
 import { cn } from "@/lib/utils";
 import { MessageSquare } from "lucide-react";
+import {
+  CommandPalette,
+  type Command,
+} from "@/components/designer/command-palette";
+import { ShortcutHelp, modSymbol } from "@/components/designer/shortcut-help";
 
 // BlockNote can't SSR — ProseMirror accesses `window` on import.
 const BlockEditor = dynamic(
@@ -111,6 +118,11 @@ export default function HtmlDesigner({ tpl: initialTpl }: Props) {
   const [sendOpen, setSendOpen] = useState(false);
   const [collabOpen, setCollabOpen] = useState(false);
   const previewTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [autoSave, setAutoSave] = useState(true);
+  const [lastSavedAt, setLastSavedAt] = useState<Date | null>(null);
+  const codeTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -260,8 +272,84 @@ export default function HtmlDesigner({ tpl: initialTpl }: Props) {
       }
     } finally {
       setSaving(false);
+      setLastSavedAt(new Date());
     }
   }
+
+  // Insert a placeholder at the cursor position in the code-mode textarea.
+  // Falls back to appending if no textarea is focused (e.g. Blocks mode).
+  function insertAtCursor(text: string) {
+    if (tab !== "code") {
+      setTab("code");
+      // Wait for the textarea to mount.
+      setTimeout(() => doInsert(text), 50);
+      return;
+    }
+    doInsert(text);
+  }
+  function doInsert(text: string) {
+    const ta = codeTextareaRef.current;
+    if (!ta) {
+      setSource((s) => s + text);
+      return;
+    }
+    const start = ta.selectionStart;
+    const end = ta.selectionEnd;
+    const next = source.slice(0, start) + text + source.slice(end);
+    setSource(next);
+    requestAnimationFrame(() => {
+      ta.focus();
+      ta.selectionStart = ta.selectionEnd = start + text.length;
+    });
+  }
+
+  // Autosave — debounced 2s after the last edit. Skips the first render
+  // (freshly-loaded source) so we don't save immediately on mount.
+  const firstSaveRender = useRef(true);
+  useEffect(() => {
+    if (firstSaveRender.current) {
+      firstSaveRender.current = false;
+      return;
+    }
+    if (!autoSave) return;
+    if (!sourceLoaded) return;
+    const t = setTimeout(() => {
+      save(false);
+    }, 2000);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [source, autoSave, sourceLoaded]);
+
+  // Keyboard: Cmd+S save, Cmd+K palette, ? help. Suppress when typing
+  // inside inputs unless it's the modifier-based shortcut itself.
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && e.key.toLowerCase() === "s") {
+        e.preventDefault();
+        save(false);
+        return;
+      }
+      if (mod && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setPaletteOpen(true);
+        return;
+      }
+      const t = e.target as HTMLElement | null;
+      const inField =
+        t &&
+        (t.tagName === "INPUT" ||
+          t.tagName === "TEXTAREA" ||
+          t.isContentEditable);
+      if (!inField && e.key === "?") {
+        e.preventDefault();
+        setHelpOpen(true);
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   function openGenerate() {
     setGenData(
@@ -389,9 +477,26 @@ export default function HtmlDesigner({ tpl: initialTpl }: Props) {
               <Settings2 className="h-4 w-4" />
               Layout
             </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setPaletteOpen(true)}
+              title={`Command palette (${modSymbol()}K)`}
+            >
+              <LayoutGrid className="h-4 w-4" />
+              Commands
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setHelpOpen(true)}
+              title="Keyboard shortcuts (?)"
+            >
+              <Keyboard className="h-4 w-4" />
+            </Button>
             <Button variant="outline" size="sm" onClick={() => save(false)} loading={saving}>
               <Save className="h-4 w-4" />
-              Save
+              {autoSave ? (lastSavedAt ? "Saved" : "Save") : "Save"}
             </Button>
             <Button
               variant="ghost"
@@ -562,6 +667,7 @@ export default function HtmlDesigner({ tpl: initialTpl }: Props) {
                 />
               ) : (
                 <textarea
+                  ref={codeTextareaRef}
                   value={source}
                   onChange={(e) => setSource(e.target.value)}
                   spellCheck={false}
@@ -689,8 +795,98 @@ export default function HtmlDesigner({ tpl: initialTpl }: Props) {
         templateId={tpl.id}
         templateName={tpl.name}
       />
+
+      <CommandPalette
+        open={paletteOpen}
+        onOpenChange={setPaletteOpen}
+        commands={buildHtmlCommands({
+          placeholders,
+          insertAtCursor,
+          setTab,
+          setLayoutOpen,
+          setI18nOpen,
+          setComputedOpen,
+          setFormLinksOpen,
+          setSendOpen,
+          setCollabOpen,
+          setGenOpen,
+          save,
+          autoSave,
+          setAutoSave,
+          setHelpOpen,
+        })}
+      />
+      <ShortcutHelp
+        open={helpOpen}
+        onOpenChange={setHelpOpen}
+        shortcuts={[
+          { keys: `${modSymbol()}K`, label: "Command palette", group: "General" },
+          { keys: `${modSymbol()}S`, label: "Save now", group: "General" },
+          { keys: "?", label: "Show shortcuts", group: "General" },
+        ]}
+      />
     </div>
   );
+}
+
+// Commands exposed to the HTML designer palette. Kept out of the
+// component body so the JSX stays readable.
+function buildHtmlCommands(p: {
+  placeholders: string[];
+  insertAtCursor: (text: string) => void;
+  setTab: (t: EditorTab) => void;
+  setLayoutOpen: (o: boolean) => void;
+  setI18nOpen: (o: boolean) => void;
+  setComputedOpen: (o: boolean) => void;
+  setFormLinksOpen: (o: boolean) => void;
+  setSendOpen: (o: boolean) => void;
+  setCollabOpen: (o: boolean) => void;
+  setGenOpen: (o: boolean) => void;
+  save: (force?: boolean) => void;
+  autoSave: boolean;
+  setAutoSave: React.Dispatch<React.SetStateAction<boolean>>;
+  setHelpOpen: (o: boolean) => void;
+}): Command[] {
+  const M = modSymbol();
+  const insertSnippets = [
+    { label: "Insert if block", text: "{{ if .field }}\n  \n{{ end }}\n" },
+    { label: "Insert range block", text: "{{ range .items }}\n  {{ . }}\n{{ end }}\n" },
+    { label: "Insert with block", text: "{{ with .obj }}\n  {{ .field }}\n{{ end }}\n" },
+    { label: "Insert comment", text: "{{/* comment */}}" },
+  ];
+  return [
+    { id: "tab:blocks", label: "Switch to Blocks editor", group: "View", run: () => p.setTab("blocks") },
+    { id: "tab:design", label: "Switch to Design editor", group: "View", run: () => p.setTab("design") },
+    { id: "tab:code", label: "Switch to HTML editor", group: "View", run: () => p.setTab("code") },
+    { id: "file:save", label: "Save now", hint: `${M}S`, group: "File", run: () => p.save(false) },
+    { id: "file:generate", label: "Generate document", group: "File", run: () => p.setGenOpen(true) },
+    {
+      id: "view:autosave",
+      label: p.autoSave ? "Disable auto-save" : "Enable auto-save",
+      group: "File",
+      run: () => p.setAutoSave((v) => !v),
+    },
+    { id: "view:layout", label: "Page layout", group: "Settings", run: () => p.setLayoutOpen(true) },
+    { id: "view:i18n", label: "Translations", group: "Settings", run: () => p.setI18nOpen(true) },
+    { id: "view:computed", label: "Computed fields", group: "Settings", run: () => p.setComputedOpen(true) },
+    { id: "view:formlinks", label: "Public form links", group: "Share", run: () => p.setFormLinksOpen(true) },
+    { id: "view:send", label: "Send via email", group: "Share", run: () => p.setSendOpen(true) },
+    { id: "view:collab", label: "Open collaboration drawer", group: "Share", run: () => p.setCollabOpen(true) },
+    ...p.placeholders.map((ph) => ({
+      id: "ph:" + ph,
+      label: "Insert placeholder: " + ph,
+      group: "Insert placeholder",
+      keywords: [ph],
+      run: () => p.insertAtCursor(`{{ .${ph} }}`),
+    })),
+    ...insertSnippets.map((s) => ({
+      id: "snip:" + s.label,
+      label: s.label,
+      group: "Insert snippet",
+      run: () => p.insertAtCursor(s.text),
+    })),
+    { id: "help:shortcuts", label: "Keyboard shortcuts", hint: "?", group: "Help", run: () => p.setHelpOpen(true) },
+  ];
 }
 
 function TabButton({

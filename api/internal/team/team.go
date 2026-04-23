@@ -149,6 +149,64 @@ func (h *Handler) RemoveMember(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
+// ResetMFA clears a teammate's enrolled TOTP secret so they can sign in with
+// just their password and re-enroll. Admin-only and org-scoped — refuses if
+// the target user belongs to a different workspace. Audited.
+func (h *Handler) ResetMFA(w http.ResponseWriter, r *http.Request) {
+	c, err := adminOnly(r)
+	if err != nil {
+		writeErr(w, 403, "forbidden", err.Error())
+		return
+	}
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		writeErr(w, 400, "missing_id", "user id required")
+		return
+	}
+
+	// Verify the target is in the same org before touching their MFA row.
+	var targetEmail string
+	err = h.DB.QueryRow(r.Context(),
+		`SELECT email FROM users WHERE id=$1 AND org_id=$2`,
+		id, c.OrgID,
+	).Scan(&targetEmail)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeErr(w, 404, "not_found", "member not found")
+			return
+		}
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+
+	// Delete the TOTP secret + recovery codes. No-op if the user didn't have
+	// MFA enabled — still return ok so the UI can show a clean confirmation.
+	tag, err := h.DB.Exec(r.Context(),
+		`DELETE FROM two_factor_secrets WHERE user_id=$1`, id)
+	if err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+
+	// Audit: record who reset MFA for whom. Critical for security forensics —
+	// an admin resetting another admin's 2FA should be scrutinisable later.
+	if h.Auth != nil && h.Auth.AuditFn != nil {
+		h.Auth.AuditFn(r.Context(), "mfa.admin_reset",
+			c.UserID, c.OrgID, c.Email,
+			clientIP(r), r.UserAgent(),
+			map[string]any{
+				"targetUserId": id,
+				"targetEmail":  targetEmail,
+				"hadMFA":       tag.RowsAffected() > 0,
+			})
+	}
+
+	writeJSON(w, 200, map[string]any{
+		"ok":     true,
+		"hadMFA": tag.RowsAffected() > 0,
+	})
+}
+
 // -- invites --------------------------------------------------------------
 
 type inviteDTO struct {
@@ -465,6 +523,19 @@ func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 
 func writeErr(w http.ResponseWriter, code int, slug, msg string) {
 	writeJSON(w, code, map[string]any{"error": map[string]string{"code": slug, "message": msg}})
+}
+
+func clientIP(r *http.Request) string {
+	if v := r.Header.Get("X-Forwarded-For"); v != "" {
+		if i := strings.IndexByte(v, ','); i > 0 {
+			return strings.TrimSpace(v[:i])
+		}
+		return strings.TrimSpace(v)
+	}
+	if v := r.Header.Get("X-Real-IP"); v != "" {
+		return v
+	}
+	return r.RemoteAddr
 }
 
 // Silence unused-import warning on rare paths.

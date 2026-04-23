@@ -3,12 +3,16 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import {
+  Activity,
   AlertTriangle,
   BookOpen,
   Check,
+  ChevronDown,
+  ChevronRight,
   Copy,
   KeyRound,
   Plus,
+  ShieldCheck,
   Trash2,
 } from "lucide-react";
 import { api } from "@/lib/api";
@@ -48,11 +52,48 @@ type KeyRow = {
   id: string;
   name: string;
   prefix: string;
+  scopes: string[];
   createdAt: string;
   lastUsedAt?: string;
   expiresAt?: string;
   revoked: boolean;
 };
+
+type ActivityRow = {
+  method: string;
+  path: string;
+  status: number;
+  durationMs: number;
+  ip?: string;
+  createdAt: string;
+};
+
+type ActivityResp = {
+  requests: ActivityRow[];
+  counts: Record<string, number>;
+};
+
+// Canonical scope list — must match `apikeys.AllScopes` in the Go backend.
+// "*" is special: if it's selected we send it alone for clarity, but the
+// server accepts any combination.
+const SCOPE_OPTIONS: {
+  value: string;
+  label: string;
+  description: string;
+  group: string;
+}[] = [
+  { value: "*", label: "Full access", description: "All endpoints; equivalent to a legacy unscoped key.", group: "Admin" },
+  { value: "files:read", label: "Read files", description: "List, get, download files & folders.", group: "Files" },
+  { value: "files:write", label: "Write files", description: "Upload, rename, move, delete files.", group: "Files" },
+  { value: "templates:read", label: "Read templates", description: "List and fetch templates.", group: "Templates" },
+  { value: "templates:write", label: "Write templates", description: "Create, update, restore templates & versions.", group: "Templates" },
+  { value: "generate:write", label: "Generate documents", description: "Run single and batch generation jobs.", group: "Generate" },
+  { value: "shares:write", label: "Manage shares", description: "Create, list, revoke share links.", group: "Sharing" },
+  { value: "webhooks:read", label: "Read webhooks", description: "Inspect delivery history.", group: "Webhooks" },
+  { value: "webhooks:write", label: "Manage webhooks", description: "Create, update, delete, test webhooks.", group: "Webhooks" },
+  { value: "audit:read", label: "Read audit log", description: "Admin-only audit event feed.", group: "Security" },
+  { value: "ops:read", label: "Read ops", description: "System health, queue state, metrics.", group: "Security" },
+];
 
 export default function ApiKeysPage() {
   const toast = useToast();
@@ -62,11 +103,15 @@ export default function ApiKeysPage() {
   const [createOpen, setCreateOpen] = useState(false);
   const [newName, setNewName] = useState("");
   const [newExpiry, setNewExpiry] = useState("0");
+  const [newScopes, setNewScopes] = useState<string[]>(["*"]);
   const [creating, setCreating] = useState(false);
-  const [freshKey, setFreshKey] = useState<{ key: string; name: string } | null>(
-    null
-  );
+  const [freshKey, setFreshKey] = useState<
+    { key: string; name: string; scopes: string[] } | null
+  >(null);
   const [copied, setCopied] = useState(false);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [activity, setActivity] = useState<Record<string, ActivityResp>>({});
+  const [activityLoading, setActivityLoading] = useState<string | null>(null);
 
   async function load() {
     setLoading(true);
@@ -88,26 +133,61 @@ export default function ApiKeysPage() {
   async function createKey() {
     setCreating(true);
     try {
-      const r = await api<{ key: string; name: string; prefix: string }>(
-        "/v1/api-keys",
-        {
-          method: "POST",
-          body: JSON.stringify({
-            name: newName.trim() || "Untitled key",
-            expiresInDays: parseInt(newExpiry, 10) || 0,
-          }),
-        }
-      );
-      setFreshKey({ key: r.key, name: r.name });
+      // If "*" is selected alongside narrower scopes, send just "*" — the
+      // server would collapse it anyway but this keeps the wire cleaner.
+      const scopes = newScopes.includes("*") ? ["*"] : newScopes;
+      const r = await api<{
+        key: string;
+        name: string;
+        prefix: string;
+        scopes: string[];
+      }>("/v1/api-keys", {
+        method: "POST",
+        body: JSON.stringify({
+          name: newName.trim() || "Untitled key",
+          expiresInDays: parseInt(newExpiry, 10) || 0,
+          scopes,
+        }),
+      });
+      setFreshKey({ key: r.key, name: r.name, scopes: r.scopes });
       setCreateOpen(false);
       setNewName("");
       setNewExpiry("0");
+      setNewScopes(["*"]);
       await load();
     } catch (e: any) {
       toast.show("error", e.message);
     } finally {
       setCreating(false);
     }
+  }
+
+  async function toggleActivity(id: string) {
+    if (expandedId === id) {
+      setExpandedId(null);
+      return;
+    }
+    setExpandedId(id);
+    if (activity[id]) return;
+    setActivityLoading(id);
+    try {
+      const r = await api<ActivityResp>(`/v1/api-keys/${id}/activity`);
+      setActivity((a) => ({ ...a, [id]: r }));
+    } catch (e: any) {
+      toast.show("error", e.message);
+    } finally {
+      setActivityLoading(null);
+    }
+  }
+
+  function toggleScope(s: string) {
+    setNewScopes((cur) => {
+      if (s === "*") return cur.includes("*") ? [] : ["*"];
+      const next = cur.includes(s)
+        ? cur.filter((x) => x !== s)
+        : [...cur.filter((x) => x !== "*"), s];
+      return next.length === 0 ? ["*"] : next;
+    });
   }
 
   async function revokeKey(row: KeyRow) {
@@ -192,56 +272,147 @@ export default function ApiKeysPage() {
               className="border-0"
             />
           ) : (
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b bg-muted/40 text-left text-xs uppercase tracking-wide text-muted-foreground">
-                  <th scope="col" className="px-3 py-2 font-medium">Name</th>
-                  <th scope="col" className="px-3 py-2 font-medium">Prefix</th>
-                  <th scope="col" className="px-3 py-2 font-medium">Created</th>
-                  <th scope="col" className="px-3 py-2 font-medium">Last used</th>
-                  <th scope="col" className="px-3 py-2 font-medium">Status</th>
-                  <th scope="col" className="px-3 py-2"></th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((row) => (
-                  <tr key={row.id} className="border-b last:border-0 align-middle">
-                    <td className="px-3 py-2 font-medium">{row.name}</td>
-                    <td className="px-3 py-2 font-mono text-xs">{row.prefix}…</td>
-                    <td className="px-3 py-2 text-muted-foreground">
-                      {new Date(row.createdAt).toLocaleDateString()}
-                    </td>
-                    <td className="px-3 py-2 text-muted-foreground">
-                      {row.lastUsedAt
-                        ? new Date(row.lastUsedAt).toLocaleString()
-                        : "Never"}
-                    </td>
-                    <td className="px-3 py-2">
+            <div className="divide-y">
+              {rows.map((row) => {
+                const isOpen = expandedId === row.id;
+                const act = activity[row.id];
+                return (
+                  <div key={row.id} className="px-3 py-2.5">
+                    <div className="flex flex-wrap items-center gap-3">
+                      <button
+                        type="button"
+                        onClick={() => toggleActivity(row.id)}
+                        className="flex items-center gap-2 font-medium hover:text-primary"
+                      >
+                        {isOpen ? (
+                          <ChevronDown className="h-4 w-4" />
+                        ) : (
+                          <ChevronRight className="h-4 w-4" />
+                        )}
+                        {row.name}
+                      </button>
+                      <code className="font-mono text-xs text-muted-foreground">
+                        {row.prefix}…
+                      </code>
                       {row.revoked ? (
                         <Badge variant="destructive">Revoked</Badge>
-                      ) : row.expiresAt && new Date(row.expiresAt) < new Date() ? (
+                      ) : row.expiresAt &&
+                        new Date(row.expiresAt) < new Date() ? (
                         <Badge variant="warning">Expired</Badge>
                       ) : (
                         <Badge variant="success">Active</Badge>
                       )}
-                    </td>
-                    <td className="px-3 py-2 text-right">
-                      {!row.revoked && (
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          onClick={() => revokeKey(row)}
-                          aria-label={`Revoke ${row.name}`}
-                          className="text-muted-foreground hover:text-destructive"
+                      <div className="ml-auto flex items-center gap-3 text-xs text-muted-foreground">
+                        <span>
+                          Created{" "}
+                          {new Date(row.createdAt).toLocaleDateString()}
+                        </span>
+                        <span>
+                          {row.lastUsedAt
+                            ? `Used ${new Date(
+                                row.lastUsedAt
+                              ).toLocaleDateString()}`
+                            : "Never used"}
+                        </span>
+                        {!row.revoked && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            onClick={() => revokeKey(row)}
+                            aria-label={`Revoke ${row.name}`}
+                            className="text-muted-foreground hover:text-destructive"
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+                    <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                      <ShieldCheck className="h-3.5 w-3.5 text-muted-foreground" />
+                      {(row.scopes?.length ? row.scopes : ["*"]).map((s) => (
+                        <Badge
+                          key={s}
+                          variant="outline"
+                          className="font-mono text-[10px]"
                         >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+                          {s}
+                        </Badge>
+                      ))}
+                    </div>
+
+                    {isOpen && (
+                      <div className="mt-3 rounded-md border bg-muted/30 p-3">
+                        {activityLoading === row.id && !act ? (
+                          <div className="space-y-1">
+                            {Array.from({ length: 3 }).map((_, i) => (
+                              <Skeleton key={i} className="h-6 w-full" />
+                            ))}
+                          </div>
+                        ) : !act || act.requests.length === 0 ? (
+                          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                            <Activity className="h-4 w-4" />
+                            No requests yet for this key.
+                          </div>
+                        ) : (
+                          <>
+                            <div className="mb-2 flex items-center gap-3 text-[11px] text-muted-foreground">
+                              <span className="font-medium">Last 24h</span>
+                              {(["2xx", "3xx", "4xx", "5xx"] as const).map(
+                                (b) => (
+                                  <span key={b}>
+                                    {b}:{" "}
+                                    <span className="font-mono tabular-nums text-foreground">
+                                      {act.counts[b] || 0}
+                                    </span>
+                                  </span>
+                                )
+                              )}
+                            </div>
+                            <ul className="space-y-0.5 text-xs">
+                              {act.requests.slice(0, 50).map((r, i) => (
+                                <li
+                                  key={i}
+                                  className="flex items-center gap-2 font-mono"
+                                >
+                                  <Badge
+                                    variant="outline"
+                                    className="w-14 justify-center text-[10px]"
+                                  >
+                                    {r.method}
+                                  </Badge>
+                                  <span
+                                    className={
+                                      r.status >= 500
+                                        ? "text-destructive"
+                                        : r.status >= 400
+                                        ? "text-amber-600"
+                                        : "text-muted-foreground"
+                                    }
+                                  >
+                                    {r.status}
+                                  </span>
+                                  <span className="flex-1 truncate">
+                                    {r.path}
+                                  </span>
+                                  <span className="tabular-nums text-muted-foreground">
+                                    {r.durationMs}ms
+                                  </span>
+                                  <span className="tabular-nums text-muted-foreground">
+                                    {new Date(
+                                      r.createdAt
+                                    ).toLocaleTimeString()}
+                                  </span>
+                                </li>
+                              ))}
+                            </ul>
+                          </>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
           )}
         </CardContent>
       </Card>
@@ -290,6 +461,47 @@ export default function ApiKeysPage() {
                 </SelectContent>
               </Select>
             </div>
+            <div className="space-y-1.5">
+              <Label>Scopes</Label>
+              <p className="text-[11px] text-muted-foreground">
+                Pick the narrowest set that still lets the integration do its
+                job. Selecting <b>Full access</b> overrides everything else.
+              </p>
+              <div className="max-h-56 space-y-1 overflow-y-auto rounded-md border p-2">
+                {SCOPE_OPTIONS.map((opt) => {
+                  const checked =
+                    newScopes.includes(opt.value) ||
+                    (newScopes.includes("*") && opt.value !== "*");
+                  const disabled =
+                    newScopes.includes("*") && opt.value !== "*";
+                  return (
+                    <label
+                      key={opt.value}
+                      className={`flex cursor-pointer items-start gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-muted/60 ${
+                        disabled ? "opacity-60" : ""
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        disabled={disabled}
+                        onChange={() => toggleScope(opt.value)}
+                        className="mt-0.5"
+                      />
+                      <span className="flex-1">
+                        <span className="font-medium">{opt.label}</span>{" "}
+                        <code className="font-mono text-[10px] text-muted-foreground">
+                          {opt.value}
+                        </code>
+                        <div className="text-[11px] text-muted-foreground">
+                          {opt.description}
+                        </div>
+                      </span>
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
           </form>
           <DialogFooter>
             <Button
@@ -337,6 +549,23 @@ export default function ApiKeysPage() {
               <Label>Key name</Label>
               <Input readOnly value={freshKey?.name || ""} />
             </div>
+
+            {freshKey?.scopes?.length ? (
+              <div className="space-y-1.5">
+                <Label className="text-xs">Scopes</Label>
+                <div className="flex flex-wrap gap-1.5">
+                  {freshKey.scopes.map((s) => (
+                    <Badge
+                      key={s}
+                      variant="outline"
+                      className="font-mono text-[10px]"
+                    >
+                      {s}
+                    </Badge>
+                  ))}
+                </div>
+              </div>
+            ) : null}
 
             <div className="space-y-1.5">
               <Label>API key</Label>

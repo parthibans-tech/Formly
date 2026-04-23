@@ -341,6 +341,52 @@ func (h *Handler) Test(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"queued": true})
 }
 
+// Redeliver re-enqueues a specific past delivery using its stored payload.
+// Handy from the dashboard when an endpoint was briefly down and the user
+// wants to replay the missed event without re-triggering the business
+// action that produced it.
+func (h *Handler) Redeliver(w http.ResponseWriter, r *http.Request) {
+	c := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
+	webhookID := chi.URLParam(r, "id")
+	deliveryID := chi.URLParam(r, "deliveryId")
+
+	// Ownership: confirm delivery belongs to a webhook in this org.
+	var (
+		ownerOrg string
+		event    string
+		body     []byte
+	)
+	err := h.DB.QueryRow(r.Context(), `
+		SELECT w.org_id, d.event, d.request_body::text
+		  FROM webhook_deliveries d
+		  JOIN webhooks w ON w.id = d.webhook_id
+		 WHERE d.id=$1 AND d.webhook_id=$2`, deliveryID, webhookID,
+	).Scan(&ownerOrg, &event, &body)
+	if err != nil {
+		writeErr(w, 404, "not_found", "delivery not found")
+		return
+	}
+	if ownerOrg != c.OrgID {
+		writeErr(w, 404, "not_found", "delivery not found")
+		return
+	}
+
+	task, err := queue.NewWebhookDeliver(queue.WebhookDeliverPayload{
+		WebhookID: webhookID,
+		Event:     event,
+		Body:      body,
+	})
+	if err != nil {
+		writeErr(w, 500, "enqueue", err.Error())
+		return
+	}
+	if _, err := h.Queue.Enqueue(task); err != nil {
+		writeErr(w, 500, "enqueue", err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"queued": true})
+}
+
 // -- task handler (called by the asynq worker process) --------------------
 
 type webhook struct {

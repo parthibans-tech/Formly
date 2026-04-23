@@ -8,6 +8,8 @@ import {
   Eye,
   Globe,
   Globe2,
+  Keyboard,
+  LayoutGrid,
   Mail,
   History,
   PlayCircle,
@@ -46,6 +48,11 @@ import { SendEmailDialog } from "@/components/send-email-dialog";
 import { CollabDrawer } from "@/components/collab-drawer";
 import { MessageSquare } from "lucide-react";
 import type { PageLayout } from "@/lib/layout";
+import {
+  CommandPalette,
+  type Command,
+} from "@/components/designer/command-palette";
+import { ShortcutHelp, modSymbol } from "@/components/designer/shortcut-help";
 
 type Template = {
   id: string;
@@ -88,6 +95,11 @@ export default function MarkdownDesigner({ tpl: initialTpl }: Props) {
   const [genProgress, setGenProgress] = useState<string | null>(null);
   const [genData, setGenData] = useState("{}");
   const previewTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [autoSave, setAutoSave] = useState(true);
+  const [lastSavedAt, setLastSavedAt] = useState<Date | null>(null);
+  const sourceRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -228,8 +240,99 @@ export default function MarkdownDesigner({ tpl: initialTpl }: Props) {
       }
     } finally {
       setSaving(false);
+      setLastSavedAt(new Date());
     }
   }
+
+  function insertAtCursor(text: string) {
+    const ta = sourceRef.current;
+    if (!ta) {
+      setSource((s) => s + text);
+      return;
+    }
+    const start = ta.selectionStart;
+    const end = ta.selectionEnd;
+    const next = source.slice(0, start) + text + source.slice(end);
+    setSource(next);
+    requestAnimationFrame(() => {
+      ta.focus();
+      ta.selectionStart = ta.selectionEnd = start + text.length;
+    });
+  }
+
+  // Wrap the current selection in `before`/`after` — used for **bold**,
+  // _italic_, and [link](url) shortcuts.
+  function wrapSelection(before: string, after: string) {
+    const ta = sourceRef.current;
+    if (!ta) return;
+    const start = ta.selectionStart;
+    const end = ta.selectionEnd;
+    const mid = source.slice(start, end);
+    const next = source.slice(0, start) + before + mid + after + source.slice(end);
+    setSource(next);
+    requestAnimationFrame(() => {
+      ta.focus();
+      ta.selectionStart = start + before.length;
+      ta.selectionEnd = start + before.length + mid.length;
+    });
+  }
+
+  // Autosave — debounced 2s after the last edit.
+  const firstSaveRender = useRef(true);
+  useEffect(() => {
+    if (firstSaveRender.current) {
+      firstSaveRender.current = false;
+      return;
+    }
+    if (!autoSave) return;
+    const t = setTimeout(() => save(false), 2000);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [source, autoSave]);
+
+  // Keyboard: Cmd+S save, Cmd+K palette, ? help, Cmd+B bold, Cmd+I italic.
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && e.key.toLowerCase() === "s") {
+        e.preventDefault();
+        save(false);
+        return;
+      }
+      if (mod && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setPaletteOpen(true);
+        return;
+      }
+      // Markdown text shortcuts only apply when the editor textarea is
+      // focused — otherwise don't steal Cmd+B from the browser.
+      const active = document.activeElement;
+      const inMd = active === sourceRef.current;
+      if (inMd && mod && e.key.toLowerCase() === "b") {
+        e.preventDefault();
+        wrapSelection("**", "**");
+        return;
+      }
+      if (inMd && mod && e.key.toLowerCase() === "i") {
+        e.preventDefault();
+        wrapSelection("_", "_");
+        return;
+      }
+      const t = e.target as HTMLElement | null;
+      const inField =
+        t &&
+        (t.tagName === "INPUT" ||
+          t.tagName === "TEXTAREA" ||
+          t.isContentEditable);
+      if (!inField && e.key === "?") {
+        e.preventDefault();
+        setHelpOpen(true);
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [source]);
 
   function openGenerate() {
     setGenData(
@@ -357,9 +460,26 @@ export default function MarkdownDesigner({ tpl: initialTpl }: Props) {
               <Settings2 className="h-4 w-4" />
               Layout
             </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setPaletteOpen(true)}
+              title={`Command palette (${modSymbol()}K)`}
+            >
+              <LayoutGrid className="h-4 w-4" />
+              Commands
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setHelpOpen(true)}
+              title="Keyboard shortcuts (?)"
+            >
+              <Keyboard className="h-4 w-4" />
+            </Button>
             <Button variant="outline" size="sm" onClick={() => save(false)} loading={saving}>
               <Save className="h-4 w-4" />
-              Save
+              {autoSave && lastSavedAt ? "Saved" : "Save"}
             </Button>
             <Button
               variant="ghost"
@@ -480,6 +600,7 @@ export default function MarkdownDesigner({ tpl: initialTpl }: Props) {
               </span>
             </div>
             <textarea
+              ref={sourceRef}
               value={source}
               onChange={(e) => setSource(e.target.value)}
               spellCheck={false}
@@ -605,8 +726,94 @@ export default function MarkdownDesigner({ tpl: initialTpl }: Props) {
         templateId={tpl.id}
         templateName={tpl.name}
       />
+
+      <CommandPalette
+        open={paletteOpen}
+        onOpenChange={setPaletteOpen}
+        commands={buildMarkdownCommands({
+          placeholders,
+          insertAtCursor,
+          wrapSelection,
+          setLayoutOpen,
+          setI18nOpen,
+          setComputedOpen,
+          setFormLinksOpen,
+          setSendOpen,
+          setCollabOpen,
+          setGenOpen,
+          save,
+          autoSave,
+          setAutoSave,
+          setHelpOpen,
+        })}
+      />
+      <ShortcutHelp
+        open={helpOpen}
+        onOpenChange={setHelpOpen}
+        shortcuts={[
+          { keys: `${modSymbol()}K`, label: "Command palette", group: "General" },
+          { keys: `${modSymbol()}S`, label: "Save now", group: "General" },
+          { keys: "?", label: "Show shortcuts", group: "General" },
+          { keys: `${modSymbol()}B`, label: "Bold selection", group: "Markdown" },
+          { keys: `${modSymbol()}I`, label: "Italic selection", group: "Markdown" },
+        ]}
+      />
     </div>
   );
+}
+
+function buildMarkdownCommands(p: {
+  placeholders: string[];
+  insertAtCursor: (text: string) => void;
+  wrapSelection: (before: string, after: string) => void;
+  setLayoutOpen: (o: boolean) => void;
+  setI18nOpen: (o: boolean) => void;
+  setComputedOpen: (o: boolean) => void;
+  setFormLinksOpen: (o: boolean) => void;
+  setSendOpen: (o: boolean) => void;
+  setCollabOpen: (o: boolean) => void;
+  setGenOpen: (o: boolean) => void;
+  save: (force?: boolean) => void;
+  autoSave: boolean;
+  setAutoSave: React.Dispatch<React.SetStateAction<boolean>>;
+  setHelpOpen: (o: boolean) => void;
+}): Command[] {
+  const M = modSymbol();
+  return [
+    { id: "file:save", label: "Save now", hint: `${M}S`, group: "File", run: () => p.save(false) },
+    { id: "file:generate", label: "Generate document", group: "File", run: () => p.setGenOpen(true) },
+    {
+      id: "view:autosave",
+      label: p.autoSave ? "Disable auto-save" : "Enable auto-save",
+      group: "File",
+      run: () => p.setAutoSave((v) => !v),
+    },
+    { id: "md:bold", label: "Bold", hint: `${M}B`, group: "Formatting", run: () => p.wrapSelection("**", "**") },
+    { id: "md:italic", label: "Italic", hint: `${M}I`, group: "Formatting", run: () => p.wrapSelection("_", "_") },
+    { id: "md:code", label: "Inline code", group: "Formatting", run: () => p.wrapSelection("`", "`") },
+    { id: "md:link", label: "Link", group: "Formatting", run: () => p.wrapSelection("[", "](https://)") },
+    { id: "md:h1", label: "Heading 1", group: "Block", run: () => p.insertAtCursor("\n# Heading\n") },
+    { id: "md:h2", label: "Heading 2", group: "Block", run: () => p.insertAtCursor("\n## Heading\n") },
+    { id: "md:ul", label: "Bulleted list", group: "Block", run: () => p.insertAtCursor("\n- Item\n- Item\n") },
+    { id: "md:ol", label: "Numbered list", group: "Block", run: () => p.insertAtCursor("\n1. Item\n2. Item\n") },
+    { id: "md:quote", label: "Block quote", group: "Block", run: () => p.insertAtCursor("\n> Quote\n") },
+    { id: "md:codeblock", label: "Code block", group: "Block", run: () => p.insertAtCursor("\n```\n\n```\n") },
+    { id: "md:table", label: "Table", group: "Block", run: () => p.insertAtCursor("\n| Col | Col |\n| --- | --- |\n| A   | B   |\n") },
+    ...p.placeholders.map((ph) => ({
+      id: "ph:" + ph,
+      label: "Insert placeholder: " + ph,
+      group: "Insert placeholder",
+      keywords: [ph],
+      run: () => p.insertAtCursor(`{{ .${ph} }}`),
+    })),
+    { id: "view:layout", label: "Page layout", group: "Settings", run: () => p.setLayoutOpen(true) },
+    { id: "view:i18n", label: "Translations", group: "Settings", run: () => p.setI18nOpen(true) },
+    { id: "view:computed", label: "Computed fields", group: "Settings", run: () => p.setComputedOpen(true) },
+    { id: "view:formlinks", label: "Public form links", group: "Share", run: () => p.setFormLinksOpen(true) },
+    { id: "view:send", label: "Send via email", group: "Share", run: () => p.setSendOpen(true) },
+    { id: "view:collab", label: "Open collaboration", group: "Share", run: () => p.setCollabOpen(true) },
+    { id: "help:shortcuts", label: "Keyboard shortcuts", hint: "?", group: "Help", run: () => p.setHelpOpen(true) },
+  ];
 }
 
 const MD_CHEATS = [

@@ -249,6 +249,42 @@ func (h *Handler) IssueTokenForUser(uid, oid, email, role string) (string, error
 // Supplied by `cmd/api` to avoid an import cycle between auth and apikeys.
 type APIKeyVerifier func(r *http.Request, rawKey string) (userID, orgID, email, role string, err error)
 
+// APIKeyInfoCtxKey identifies the API key that authenticated the current
+// request (if any). Populated by Middleware when the caller sent a `fk_`
+// bearer and the verifier returned success. JWT-authenticated requests do
+// not set this key.
+type apiKeyCtxKey struct{}
+
+// APIKeyInfo describes the API key behind the current request — used by
+// observability middleware (to log per-key traffic) and by the scope guard
+// (to enforce the key's allow-list).
+type APIKeyInfo struct {
+	ID     string
+	Scopes []string
+}
+
+var APIKeyInfoCtxKey = apiKeyCtxKey{}
+
+// APIKeyFrom returns the API key info attached to the request context, if
+// the request was authenticated with an API key.
+func APIKeyFrom(ctx context.Context) *APIKeyInfo {
+	v, _ := ctx.Value(APIKeyInfoCtxKey).(*APIKeyInfo)
+	return v
+}
+
+// APIKeyVerifierV2 is the richer verifier that also returns the key ID and
+// its scope list. Kept alongside the legacy signature so existing callers
+// that only need identity still compile.
+type APIKeyVerifierV2 func(r *http.Request, rawKey string) (userID, orgID, email, role, keyID string, scopes []string, err error)
+
+var apiKeyVerifierV2 APIKeyVerifierV2
+
+// RegisterAPIKeyVerifierV2 installs the richer verifier. If registered, it
+// takes precedence over the legacy one.
+func RegisterAPIKeyVerifierV2(fn APIKeyVerifierV2) {
+	apiKeyVerifierV2 = fn
+}
+
 // APIKeyVerifier is registered at boot by cmd/api. Zero value means API-key
 // auth is disabled and only JWTs are accepted.
 var apiKeyVerifier APIKeyVerifier
@@ -274,6 +310,20 @@ func (h *Handler) Middleware(next http.Handler) http.Handler {
 
 		// API key path — short-circuit JWT parsing.
 		if strings.HasPrefix(raw, APIKeyPrefix) {
+			// Prefer the richer verifier when registered so we can thread
+			// the key ID + scopes through context.
+			if apiKeyVerifierV2 != nil {
+				uid, oid, email, role, keyID, scopes, err := apiKeyVerifierV2(r, raw)
+				if err != nil {
+					writeErr(w, 401, "invalid_api_key", err.Error())
+					return
+				}
+				claims := &Claims{UserID: uid, OrgID: oid, Email: email, Role: role}
+				ctx := context.WithValue(r.Context(), UserCtxKey, claims)
+				ctx = context.WithValue(ctx, APIKeyInfoCtxKey, &APIKeyInfo{ID: keyID, Scopes: scopes})
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
+			}
 			if apiKeyVerifier == nil {
 				writeErr(w, 401, "apikey_disabled", "api keys are not enabled")
 				return

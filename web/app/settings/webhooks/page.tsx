@@ -10,6 +10,7 @@ import {
   History,
   Link2,
   Plus,
+  RefreshCcw,
   Send,
   Trash2,
   Webhook as WebhookIcon,
@@ -190,6 +191,20 @@ export default function WebhooksPage() {
       await api(`/v1/webhooks/${row.id}/test`, { method: "POST" });
       toast.show("success", "Test ping queued", {
         description: "Open the deliveries panel to see the result.",
+      });
+    } catch (e: any) {
+      toast.show("error", e.message);
+    }
+  }
+
+  async function retryDelivery(webhookId: string, deliveryId: string) {
+    try {
+      await api(
+        `/v1/webhooks/${webhookId}/deliveries/${deliveryId}/retry`,
+        { method: "POST" }
+      );
+      toast.show("success", "Retry queued", {
+        description: "The event will redeliver; refresh deliveries shortly.",
       });
     } catch (e: any) {
       toast.show("error", e.message);
@@ -600,6 +615,18 @@ if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {
                           </pre>
                         )}
                       </div>
+                      {drawer && (
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          onClick={() => retryDelivery(drawer.id, d.id)}
+                          aria-label="Retry delivery"
+                          title="Re-enqueue this delivery"
+                          className="text-muted-foreground hover:text-primary"
+                        >
+                          <RefreshCcw className="h-3.5 w-3.5" />
+                        </Button>
+                      )}
                     </div>
                   </li>
                 ))}

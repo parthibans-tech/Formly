@@ -21,6 +21,7 @@ import {
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
+import { ApiExplorer } from "@/components/api-explorer";
 
 export default function ApiDocsPage() {
   const [hasToken, setHasToken] = useState(false);
@@ -123,6 +124,23 @@ export default function ApiDocsPage() {
               {`curl ${apiBase}/v1/me \\
   -H "Authorization: Bearer fk_live_…"`}
             </pre>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Terminal className="h-5 w-5 text-primary" />
+              Interactive explorer
+            </CardTitle>
+            <CardDescription>
+              Expand any endpoint and press <strong>Send</strong> to fire a
+              real request using your session token. Spec is served from{" "}
+              <code className="font-mono text-xs">/v1/openapi.json</code>.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <ApiExplorer />
           </CardContent>
         </Card>
 

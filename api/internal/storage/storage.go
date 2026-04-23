@@ -89,6 +89,13 @@ func (c *Client) Remove(ctx context.Context, key string) error {
 	return c.mc.RemoveObject(ctx, c.bucket, key, minio.RemoveObjectOptions{})
 }
 
+// Ping issues a cheap round-trip to verify the storage backend is reachable.
+// Used by the observability health checker.
+func (c *Client) Ping(ctx context.Context) error {
+	_, err := c.mc.BucketExists(ctx, c.bucket)
+	return err
+}
+
 // PutBytes writes the given bytes to the bucket at key with the supplied MIME type.
 func (c *Client) PutBytes(ctx context.Context, key, mime string, data []byte) error {
 	_, err := c.mc.PutObject(ctx, c.bucket, key, bytesReader(data), int64(len(data)), minio.PutObjectOptions{ContentType: mime})

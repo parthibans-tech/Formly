@@ -271,6 +271,12 @@ function describe(action: string): {
         title: "Signed in",
       };
     case "mfa":
+      if (verb === "admin_reset")
+        return {
+          Icon: AlertTriangle,
+          color: "bg-amber-500/10 text-amber-600",
+          title: "Admin reset MFA for user",
+        };
       return {
         Icon: ShieldCheck,
         color: "bg-primary/10 text-primary",

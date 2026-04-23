@@ -22,6 +22,8 @@ import (
 	"github.com/docforge/api/internal/mail"
 	"github.com/docforge/api/internal/mfa"
 	"github.com/docforge/api/internal/mockdata"
+	"github.com/docforge/api/internal/observability"
+	"github.com/docforge/api/internal/platform"
 	"github.com/docforge/api/internal/presence"
 	"github.com/docforge/api/internal/queue"
 	"github.com/docforge/api/internal/reviewlinks"
@@ -97,6 +99,19 @@ func main() {
 	ss := sessions.New(pool)
 	cp := compliance.New(pool)
 
+	// Observability: request metrics aggregator + health checker + error
+	// recorder. The aggregator is middleware-scoped; health probes run in the
+	// background; /v1/ops/* routes read both.
+	obsAgg := observability.NewAggregator()
+	obsChecker := &observability.Checker{
+		DB:      pool,
+		Storage: store.Ping,
+		Redis:   queue.ClientOpt(),
+	}
+	obs := observability.New(pool, obsAgg, obsChecker, queue.ClientOpt())
+	observability.StartFlusher(ctx, pool, obsAgg)
+	observability.StartHealthLoop(ctx, pool, obsChecker, time.Minute)
+
 	// Wire auth hooks so login → session tracking + audit, middleware →
 	// revocation check, login → optional MFA challenge.
 	a.MFAChallengeRequired = mf.ChallengeRequired
@@ -124,9 +139,11 @@ func main() {
 	}
 
 	// Register the API key verifier with auth so Bearer tokens starting with
-	// `fk_` authenticate against the api_keys table instead of as a JWT.
-	auth.RegisterAPIKeyVerifier(func(r *http.Request, raw string) (string, string, string, string, error) {
-		return apikeys.VerifyAndLoad(pool, r, raw)
+	// `fk_` authenticate against the api_keys table instead of as a JWT. We
+	// register the v2 verifier so the auth middleware attaches the key ID +
+	// scopes to the request context (used by scope-guard + per-key logger).
+	auth.RegisterAPIKeyVerifierV2(func(r *http.Request, raw string) (string, string, string, string, string, []string, error) {
+		return apikeys.VerifyAndLoadV2(pool, r, raw)
 	})
 
 	r := chi.NewRouter()
@@ -134,6 +151,10 @@ func main() {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(30 * time.Second))
 	r.Use(security.Headers())
+	// Observability: record per-request timing + capture 5xx responses.
+	// Mounted after RequestID so captured errors carry X-Request-Id.
+	r.Use(obsAgg.Middleware())
+	r.Use(observability.ErrorCapture(pool))
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"http://localhost:3000"},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"},
@@ -150,13 +171,13 @@ func main() {
 		BucketKey: security.LoginBucketKey,
 	})
 
-	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		if err := pool.Ping(r.Context()); err != nil {
-			http.Error(w, "db down", 503)
-			return
-		}
-		w.Write([]byte("ok"))
-	})
+	// Deep health + metrics exposition. Public (unauthenticated) so probes
+	// and scrapers can hit them, but return structured data.
+	r.Get("/healthz", obs.DeepHealth)
+	r.Get("/metrics", obs.Metrics)
+
+	// OpenAPI spec — public so docs viewers can fetch it without a token.
+	r.Get("/v1/openapi.json", platform.OpenAPIHandler())
 
 	r.Route("/v1/auth", func(r chi.Router) {
 		r.Use(authRateLimit)
@@ -179,6 +200,13 @@ func main() {
 
 	r.Group(func(r chi.Router) {
 		r.Use(a.Middleware)
+		// Platform: scope enforcement + rate-limit headers + per-key request
+		// log. All three are cheap and safely chain after the auth middleware
+		// (which attaches the API-key info to ctx). Scope guard only applies
+		// to API-key-authenticated traffic; JWT callers are passed through.
+		r.Use(platform.ScopeGuard())
+		r.Use(platform.RateLimitHeaders(600, time.Minute))
+		r.Use(platform.RequestLogger(pool))
 		r.Get("/v1/me", a.Me)
 		r.Post("/v1/auth/logout", a.Logout)
 
@@ -187,6 +215,9 @@ func main() {
 		mf.Mount(r)
 		ss.Mount(r)
 		cp.Mount(r)
+
+		// Observability (admin-only inside the handler).
+		obs.Mount(r)
 
 		r.Post("/v1/files/upload-url", f.CreateUploadURL)
 		r.Post("/v1/files/{id}/complete", f.Complete)
@@ -239,6 +270,7 @@ func main() {
 		r.Get("/v1/api-keys", ak.List)
 		r.Post("/v1/api-keys", ak.Create)
 		r.Delete("/v1/api-keys/{id}", ak.Revoke)
+		r.Get("/v1/api-keys/{id}/activity", ak.Activity)
 
 		// Webhooks.
 		r.Get("/v1/webhooks", wh.List)
@@ -246,6 +278,7 @@ func main() {
 		r.Patch("/v1/webhooks/{id}", wh.Update)
 		r.Delete("/v1/webhooks/{id}", wh.Delete)
 		r.Get("/v1/webhooks/{id}/deliveries", wh.Deliveries)
+		r.Post("/v1/webhooks/{id}/deliveries/{deliveryId}/retry", wh.Redeliver)
 		r.Post("/v1/webhooks/{id}/test", wh.Test)
 
 		// Public form links (per-template fill URLs).
@@ -273,6 +306,7 @@ func main() {
 		r.Get("/v1/team/members", tm.ListMembers)
 		r.Patch("/v1/team/members/{id}", tm.UpdateMember)
 		r.Delete("/v1/team/members/{id}", tm.RemoveMember)
+		r.Post("/v1/team/members/{id}/reset-mfa", tm.ResetMFA)
 		r.Get("/v1/team/invites", tm.ListInvites)
 		r.Post("/v1/team/invites", tm.CreateInvite)
 		r.Delete("/v1/team/invites/{id}", tm.RevokeInvite)
