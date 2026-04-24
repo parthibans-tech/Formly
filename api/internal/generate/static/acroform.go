@@ -107,6 +107,11 @@ func InjectAcroForm(pdfBytes []byte, widgets []Widget) ([]byte, error) {
 	}
 
 	// Parse the existing PDF into a mutable context.
+	//
+	// NOTE: callers should run InjectAcroForm on the pristine source BEFORE
+	// stampOverlay, not after. Running this after a stamp causes pdfcpu's
+	// WriteContext to orphan one of the source's font dicts (see comment in
+	// Fill() for the full explanation and symptom).
 	rs := bytes.NewReader(pdfBytes)
 	conf := model.NewDefaultConfiguration()
 	conf.ValidationMode = model.ValidationRelaxed

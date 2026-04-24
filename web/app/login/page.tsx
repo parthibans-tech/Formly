@@ -56,6 +56,7 @@ export default function LoginPage() {
         token?: string;
         user?: any;
         mfaRequired?: boolean;
+        forcePasswordReset?: boolean;
       }>("/v1/auth/login", { method: "POST", body: JSON.stringify(body) });
       if (res.mfaRequired) {
         setMfaRequired(true);
@@ -63,6 +64,16 @@ export default function LoginPage() {
         return;
       }
       setSession(res.token!, res.user);
+      // A super-admin or org policy can flag this account as needing
+      // a fresh password before it can use the app. We honor it by
+      // routing straight to /set-password — the user keeps their
+      // freshly-issued JWT but the page itself blocks navigation
+      // until a new password is chosen.
+      if (res.forcePasswordReset) {
+        toast.show("info", "Set a new password to continue");
+        router.replace("/set-password");
+        return;
+      }
       toast.show("success", "Welcome back");
       router.replace("/drive");
     } catch (e: any) {
@@ -152,7 +163,7 @@ export default function LoginPage() {
         <div className="space-y-1.5">
           <h1 className="text-2xl font-semibold tracking-tight">Welcome back</h1>
           <p className="text-sm text-muted-foreground">
-            Sign in to your Formly workspace to continue.
+            Sign in to your Drive360 workspace to continue.
           </p>
         </div>
 

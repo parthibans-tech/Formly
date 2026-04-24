@@ -1,6 +1,7 @@
 package sharing
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -20,6 +21,39 @@ import (
 type Handler struct {
 	DB      *pgxpool.Pool
 	Storage *storage.Client
+
+	// Mailer is optional — when wired, the access-request flow sends
+	// notifications (file → owner inbox; approve/deny → requester) via
+	// the central Mailer so audit + provider routing stay consistent.
+	// If nil, the SQL changes still happen but no email goes out, which
+	// keeps tests and CLI tooling that construct a Handler directly
+	// from working without a Mailer dependency.
+	Mailer Notifier
+}
+
+// Notifier is the small slice of mail.Mailer that sharing actually
+// uses. We declare it here as an interface so the import direction
+// stays sharing → (no mail package), which avoids the import cycle
+// that would land if sharing imported mail and mail imported sharing
+// (which it doesn't today, but easy to slip into).
+type Notifier interface {
+	Send(ctx context.Context, opts NotifyOptions) (string, error)
+}
+
+// NotifyOptions mirrors mail.SendOptions but without a hard dep on the
+// email package — sharing only needs to-address + subject + body. The
+// concrete mail.Mailer satisfies this via a tiny adapter wired up in
+// cmd/api/main.go.
+type NotifyOptions struct {
+	OrgID    string
+	UserID   string
+	Kind     string
+	Source   string
+	To       []string
+	Subject  string
+	HTMLBody string
+	TextBody string
+	Metadata map[string]any
 }
 
 func New(db *pgxpool.Pool, s *storage.Client) *Handler {

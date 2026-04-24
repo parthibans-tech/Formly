@@ -17,7 +17,10 @@ import StaticDesigner from "@/components/static-designer";
 import HtmlDesigner from "@/components/html-designer";
 import MarkdownDesigner from "@/components/markdown-designer";
 import { AcroFormDesigner } from "@/components/acroform/acroform-designer";
+import ImageDesigner from "@/components/image-designer";
+import { TemplateViewer } from "@/components/template-viewer";
 import { BatchDialog } from "@/components/batch-dialog";
+import { ApiGuideSheet } from "@/components/api-guide-trigger";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -69,6 +72,10 @@ type Template = {
   config: { mappings?: Record<string, Mapping>; placeholders?: string[]; pageLayout?: any };
   fields: Field[];
   widgets: Widget[];
+  // Server-computed edit permission. When false the UI drops into
+  // read-only mode (banner + disabled Save/Rename) so viewers don't
+  // edit locally and then hit a 403 on save.
+  canEdit: boolean;
 };
 
 const TRANSFORMS = [
@@ -269,6 +276,29 @@ export default function DesignerPage() {
     );
   }
 
+  // Viewer-scoped shares (resource_shares role=viewer) land on the same
+  // URL as editors but must NOT see the designer — no edit sidebars, no
+  // widget palettes, no save buttons, period. We route them to a
+  // dedicated read-only viewer component *before* any mode-specific
+  // designer mounts. The `readOnly` prop threaded into child designers
+  // below stays as defense-in-depth in case canEdit ever lies.
+  if (!tpl.canEdit) {
+    return (
+      <TemplateViewer
+        tpl={{
+          id: tpl.id,
+          fileId: tpl.fileId,
+          name: tpl.name,
+          mode: tpl.mode,
+          version: tpl.version,
+          fields: tpl.fields,
+          config: tpl.config,
+        }}
+        previewUrl={previewUrl}
+      />
+    );
+  }
+
   if (tpl.mode === "static" && previewUrl) {
     return (
       <StaticDesigner
@@ -309,6 +339,26 @@ export default function DesignerPage() {
           version: tpl.version,
           config: tpl.config || {},
         }}
+      />
+    );
+  }
+
+  if (tpl.mode === "image" && previewUrl) {
+    // Raster-image editor — crop / rotate / flip / resize / HD-upscale /
+    // brightness-contrast-saturation / filters / quality + format swap.
+    // Same canvas-based designer surface as the others, but the
+    // "ops pipeline" runs server-side via /v1/templates/:id/images/transform
+    // so we don't duplicate pixel math between Go and TS.
+    return (
+      <ImageDesigner
+        tpl={{
+          id: tpl.id,
+          name: tpl.name,
+          mode: tpl.mode,
+          version: tpl.version,
+          config: (tpl.config as any) || {},
+        }}
+        previewUrl={previewUrl}
       />
     );
   }
@@ -366,6 +416,15 @@ export default function DesignerPage() {
                 Versions
               </Link>
             </Button>
+            {/* API guide opens inline as a right-side drawer so the
+                user never loses their place in the designer. The
+                guide's field table, snippets, and JSON Schema are all
+                derived from the template's current config, so viewing
+                "what will integrators see when I add/rename this
+                field?" is one click away. A standalone route at
+                /templates/:id/api mirrors this content for shareable
+                URLs. */}
+            <ApiGuideSheet templateId={tpl.id} templateName={tpl.name} />
             <Button variant="ghost" size="sm" asChild>
               <Link href={`/templates/${tpl.id}/playground`}>
                 <Sparkles className="h-4 w-4" />

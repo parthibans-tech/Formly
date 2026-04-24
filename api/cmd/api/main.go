@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/docforge/api/internal/apikeys"
@@ -15,8 +16,10 @@ import (
 	"github.com/docforge/api/internal/comments"
 	"github.com/docforge/api/internal/compliance"
 	"github.com/docforge/api/internal/db"
+	"github.com/docforge/api/internal/email"
 	"github.com/docforge/api/internal/files"
 	"github.com/docforge/api/internal/folders"
+	"github.com/docforge/api/internal/images"
 	"github.com/docforge/api/internal/formlinks"
 	"github.com/docforge/api/internal/jobs"
 	"github.com/docforge/api/internal/mail"
@@ -24,6 +27,7 @@ import (
 	"github.com/docforge/api/internal/mockdata"
 	"github.com/docforge/api/internal/observability"
 	"github.com/docforge/api/internal/platform"
+	"github.com/docforge/api/internal/platformusers"
 	"github.com/docforge/api/internal/presence"
 	"github.com/docforge/api/internal/queue"
 	"github.com/docforge/api/internal/reviewlinks"
@@ -77,6 +81,7 @@ func main() {
 	t.Queue = qc
 	f := files.New(pool, store)
 	f.Detector = t.DetectAndCreate
+	img := images.New(pool, store)
 	md := mockdata.New(pool)
 	jh := jobs.New(pool)
 	fh := folders.New(pool)
@@ -86,8 +91,17 @@ func main() {
 	wh.WireEventBus()
 	fl := formlinks.New(pool, store, t.Runner)
 	mh := mail.New(pool, store, t.Runner)
+	// Wire the central Mailer into sharing so access-request flows can
+	// send notifications. The adapter is a one-method shim that lets
+	// `internal/sharing` stay free of an `internal/mail` import (and
+	// therefore of `internal/email` + `internal/generate`).
+	sh.Mailer = mailerAdapter{m: mh.Mailer}
 	sc := scheduled.New(pool, qc)
 	tm := team.New(pool, a)
+	// Same adapter pattern as sharing — gives team invites a path to
+	// the central Mailer without making `internal/team` import
+	// `internal/mail` directly.
+	tm.Mailer = teamMailerAdapter{m: mh.Mailer}
 	cm := comments.New(pool)
 	rv := reviews.New(pool)
 	pr := presence.New(pool)
@@ -98,6 +112,12 @@ func main() {
 	mf := mfa.New(pool, a)
 	ss := sessions.New(pool)
 	cp := compliance.New(pool)
+
+	// Super-admin user management (Phase 1 — list, lock, MFA reset,
+	// session revoke). Routes are protected by the requireSuperAdmin
+	// middleware below; the handler trusts that gate and only writes
+	// audit rows for state-changing actions.
+	pu := platformusers.New(pool)
 
 	// Observability: request metrics aggregator + health checker + error
 	// recorder. The aggregator is middleware-scoped; health probes run in the
@@ -217,6 +237,7 @@ func main() {
 		r.Use(platform.RequestLogger(pool))
 		r.Get("/v1/me", a.Me)
 		r.Post("/v1/auth/logout", a.Logout)
+		r.Post("/v1/auth/set-password", a.SetPassword)
 
 		// Security & compliance.
 		ad.Mount(r)
@@ -229,12 +250,29 @@ func main() {
 
 		r.Post("/v1/files/upload-url", f.CreateUploadURL)
 		r.Post("/v1/files/{id}/complete", f.Complete)
+		// Backfill: run DetectAndCreate on a pre-existing file that
+		// has no template yet. Lets the Drive click handler open
+		// images / HTML / markdown uploaded before their detector
+		// shipped without forcing a re-upload.
+		r.Post("/v1/files/{id}/ensure-template", f.EnsureTemplate)
 		r.Get("/v1/files", f.List)
 		r.Get("/v1/files/{id}", f.Get)
 		r.Patch("/v1/files/{id}", f.Patch)
 		r.Get("/v1/files/{id}/download", f.Download)
 		r.Delete("/v1/files/{id}", f.Delete)
 		r.Post("/v1/files/{id}/restore", f.Restore)
+		// Hard delete of a single trashed file (blob + row). Distinct
+		// from the soft-delete above — the trash → purge flow is
+		// deliberately two-step so users can restore by mistake.
+		r.Delete("/v1/files/{id}/purge", f.Purge)
+		// Empty the current user's trash (or the whole org's, for admins).
+		r.Post("/v1/trash/empty", f.EmptyTrash)
+		// Per-user starred state. Star/Unstar are idempotent so the
+		// client can call them without knowing the current state.
+		// The `view=starred` query on List returns the user's starred
+		// files in reverse-star-time order.
+		r.Post("/v1/files/{id}/star", f.Star)
+		r.Delete("/v1/files/{id}/star", f.Unstar)
 
 		// Folders
 		r.Post("/v1/folders", fh.Create)
@@ -258,6 +296,16 @@ func main() {
 		r.Delete("/v1/folders/{id}/access/{shareId}", sh.RevokeFolder)
 		r.Get("/v1/shared-with-me", sh.SharedWithMe)
 
+		// Access-request inbox — pull-mode alternative to the
+		// owner-push grant above. Viewers who need more than read
+		// rights file a request here; owners see pending rows and
+		// approve/deny from /settings/access-requests.
+		r.Post("/v1/files/{id}/request-access", sh.RequestFileAccess)
+		r.Get("/v1/access-requests", sh.ListAccessRequests)
+		r.Post("/v1/access-requests/{id}/approve", sh.ApproveAccessRequest)
+		r.Post("/v1/access-requests/{id}/deny", sh.DenyAccessRequest)
+		r.Post("/v1/access-requests/{id}/cancel", sh.CancelAccessRequest)
+
 		// Groups — named collections of users used as share principals.
 		r.Get("/v1/groups", sh.GroupsList)
 		r.Post("/v1/groups", sh.GroupsCreate)
@@ -269,6 +317,7 @@ func main() {
 		r.Delete("/v1/groups/{id}/members/{userId}", sh.GroupMembersRemove)
 
 		r.Get("/v1/templates/{id}", t.Get)
+		r.Get("/v1/templates/{id}/schema", t.Schema)
 		r.Patch("/v1/templates/{id}", t.Rename)
 		r.Put("/v1/templates/{id}/config", t.UpdateConfig)
 		r.Get("/v1/templates/{id}/preview-url", t.PreviewURL)
@@ -278,6 +327,13 @@ func main() {
 		r.Get("/v1/templates/{id}/widgets", t.ListWidgets)
 		r.Put("/v1/templates/{id}/widgets", t.ReplaceWidgets)
 		r.Put("/v1/templates/{id}/acroform/structure", t.UpdateAcroformStructure)
+
+		// Image designer — runs the transform pipeline (crop / rotate /
+		// flip / resize / quality / upscale / filters) against the image
+		// attached to a mode=image template. Same endpoint serves both
+		// the live preview (returns bytes inline) and the save path
+		// (writes a sibling file or overwrites in place).
+		r.Post("/v1/templates/{id}/images/transform", img.Transform)
 
 		r.Get("/v1/templates/{id}/mock-data", md.List)
 		r.Post("/v1/templates/{id}/mock-data", md.Save)
@@ -323,6 +379,25 @@ func main() {
 		r.Put("/v1/email/settings", mh.SaveSettings)
 		r.Post("/v1/email/test", mh.TestSend)
 		r.Get("/v1/email/sends", mh.ListSends)
+		// Super-admin cross-org audit. Server-side gate on admin role
+		// inside the handler — separate path so the org-scoped list
+		// stays a clean default for normal users.
+		r.Get("/v1/admin/email/sends", mh.ListSendsAdmin)
+
+		// Super-admin user management. The middleware checks role=admin
+		// and (when set) PLATFORM_ROOT_ORG_ID — letting org admins keep
+		// their per-workspace controls untouched while reserving these
+		// platform-wide endpoints for the operator org.
+		r.Route("/v1/admin/users", func(r chi.Router) {
+			r.Use(requireSuperAdmin)
+			r.Get("/", pu.List)
+			r.Get("/{id}", pu.Detail)
+			r.Post("/{id}/lock", pu.Lock)
+			r.Post("/{id}/unlock", pu.Unlock)
+			r.Post("/{id}/reset-mfa", pu.ResetMFA)
+			r.Post("/{id}/force-password-reset", pu.ForcePasswordReset)
+			r.Delete("/{id}/sessions", pu.RevokeSessions)
+		})
 		r.Post("/v1/templates/{id}/send", mh.SendTemplate)
 
 		// Scheduled generation jobs.
@@ -433,4 +508,75 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		}
 	}
 	return nil
+}
+
+
+// mailerAdapter exposes mail.Mailer as the slim sharing.Notifier
+// interface. We translate the two SendOptions struct shapes here so
+// neither package has to depend on the other directly.
+type mailerAdapter struct{ m *mail.Mailer }
+
+func (a mailerAdapter) Send(ctx context.Context, opts sharing.NotifyOptions) (string, error) {
+	return a.m.Send(ctx, mail.SendOptions{
+		OrgID:  opts.OrgID,
+		UserID: opts.UserID,
+		Kind:   opts.Kind,
+		Source: opts.Source,
+		Message: email.Message{
+			To:       opts.To,
+			Subject:  opts.Subject,
+			HTMLBody: opts.HTMLBody,
+			TextBody: opts.TextBody,
+		},
+		Metadata: opts.Metadata,
+	})
+}
+
+// teamMailerAdapter does the same translation for team invites.
+type teamMailerAdapter struct{ m *mail.Mailer }
+
+func (a teamMailerAdapter) Send(ctx context.Context, opts team.NotifyOptions) (string, error) {
+	return a.m.Send(ctx, mail.SendOptions{
+		OrgID:  opts.OrgID,
+		UserID: opts.UserID,
+		Kind:   opts.Kind,
+		Source: opts.Source,
+		Message: email.Message{
+			To:       opts.To,
+			Subject:  opts.Subject,
+			HTMLBody: opts.HTMLBody,
+			TextBody: opts.TextBody,
+		},
+		Metadata: opts.Metadata,
+	})
+}
+
+// requireSuperAdmin gates the /v1/admin/users/* routes.
+//
+// Two-step check:
+//  1. Caller must already be authenticated as an admin (role=admin) —
+//     same gate the per-org admin endpoints use.
+//  2. If PLATFORM_ROOT_ORG_ID is set in the environment, the caller's
+//     org must match it. This is what separates "I'm the admin of my
+//     own little workspace" from "I run the platform." If the env var
+//     is unset (typical in dev), step 2 is skipped so a single admin
+//     can wear both hats — useful before you have a dedicated
+//     operator org provisioned.
+//
+// The middleware writes nothing — handlers do their own audit logging
+// once they know the action succeeded.
+func requireSuperAdmin(next http.Handler) http.Handler {
+	rootOrg := strings.TrimSpace(os.Getenv("PLATFORM_ROOT_ORG_ID"))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, _ := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
+		if c == nil || !c.IsAdmin() {
+			http.Error(w, `{"error":{"code":"forbidden","message":"admin role required"}}`, http.StatusForbidden)
+			return
+		}
+		if rootOrg != "" && c.OrgID != rootOrg {
+			http.Error(w, `{"error":{"code":"forbidden","message":"super-admin only"}}`, http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

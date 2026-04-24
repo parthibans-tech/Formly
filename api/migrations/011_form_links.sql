@@ -1,6 +1,6 @@
 -- Form links: a public URL per template that renders a web form derived from
 -- the template's placeholders. Filling the form generates a PDF without the
--- submitter needing a Formly account.
+-- submitter needing a Drive360 account.
 CREATE TABLE IF NOT EXISTS form_links (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   org_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,

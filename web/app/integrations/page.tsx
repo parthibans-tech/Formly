@@ -67,10 +67,10 @@ export default function IntegrationsPage() {
           Automation
         </div>
         <h1 className="text-2xl font-semibold tracking-tight">
-          Connect Formly to 7 000+ apps
+          Connect Drive360 to 7 000+ apps
         </h1>
         <p className="mt-1 text-sm text-muted-foreground max-w-2xl">
-          Zapier, Make, and n8n all work with Formly out of the box via two
+          Zapier, Make, and n8n all work with Drive360 out of the box via two
           primitives: <strong>API keys</strong> for outgoing calls, and{" "}
           <strong>Webhooks</strong> for incoming events. No custom connector
           required — both sides already speak HTTP + JSON.
@@ -90,7 +90,7 @@ export default function IntegrationsPage() {
             number="1"
             icon={KeyRound}
             title="Create an API key"
-            description="Formly uses Bearer tokens to authenticate every call. Create a key and paste it into your automation platform's credentials step."
+            description="Drive360 uses Bearer tokens to authenticate every call. Create a key and paste it into your automation platform's credentials step."
             cta={
               <Button asChild size="sm" variant="outline">
                 <Link href="/settings/api-keys">
@@ -104,7 +104,7 @@ export default function IntegrationsPage() {
             number="2"
             icon={Webhook}
             title="(Optional) Add a webhook"
-            description="If your automation reacts to events inside Formly (e.g. a generated PDF), add a webhook pointing at the Catch Hook URL your provider gave you."
+            description="If your automation reacts to events inside Drive360 (e.g. a generated PDF), add a webhook pointing at the Catch Hook URL your provider gave you."
             cta={
               <Button asChild size="sm" variant="outline">
                 <Link href="/settings/webhooks">
@@ -131,7 +131,7 @@ export default function IntegrationsPage() {
           sampleTpl={sampleTpl}
           onCopy={copy}
           docsURL="https://zapier.com/app/editor"
-          triggerHint="Use Zapier → Webhooks by Zapier → Catch Hook. Paste the URL Zapier shows into a Formly webhook subscription."
+          triggerHint="Use Zapier → Webhooks by Zapier → Catch Hook. Paste the URL Zapier shows into a Drive360 webhook subscription."
           actionHint="In a Zapier action step, pick Webhooks by Zapier → POST, then plug in the snippet below."
         />
 
@@ -147,7 +147,7 @@ export default function IntegrationsPage() {
           sampleTpl={sampleTpl}
           onCopy={copy}
           docsURL="https://www.make.com/en/help/tools/webhooks"
-          triggerHint="Add a Custom webhook module in Make. Copy its address into a Formly webhook."
+          triggerHint="Add a Custom webhook module in Make. Copy its address into a Drive360 webhook."
           actionHint="Use the HTTP module → Make a request. Method POST, URL as below, plus an Authorization header."
         />
 
@@ -163,7 +163,7 @@ export default function IntegrationsPage() {
           sampleTpl={sampleTpl}
           onCopy={copy}
           docsURL="https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-base.webhook/"
-          triggerHint="Drop a Webhook node. Use the test or production URL as the destination in a Formly webhook."
+          triggerHint="Drop a Webhook node. Use the test or production URL as the destination in a Drive360 webhook."
           actionHint="An HTTP Request node with method POST covers outbound calls; use the snippet below as a template."
         />
 
@@ -179,7 +179,7 @@ export default function IntegrationsPage() {
           sampleTpl={sampleTpl}
           onCopy={copy}
           docsURL="/docs/api"
-          triggerHint="Point any HTTP listener (ngrok, a tiny Flask handler, etc.) at the URL you configure in Formly webhooks."
+          triggerHint="Point any HTTP listener (ngrok, a tiny Flask handler, etc.) at the URL you configure in Drive360 webhooks."
           actionHint="Same Bearer + JSON as the rest of the REST API. See the docs page for the full endpoint reference."
           plainDocsLabel="View API docs"
         />
@@ -190,8 +190,8 @@ export default function IntegrationsPage() {
         <CardHeader>
           <CardTitle>Verifying inbound signatures</CardTitle>
           <CardDescription>
-            When Formly posts to your automation platform, every request
-            carries a <code className="font-mono text-xs">Formly-Signature</code>{" "}
+            When Drive360 posts to your automation platform, every request
+            carries a <code className="font-mono text-xs">Drive360-Signature</code>{" "}
             header. Zapier / Make / n8n can call a small code step to verify it.
           </CardDescription>
         </CardHeader>
@@ -224,10 +224,10 @@ output = { ok: crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected)) }
           <div className="grid gap-3 md:grid-cols-2">
             <div className="rounded-md border bg-card p-3">
               <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                Formly → external
+                Drive360 → external
               </div>
               <p className="text-muted-foreground">
-                Use a <strong>Formly webhook</strong>. Your automation platform
+                Use a <strong>Drive360 webhook</strong>. Your automation platform
                 receives a JSON POST with the event name and payload. Fan out
                 to CRMs, Slack, email, spreadsheets — anything your platform
                 supports.
@@ -235,10 +235,10 @@ output = { ok: crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected)) }
             </div>
             <div className="rounded-md border bg-card p-3">
               <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                External → Formly
+                External → Drive360
               </div>
               <p className="text-muted-foreground">
-                Use a <strong>Formly API key</strong>. Your automation platform
+                Use a <strong>Drive360 API key</strong>. Your automation platform
                 posts to <code className="font-mono text-[11px]">/v1/templates/{"{id}"}/generate</code>{" "}
                 (or <code className="font-mono text-[11px]">/send</code>, or any
                 other endpoint in the docs).
@@ -364,11 +364,11 @@ function ProviderCard({
 
       {open && (
         <CardContent className="space-y-5 border-t pt-5">
-          {/* Trigger: Formly → provider */}
+          {/* Trigger: Drive360 → provider */}
           <section>
             <div className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
               <ArrowRight className="h-3.5 w-3.5" />
-              Formly event → {name}
+              Drive360 event → {name}
             </div>
             <p className="mb-2 text-sm text-muted-foreground">{triggerHint}</p>
             <ol className="space-y-1 text-sm">
@@ -386,7 +386,7 @@ function ProviderCard({
                   2
                 </span>
                 <span className="ml-1">
-                  In Formly, open{" "}
+                  In Drive360, open{" "}
                   <Link
                     href="/settings/webhooks"
                     className="text-primary hover:underline"
@@ -401,7 +401,7 @@ function ProviderCard({
                   3
                 </span>
                 <span className="ml-1">
-                  Trigger a matching event in Formly (e.g. generate a PDF).
+                  Trigger a matching event in Drive360 (e.g. generate a PDF).
                   Your {name} scenario fires with the signed JSON payload.
                 </span>
               </li>
@@ -410,11 +410,11 @@ function ProviderCard({
 
           <Separator />
 
-          {/* Action: provider → Formly */}
+          {/* Action: provider → Drive360 */}
           <section>
             <div className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
               <ArrowRight className="h-3.5 w-3.5" />
-              {name} → Formly (generate PDF)
+              {name} → Drive360 (generate PDF)
             </div>
             <p className="mb-2 text-sm text-muted-foreground">{actionHint}</p>
             <CodeBlock
@@ -427,7 +427,7 @@ function ProviderCard({
           <section>
             <div className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
               <ArrowRight className="h-3.5 w-3.5" />
-              {name} → Formly (generate + email)
+              {name} → Drive360 (generate + email)
             </div>
             <p className="mb-2 text-sm text-muted-foreground">
               Swap the URL to <code className="font-mono text-xs">/send</code>{" "}
@@ -454,7 +454,7 @@ function ProviderCard({
               </a>
             </Button>
             <Button asChild size="sm" variant="ghost">
-              <Link href="/docs/api">Formly API reference</Link>
+              <Link href="/docs/api">Drive360 API reference</Link>
             </Button>
           </div>
         </CardContent>

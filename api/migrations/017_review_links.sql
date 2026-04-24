@@ -1,4 +1,4 @@
--- External reviewer links: tokenized URLs that let a non-Formly user view a
+-- External reviewer links: tokenized URLs that let a non-Drive360 user view a
 -- rendered preview of a template, leave comments, and approve or reject —
 -- without creating an account. Their decisions + comments land in the same
 -- tables as internal reviewers (comments.author_id NULL, reviews with

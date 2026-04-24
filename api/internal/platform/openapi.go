@@ -13,11 +13,11 @@ func openapiSpec() map[string]any {
 	return map[string]any{
 		"openapi": "3.1.0",
 		"info": map[string]any{
-			"title":       "Formly API",
+			"title":       "Drive360 API",
 			"version":     "1.0.0",
-			"description": "REST API for Formly. Authenticate with a bearer token: a session JWT for first-party calls, or an API key (prefix `fk_`) for programmatic access.",
+			"description": "REST API for Drive360. Authenticate with a bearer token: a session JWT for first-party calls, or an API key (prefix `fk_`) for programmatic access.",
 			"contact": map[string]any{
-				"name": "Formly support",
+				"name": "Drive360 support",
 				"url":  "https://formly.dev/docs",
 			},
 		},

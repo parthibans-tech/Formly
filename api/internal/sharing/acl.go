@@ -136,6 +136,79 @@ func CanAccessFile(ctx context.Context, db pgxDB, claims *auth.Claims, fileID st
 	return exists, nil
 }
 
+// CanEditFile returns true when the user has *write* permission on the
+// file — i.e. they own it, or a resource_shares row with role='editor'
+// grants it (directly, via a group, or via a folder ancestor). Used by
+// mutation endpoints (template Rename / UpdateConfig / UpdateSource /
+// UpdateAcroformStructure) so a viewer-scoped share can't smuggle edits
+// through the API even when the UI hides the designer button.
+//
+// Viewers get `false` here even though `CanAccessFile` would return true
+// for them — that's the whole point of the distinction.
+//
+// Admins bypass the check (same rationale as CanAccessFile).
+func CanEditFile(ctx context.Context, db pgxDB, claims *auth.Claims, fileID string) (bool, error) {
+	if claims.IsAdmin() {
+		var exists bool
+		if err := db.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM files WHERE id=$1 AND org_id=$2)`,
+			fileID, claims.OrgID).Scan(&exists); err != nil {
+			return false, err
+		}
+		return exists, nil
+	}
+	// Short-circuit on ownership first. This is the overwhelmingly common
+	// case (users editing their own files), and keeping it as a dead-simple
+	// single-table lookup means we never have to trust the more elaborate
+	// folder-ancestry CTE below to return the right answer for owners —
+	// any glitch in the CTE query plan would otherwise silently downgrade
+	// owners to viewer mode in the UI.
+	var isOwner bool
+	if err := db.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM files WHERE id=$1 AND org_id=$2 AND owner_id=$3::uuid)`,
+		fileID, claims.OrgID, claims.UserID).Scan(&isOwner); err != nil {
+		return false, err
+	}
+	if isOwner {
+		return true, nil
+	}
+	// Not the owner — fall through to the shared-editor lookup. The
+	// recursive CTE is hoisted to the top of the statement (rather than
+	// nested inside `IN (...)`) so it parses cleanly on every Postgres
+	// version; the previous inline-CTE form was legal modern syntax but
+	// had tripped up on at least one deployment.
+	q := `
+		WITH RECURSIVE shared_folders AS (
+			SELECT rs.resource_id AS id FROM resource_shares rs
+			 WHERE rs.resource_type='folder' AND rs.role='editor'
+			   AND (
+				   rs.user_id=$3::uuid
+				   OR rs.group_id IN (SELECT gm.group_id FROM group_members gm WHERE gm.user_id=$3::uuid)
+			   )
+			UNION
+			SELECT fo.id FROM folders fo JOIN shared_folders sf ON fo.parent_id = sf.id
+		)
+		SELECT EXISTS(
+			SELECT 1 FROM files f
+			 WHERE f.id=$1 AND f.org_id=$2 AND (
+				f.id IN (
+					SELECT rs.resource_id FROM resource_shares rs
+					 WHERE rs.resource_type='file' AND rs.role='editor'
+					   AND (
+						   rs.user_id=$3::uuid
+						   OR rs.group_id IN (SELECT gm.group_id FROM group_members gm WHERE gm.user_id=$3::uuid)
+					   )
+				)
+				OR f.folder_id IN (SELECT id FROM shared_folders)
+			 )
+		)`
+	var exists bool
+	if err := db.QueryRow(ctx, q, fileID, claims.OrgID, claims.UserID).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
 // CanAccessFolder — same idea for folders.
 func CanAccessFolder(ctx context.Context, db pgxDB, claims *auth.Claims, folderID string) (bool, error) {
 	if claims.IsAdmin() {
@@ -413,6 +486,10 @@ type sharedFileDTO struct {
 	Role       string    `json:"role"`          // viewer | editor
 	SharedVia  string    `json:"sharedVia"`     // "user" | "group" | "folder"
 	CreatedAt  time.Time `json:"createdAt"`
+	// Per-user starred flag — whether the current caller has starred
+	// this shared file. Keeps UI parity with /v1/files: the star
+	// overlay should work in every view that shows files.
+	Starred bool `json:"starred"`
 }
 
 // SharedWithMe: GET /v1/shared-with-me — returns every file visible to me
@@ -448,9 +525,11 @@ func (h *Handler) SharedWithMe(w http.ResponseWriter, r *http.Request) {
 		         WHEN EXISTS(SELECT 1 FROM resource_shares WHERE resource_type='file' AND resource_id=f.id AND user_id=$1) THEN 'user'
 		         WHEN EXISTS(SELECT 1 FROM resource_shares WHERE resource_type='file' AND resource_id=f.id AND group_id IN (SELECT group_id FROM my_groups)) THEN 'group'
 		         ELSE 'folder'
-		       END AS shared_via
+		       END AS shared_via,
+		       (sf.user_id IS NOT NULL) AS starred
 		  FROM files f
 		  LEFT JOIN users u ON u.id = f.owner_id
+		  LEFT JOIN starred_files sf ON sf.file_id = f.id AND sf.user_id = $1
 		 WHERE f.org_id=$2 AND f.trashed_at IS NULL AND f.owner_id <> $1
 		   AND (
 		     f.id IN (
@@ -473,7 +552,7 @@ func (h *Handler) SharedWithMe(w http.ResponseWriter, r *http.Request) {
 		var d sharedFileDTO
 		var email *string
 		if err := rows.Scan(&d.ID, &d.Name, &d.Mime, &d.Size, &d.Status,
-			&d.TemplateID, &d.FolderID, &email, &d.CreatedAt, &d.Role, &d.SharedVia); err != nil {
+			&d.TemplateID, &d.FolderID, &email, &d.CreatedAt, &d.Role, &d.SharedVia, &d.Starred); err != nil {
 			writeErr(w, 500, "db_error", err.Error())
 			return
 		}

@@ -10,6 +10,7 @@ import {
   Move,
   PencilLine,
   Share2,
+  Star,
   Trash2,
 } from "lucide-react";
 import {
@@ -41,6 +42,9 @@ export type GridFile = {
   templateId?: string;
   folderId?: string | null;
   createdAt: string;
+  // Per-user starred flag. Rendered as a star overlay on the thumbnail
+  // when true; toggles via `onToggleStar`.
+  starred?: boolean;
 };
 
 export type GridCardMenuItem = {
@@ -65,6 +69,11 @@ type Props = {
   onShare?: () => void;
   onMove?: () => void;
   onRemove?: () => void;
+  // Optional star toggle. When provided, renders a small star button
+  // overlaid on the thumbnail's top-right corner (symmetric with the
+  // select checkbox on the top-left). Fires on click; the parent is
+  // responsible for updating `file.starred`. No callback = no overlay.
+  onToggleStar?: () => void;
   // If provided, completely replaces the default action menu.
   menuItems?: GridCardMenuItem[];
   // When true, clicking anywhere on the card (not a button/link) opens
@@ -94,6 +103,7 @@ export function FileGridCard({
   onShare,
   onMove,
   onRemove,
+  onToggleStar,
   menuItems,
   clickOpensDetails,
   showSelectCheckbox,
@@ -272,6 +282,37 @@ export function FileGridCard({
             )}
           >
             {selected ? <Check className="h-3 w-3" /> : null}
+          </button>
+        )}
+        {onToggleStar && (
+          // Top-right mirror of the select checkbox. Always visible
+          // when starred (so the user can see the state at a glance);
+          // fades in on hover otherwise so an unstarred grid isn't
+          // noisy. Stop-propagation keeps the card's open-details
+          // handler from firing on click.
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleStar();
+            }}
+            aria-label={file.starred ? "Unstar" : "Star"}
+            aria-pressed={!!file.starred}
+            title={file.starred ? "Starred — click to unstar" : "Star"}
+            className={cn(
+              "absolute right-2 top-2 z-10 grid h-6 w-6 place-items-center rounded-md border bg-background/90 shadow-sm backdrop-blur transition-opacity",
+              file.starred
+                ? "border-amber-400/40 opacity-100"
+                : "border-border opacity-0 group-hover:opacity-100"
+            )}
+          >
+            <Star
+              className={cn(
+                "h-3.5 w-3.5",
+                file.starred
+                  ? "fill-amber-400 text-amber-500"
+                  : "text-muted-foreground"
+              )}
+            />
           </button>
         )}
       </div>

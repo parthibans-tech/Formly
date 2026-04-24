@@ -150,7 +150,7 @@ export function FormBuilderDialog({ open, onOpenChange, onCreate, busy }: Props)
             Form builder
           </DialogTitle>
           <DialogDescription>
-            List the fields you want to collect. Formly will generate a clean
+            List the fields you want to collect. Drive360 will generate a clean
             form PDF, auto-arrange each input, and map every field so the
             template is ready to fill immediately.
           </DialogDescription>

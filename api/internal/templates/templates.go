@@ -26,6 +26,7 @@ import (
 	"github.com/go-pdf/fpdf"
 	"github.com/docforge/api/internal/jobs"
 	"github.com/docforge/api/internal/queue"
+	"github.com/docforge/api/internal/sharing"
 	"github.com/docforge/api/internal/storage"
 	"github.com/go-chi/chi/v5"
 	"github.com/hibiken/asynq"
@@ -52,6 +53,8 @@ func New(db *pgxpool.Pool, s *storage.Client) *Handler {
 // PDFs without form fields → mode=static (widgets added later via designer).
 // HTML files → mode=html with a config seeded from extracted placeholders.
 // Markdown files → mode=markdown with extracted placeholders.
+// Images (PNG/JPEG/WebP/GIF/BMP/TIFF) → mode=image so the file opens in
+// the image designer (crop / rotate / flip / resize / quality / upscale).
 // Anything else → no template.
 func (h *Handler) DetectAndCreate(ctx context.Context, fileID, orgID, name, mime, storageKey string) (string, error) {
 	// Auto-suffix the template name if another active template in this org
@@ -69,8 +72,64 @@ func (h *Handler) DetectAndCreate(ctx context.Context, fileID, orgID, name, mime
 		return h.detectMarkdown(ctx, fileID, orgID, resolved, storageKey)
 	case isHTML(mime, name):
 		return h.detectHTML(ctx, fileID, orgID, resolved, storageKey)
+	case isImage(mime, name):
+		return h.detectImage(ctx, fileID, orgID, resolved, storageKey, mime)
 	}
 	return "", nil
+}
+
+// isImage recognises the common raster formats the image designer can
+// decode + encode. SVG is intentionally excluded — it's vector and
+// has no raster ops (crop/rotate/flip), so it belongs elsewhere.
+func isImage(mime, name string) bool {
+	m := strings.ToLower(mime)
+	if strings.HasPrefix(m, "image/") {
+		// Guard against image/svg+xml — vector, no raster pipeline.
+		if strings.Contains(m, "svg") {
+			return false
+		}
+		return true
+	}
+	ext := strings.ToLower(filepath.Ext(name))
+	switch ext {
+	case ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff":
+		return true
+	}
+	return false
+}
+
+// detectImage seeds a mode=image template pointing at the uploaded raster.
+// Unlike the other modes there are no placeholders / fields to extract —
+// the whole editing surface is the image bytes themselves. We still stash
+// the source mime in config_json so the designer knows whether to default
+// the export format (e.g. keep PNG vs re-encode as JPEG for quality slider).
+func (h *Handler) detectImage(ctx context.Context, fileID, orgID, name, storageKey, mime string) (string, error) {
+	cfg := map[string]interface{}{
+		"sourceMime":       mime,
+		"sourceStorageKey": storageKey,
+	}
+	cfgBytes, _ := json.Marshal(cfg)
+
+	tx, err := h.DB.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback(ctx)
+
+	var tplID string
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO templates (org_id, file_id, mode, name, config_json) VALUES ($1,$2,'image',$3,$4) RETURNING id`,
+		orgID, fileID, name, cfgBytes,
+	).Scan(&tplID); err != nil {
+		return "", err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE files SET template_id=$1 WHERE id=$2`, tplID, fileID); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", err
+	}
+	return tplID, nil
 }
 
 func (h *Handler) detectPDF(ctx context.Context, fileID, orgID, name, storageKey string) (string, error) {
@@ -227,6 +286,12 @@ type templateDTO struct {
 	Fields     []fieldDTO             `json:"fields"`
 	Widgets    []gstatic.Widget       `json:"widgets"`
 	UpdatedAt  time.Time              `json:"updatedAt"`
+	// CanEdit mirrors the server-side role check so the designer UI can
+	// go read-only for viewers (banner + disabled Save/Rename) without
+	// having to rely on 403s to surface the restriction. Matches the
+	// `sharing.CanEditFile` rule: true for owners, editor-shared users,
+	// and admins; false for viewer-shared users.
+	CanEdit bool `json:"canEdit"`
 }
 
 func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
@@ -293,6 +358,20 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		dto.Widgets = []gstatic.Widget{}
 	}
 
+	// Compute edit permission alongside read access so the client can
+	// flip to read-only mode up-front instead of letting the user edit
+	// locally and hitting a 403 on save. Fail the GET on ACL errors
+	// rather than silently downgrading to viewer — a silent downgrade
+	// looks identical to a correct viewer-share result, which means
+	// owners would see their own files as read-only if the check ever
+	// blew up, and we'd have no signal that anything was wrong.
+	canEdit, err := sharing.CanEditFile(r.Context(), h.DB, c, dto.FileID)
+	if err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+	dto.CanEdit = canEdit
+
 	writeJSON(w, 200, dto)
 }
 
@@ -339,6 +418,17 @@ func (h *Handler) Rename(w http.ResponseWriter, r *http.Request) {
 		id, c.OrgID,
 	).Scan(&fileID, &currentName, &currentFileName); err != nil {
 		writeErr(w, 404, "not_found", "template not found")
+		return
+	}
+
+	// Viewer-scoped shares can SELECT this row but must not be able to
+	// mutate it. Block here before we start a write tx. 404 (not 403) so
+	// we don't leak that the template exists to a non-viewer.
+	if ok, err := sharing.CanEditFile(r.Context(), h.DB, c, fileID); err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	} else if !ok {
+		writeErr(w, 403, "forbidden", "you don't have edit access to this template")
 		return
 	}
 
@@ -416,6 +506,26 @@ func (h *Handler) UpdateConfig(w http.ResponseWriter, r *http.Request) {
 	cfgBytes, _ := json.Marshal(req.Config)
 
 	ctx := r.Context()
+
+	// Gate on edit permission before we even open the tx. Viewers can
+	// GET the template (CanAccessFile permits it) but must not mutate
+	// its config_json.
+	var fileID string
+	if err := h.DB.QueryRow(ctx,
+		`SELECT file_id FROM templates WHERE id=$1 AND org_id=$2`,
+		id, c.OrgID,
+	).Scan(&fileID); err != nil {
+		writeErr(w, 404, "not_found", "template not found")
+		return
+	}
+	if ok, err := sharing.CanEditFile(ctx, h.DB, c, fileID); err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	} else if !ok {
+		writeErr(w, 403, "forbidden", "you don't have edit access to this template")
+		return
+	}
+
 	tx, err := h.DB.Begin(ctx)
 	if err != nil {
 		writeErr(w, 500, "db_error", err.Error())
@@ -475,10 +585,20 @@ type generateReq struct {
 	Data    map[string]interface{} `json:"data"`
 	Flatten bool                   `json:"flatten"`
 	Async   bool                   `json:"async"`
+	// Preview routes the request through Runner.RunPreview instead of
+	// Runner.Run: the render is uploaded to a deterministic per-(user,
+	// template) temp key and returned as an inline-disposition presigned
+	// URL, with NO files row created. This is what the playground "Run"
+	// button and the view-only template page use — they want to iframe
+	// the output without polluting the user's Drive with a new file on
+	// every click. The explicit "Save to Drive" action in the playground
+	// omits this flag to take the persist path instead.
+	Preview bool `json:"preview"`
 }
 
 type generateResp struct {
 	OutputFileID string `json:"outputFileId,omitempty"`
+	OutputName   string `json:"outputName,omitempty"`
 	DownloadURL  string `json:"downloadUrl,omitempty"`
 	Bytes        int    `json:"bytes,omitempty"`
 	JobID        string `json:"jobId,omitempty"`
@@ -500,6 +620,26 @@ func (h *Handler) Generate(w http.ResponseWriter, r *http.Request) {
 
 	if !h.ownsTemplate(r.Context(), id, c.OrgID) {
 		writeErr(w, 404, "not_found", "template not found")
+		return
+	}
+
+	// Preview path: render-only, no Drive pollution. Uploads the bytes
+	// to a per-user-per-template temp key (overwrites on each call so
+	// nothing piles up), returns an inline-disposition presigned URL so
+	// the browser renders in an iframe instead of downloading. Async
+	// mode is irrelevant for previews — they're always sync.
+	if req.Preview {
+		res, err := h.Runner.RunPreview(r.Context(), c.OrgID, c.UserID, id, req.Data, req.Flatten)
+		if err != nil {
+			var fe *acroform.FillErrors
+			if errors.As(err, &fe) && fe != nil && len(fe.Errors) > 0 {
+				writeValidationErr(w, fe.Errors)
+				return
+			}
+			writeErr(w, 400, "fill_failed", err.Error())
+			return
+		}
+		writeJSON(w, 200, generateResp{DownloadURL: res.URL, Bytes: res.Bytes})
 		return
 	}
 
@@ -545,12 +685,15 @@ func (h *Handler) Generate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "fill_failed", err.Error())
 		return
 	}
+	// Non-preview Generate persists the rendered file to Drive and
+	// returns a download-disposition URL so the browser saves it —
+	// that's what "Generate" has always meant on this endpoint.
 	url, err := h.Storage.PresignGet(r.Context(), res.OutputKey, res.OutputName, 10*time.Minute)
 	if err != nil {
 		writeErr(w, 500, "presign", err.Error())
 		return
 	}
-	writeJSON(w, 200, generateResp{OutputFileID: res.OutputFileID, DownloadURL: url, Bytes: res.Bytes})
+	writeJSON(w, 200, generateResp{OutputFileID: res.OutputFileID, OutputName: res.OutputName, DownloadURL: url, Bytes: res.Bytes})
 }
 
 // Batch accepts a multipart upload (csv, xlsx, or tsv) and enqueues a batch
@@ -1143,7 +1286,7 @@ func buildFormPDF(orient, size, title, subtitle string, fields []FormBuilderFiel
 	pdf.SetFont("Helvetica", "I", 8)
 	pdf.SetTextColor(180, 180, 180)
 	pdf.SetXY(margin, pageH-margin+14)
-	pdf.Cell(contentW, 10, "Created with Formly")
+	pdf.Cell(contentW, 10, "Created with Drive360")
 
 	return pdf, widgets, nil
 }
@@ -1535,16 +1678,24 @@ func (h *Handler) UpdateSource(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "invalid_body", err.Error())
 		return
 	}
-	var mode, storageKey string
+	var mode, storageKey, fileID string
 	var cfgRaw []byte
 	var currentVersion int
 	err := h.DB.QueryRow(r.Context(),
-		`SELECT t.mode, t.config_json, t.version, f.storage_key
+		`SELECT t.mode, t.config_json, t.version, f.storage_key, t.file_id
 		 FROM templates t JOIN files f ON f.id=t.file_id
 		 WHERE t.id=$1 AND t.org_id=$2`, id, c.OrgID,
-	).Scan(&mode, &cfgRaw, &currentVersion, &storageKey)
+	).Scan(&mode, &cfgRaw, &currentVersion, &storageKey, &fileID)
 	if err != nil {
 		writeErr(w, 404, "not_found", "template not found")
+		return
+	}
+	// Viewer shares can read the source but must not overwrite it.
+	if ok, err := sharing.CanEditFile(r.Context(), h.DB, c, fileID); err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	} else if !ok {
+		writeErr(w, 403, "forbidden", "you don't have edit access to this template")
 		return
 	}
 	if req.ExpectedVersion != nil && *req.ExpectedVersion != currentVersion {
@@ -1846,6 +1997,14 @@ func (h *Handler) UpdateAcroformStructure(w http.ResponseWriter, r *http.Request
 	).Scan(&mode, &fileID, &currentVersion, &storageKey)
 	if err != nil {
 		writeErr(w, 404, "not_found", "template not found")
+		return
+	}
+	// Structure patches rewrite the backing PDF — strictly an editor op.
+	if ok, err := sharing.CanEditFile(ctx, h.DB, c, fileID); err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	} else if !ok {
+		writeErr(w, 403, "forbidden", "you don't have edit access to this template")
 		return
 	}
 	if mode != "acroform" {

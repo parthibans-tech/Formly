@@ -234,7 +234,7 @@ export default function SchedulesPage() {
             <EmptyState
               icon={CalendarClock}
               title="No schedules yet"
-              description="Pick a template, a cron expression, and a data payload — Formly does the rest."
+              description="Pick a template, a cron expression, and a data payload — Drive360 does the rest."
               action={
                 <Button onClick={() => setCreateOpen(true)} size="sm">
                   <Plus className="h-4 w-4" />

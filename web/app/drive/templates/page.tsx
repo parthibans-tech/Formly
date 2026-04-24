@@ -81,7 +81,7 @@ export default function TemplatesPage() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Templates</h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            Every file in your workspace that&apos;s wired to a Formly
+            Every file in your workspace that&apos;s wired to a Drive360
             template. Open one to edit its layout or map data.
           </p>
         </div>

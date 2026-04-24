@@ -199,8 +199,16 @@ func isEmptyValue(v interface{}) bool {
 	return false
 }
 
-// validateValue returns human-readable error messages for a rule violation.
+// ValidateValue returns human-readable error messages for a rule violation.
 // Empty values pass — callers handle "required" separately.
+//
+// Exported so non-acroform render paths (html/markdown/doc) can reuse the
+// same rule engine before dispatching to their template renderers,
+// giving every mode a single source of truth for how `data` is checked.
+func ValidateValue(v interface{}, r *ValidationRule) []string {
+	return validateValue(v, r)
+}
+
 func validateValue(v interface{}, r *ValidationRule) []string {
 	if r == nil {
 		return nil

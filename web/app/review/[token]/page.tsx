@@ -291,14 +291,14 @@ function Shell({ children }: { children: React.ReactNode }) {
           <span className="grid h-8 w-8 place-items-center rounded-md bg-primary text-primary-foreground">
             <FileSignature className="h-4 w-4" />
           </span>
-          Formly · Review
+          Drive360 · Review
         </div>
       </header>
       <div className="flex flex-1 items-start justify-center p-6">
         {children}
       </div>
       <footer className="border-t bg-background px-4 py-3 text-center text-[11px] text-muted-foreground">
-        Powered by Formly · This link was shared for one-time review.
+        Powered by Drive360 · This link was shared for one-time review.
       </footer>
     </div>
   );

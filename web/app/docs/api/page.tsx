@@ -52,7 +52,7 @@ export default function ApiDocsPage() {
             <span className="grid h-8 w-8 place-items-center rounded-md bg-primary text-primary-foreground">
               <FileSignature className="h-4 w-4" />
             </span>
-            Formly · API docs
+            Drive360 · API docs
           </Link>
           <div className="ml-auto flex items-center gap-1">
             <ThemeToggle />
@@ -75,7 +75,7 @@ export default function ApiDocsPage() {
             REST API · v1
           </div>
           <h1 className="text-3xl font-semibold tracking-tight">
-            Programmatic access to your Formly workspace
+            Programmatic access to your Drive360 workspace
           </h1>
           <p className="max-w-2xl text-muted-foreground">
             Every feature in the app is backed by a JSON REST endpoint. Create

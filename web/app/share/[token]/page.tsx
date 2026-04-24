@@ -236,7 +236,7 @@ export default function SharePage() {
             <span className="grid h-8 w-8 place-items-center rounded-md bg-primary text-primary-foreground">
               <FileSignature className="h-4 w-4" />
             </span>
-            Formly
+            Drive360
             <Badge variant="outline" className="ml-1 gap-1">
               <LinkIcon className="h-3 w-3" />
               Shared file

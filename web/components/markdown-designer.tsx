@@ -46,6 +46,7 @@ import {
   type Translations,
 } from "@/components/translations-dialog";
 import { FormLinksDialog } from "@/components/form-links-dialog";
+import { ApiGuideSheet } from "@/components/api-guide-trigger";
 import { SendEmailDialog } from "@/components/send-email-dialog";
 import { CollabDrawer } from "@/components/collab-drawer";
 import { MessageSquare } from "lucide-react";
@@ -72,9 +73,14 @@ type Template = {
   };
 };
 
-type Props = { tpl: Template };
+type Props = {
+  tpl: Template;
+  // Viewer shares land here too — short-circuit every mutation path
+  // instead of letting the user edit locally and then 403 on save.
+  readOnly?: boolean;
+};
 
-export default function MarkdownDesigner({ tpl: initialTpl }: Props) {
+export default function MarkdownDesigner({ tpl: initialTpl, readOnly = false }: Props) {
   const toast = useToast();
   const [tpl, setTpl] = useState(initialTpl);
   const [source, setSource] = useState("");
@@ -154,6 +160,7 @@ export default function MarkdownDesigner({ tpl: initialTpl }: Props) {
   }, [source, sampleJSON, tpl.id]);
 
   async function saveI18n(next: Translations) {
+    if (readOnly) return;
     setSavingI18n(true);
     try {
       const merged = {
@@ -177,6 +184,7 @@ export default function MarkdownDesigner({ tpl: initialTpl }: Props) {
   }
 
   async function saveComputed(defs: ComputedDef[]) {
+    if (readOnly) return;
     setSavingComputed(true);
     try {
       const merged = { ...(tpl.config || {}), computed: defs };
@@ -195,6 +203,7 @@ export default function MarkdownDesigner({ tpl: initialTpl }: Props) {
   }
 
   async function savePageLayout(next: PageLayout) {
+    if (readOnly) return;
     setSavingLayout(true);
     try {
       const merged = { ...(tpl.config || {}), pageLayout: next };
@@ -213,6 +222,7 @@ export default function MarkdownDesigner({ tpl: initialTpl }: Props) {
   }
 
   async function save(forceOverwrite = false) {
+    if (readOnly) return;
     setSaving(true);
     try {
       const body: any = { source };
@@ -344,9 +354,22 @@ export default function MarkdownDesigner({ tpl: initialTpl }: Props) {
   }, [source]);
 
   function openGenerate() {
-    setGenData(
-      JSON.stringify(skeleton(tpl.config.placeholders || []), null, 2)
-    );
+    // Prefer the sample data the user has been tweaking in the live
+    // preview — otherwise we'd silently overwrite their edits the moment
+    // they click Generate. Fall back to skeleton() only when the
+    // sampleJSON is blank/invalid so the dialog still opens with
+    // plausible defaults for fresh templates.
+    let seeded: Record<string, any> | null = null;
+    try {
+      const parsed = JSON.parse(sampleJSON || "{}");
+      if (parsed && typeof parsed === "object" && Object.keys(parsed).length > 0) {
+        seeded = parsed;
+      }
+    } catch {
+      seeded = null;
+    }
+    const base = seeded ?? skeleton(tpl.config.placeholders || []);
+    setGenData(JSON.stringify(base, null, 2));
     setGenOpen(true);
   }
 
@@ -412,6 +435,7 @@ export default function MarkdownDesigner({ tpl: initialTpl }: Props) {
                 Versions
               </Link>
             </Button>
+            <ApiGuideSheet templateId={tpl.id} templateName={tpl.name} />
             <Button variant="ghost" size="sm" asChild>
               <Link href={`/templates/${tpl.id}/playground`}>
                 <Sparkles className="h-4 w-4" />
@@ -477,7 +501,18 @@ export default function MarkdownDesigner({ tpl: initialTpl }: Props) {
             >
               <Keyboard className="h-4 w-4" />
             </Button>
-            <Button variant="outline" size="sm" onClick={() => save(false)} loading={saving}>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => save(false)}
+              loading={saving}
+              disabled={readOnly}
+              title={
+                readOnly
+                  ? "View-only access — ask the owner for edit access"
+                  : undefined
+              }
+            >
               <Save className="h-4 w-4" />
               {autoSave && lastSavedAt ? "Saved" : "Save"}
             </Button>

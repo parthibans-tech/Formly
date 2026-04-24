@@ -9,12 +9,15 @@
 package team
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	htmlpkg "html"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -29,6 +32,30 @@ import (
 type Handler struct {
 	DB   *pgxpool.Pool
 	Auth *auth.Handler
+
+	// Mailer is optional — when wired, CreateInvite emails the
+	// recipient with an accept link. Nil keeps tests / CLI that build
+	// a Handler directly working without an SMTP/SES dependency.
+	Mailer Notifier
+}
+
+// Notifier is the slim shape team needs from mail.Mailer. Declared
+// locally so this package never imports `internal/mail` (and thus
+// never picks up the email + generate transitive deps).
+type Notifier interface {
+	Send(ctx context.Context, opts NotifyOptions) (string, error)
+}
+
+type NotifyOptions struct {
+	OrgID    string
+	UserID   string
+	Kind     string
+	Source   string
+	To       []string
+	Subject  string
+	HTMLBody string
+	TextBody string
+	Metadata map[string]any
 }
 
 func New(db *pgxpool.Pool, a *auth.Handler) *Handler {
@@ -325,15 +352,92 @@ func (h *Handler) CreateInvite(w http.ResponseWriter, r *http.Request) {
 	events.Publish(r.Context(), "team.invited", c.OrgID, map[string]interface{}{
 		"inviteId": id, "email": email, "role": role,
 	})
+
+	// Best-effort send the invite email. The token is single-use and
+	// already sitting in the DB, so a delivery failure is recoverable —
+	// the admin can re-share the link from /settings/team. We surface
+	// an `emailStatus` field in the response so the UI can hint that
+	// no mail went out (e.g. when SES isn't configured).
+	emailStatus := h.sendInviteEmail(r.Context(), c, email, role, token, *expiresAt, id)
+
 	writeJSON(w, 200, map[string]any{
-		"id":        id,
-		"token":     token,
-		"email":     email,
-		"role":      role,
-		"createdAt": createdAt.Format(time.RFC3339),
-		"expiresAt": expiresAt.Format(time.RFC3339),
+		"id":          id,
+		"token":       token,
+		"email":       email,
+		"role":        role,
+		"createdAt":   createdAt.Format(time.RFC3339),
+		"expiresAt":   expiresAt.Format(time.RFC3339),
+		"emailStatus": emailStatus,
 	})
 }
+
+// sendInviteEmail dispatches the invitation email via the central
+// Mailer. Returns "sent" / "skipped" / "failed:<reason>" so the
+// settings/team page can show the admin what happened without making
+// them poke through the audit log.
+func (h *Handler) sendInviteEmail(
+	ctx context.Context,
+	c *auth.Claims,
+	to, role, token string,
+	expiresAt time.Time,
+	inviteID string,
+) string {
+	if h.Mailer == nil {
+		return "skipped"
+	}
+	acceptURL := appURL("/invite/" + token)
+	subject := c.Email + " invited you to Drive360"
+
+	html := `<div style="font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:560px">
+  <h2 style="margin:0 0 12px">You're invited to Drive360</h2>
+  <p><strong>` + escapeHTML(c.Email) + `</strong> added you as a
+     <strong>` + escapeHTML(role) + `</strong> on their workspace.</p>
+  <p style="margin:20px 0">
+    <a href="` + acceptURL + `"
+       style="display:inline-block;background:#0f172a;color:#fff;padding:10px 16px;border-radius:6px;text-decoration:none;font-weight:600">
+      Accept invitation
+    </a>
+  </p>
+  <p style="color:#6b7280;font-size:12px">
+    This link expires on ` + expiresAt.Format("Jan 2, 2006") + `. If the button
+    doesn't work, copy and paste this URL: <br/>
+    <code style="font-family:monospace">` + acceptURL + `</code>
+  </p>
+</div>`
+	text := c.Email + " invited you to Drive360 as " + role + ".\n" +
+		"Accept here: " + acceptURL + "\n" +
+		"This link expires on " + expiresAt.Format("Jan 2, 2006") + "."
+
+	_, err := h.Mailer.Send(ctx, NotifyOptions{
+		OrgID:    c.OrgID,
+		UserID:   c.UserID,
+		Kind:     "invitation",
+		Source:   "team.create_invite",
+		To:       []string{to},
+		Subject:  subject,
+		HTMLBody: html,
+		TextBody: text,
+		Metadata: map[string]any{
+			"inviteId":  inviteID,
+			"role":      role,
+			"expiresAt": expiresAt.Format(time.RFC3339),
+		},
+	})
+	if err != nil {
+		return "failed:" + err.Error()
+	}
+	return "sent"
+}
+
+func appURL(path string) string {
+	base := os.Getenv("APP_URL")
+	if base == "" {
+		base = "http://localhost:3000"
+	}
+	return base + path
+}
+
+func escapeHTML(s string) string { return htmlpkg.EscapeString(s) }
 
 func (h *Handler) RevokeInvite(w http.ResponseWriter, r *http.Request) {
 	c, err := adminOnly(r)

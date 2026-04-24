@@ -179,7 +179,7 @@ export function BatchDialog({ open, onOpenChange, templateId }: Props) {
               />
               <p className="text-[11px] text-muted-foreground">
                 The sheet must be shared as <strong>Anyone with the link</strong>{" "}
-                (viewer is fine). Formly fetches the public CSV export — no
+                (viewer is fine). Drive360 fetches the public CSV export — no
                 OAuth required.
               </p>
             </div>

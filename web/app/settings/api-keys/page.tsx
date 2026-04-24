@@ -221,7 +221,7 @@ export default function ApiKeysPage() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">API keys</h1>
           <p className="text-sm text-muted-foreground">
-            Programmatic access to your Formly workspace. Use a Bearer token in
+            Programmatic access to your Drive360 workspace. Use a Bearer token in
             the <code className="font-mono text-xs">Authorization</code> header
             to hit any <code className="font-mono text-xs">/v1/*</code>{" "}
             endpoint.

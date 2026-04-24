@@ -220,14 +220,14 @@ function PublicShell({ children }: { children: React.ReactNode }) {
           <span className="grid h-8 w-8 place-items-center rounded-md bg-primary text-primary-foreground">
             <FileSignature className="h-4 w-4" />
           </span>
-          Formly
+          Drive360
         </div>
       </header>
       <div className="flex flex-1 items-center justify-center p-6">
         {children}
       </div>
       <footer className="border-t bg-background px-4 py-3 text-center text-[11px] text-muted-foreground">
-        Powered by Formly · Your submissions are delivered to the template owner.
+        Powered by Drive360 · Your submissions are delivered to the template owner.
       </footer>
     </div>
   );

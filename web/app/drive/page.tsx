@@ -33,14 +33,20 @@ import {
   Search,
   Share2,
   SlidersHorizontal,
+  Star,
   Trash2,
   Upload,
   UploadCloud,
   Users,
   X,
 } from "lucide-react";
-import { api, clearSession, getToken, getUser } from "@/lib/api";
+import { api, ApiError, clearSession, getToken, getUser } from "@/lib/api";
 import { useToast } from "@/components/toast";
+import {
+  UploadConflictDialog,
+  type ConflictChoice,
+  type UploadConflict,
+} from "@/components/upload-conflict-dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -118,6 +124,8 @@ type FileItem = {
   templateId?: string;
   folderId?: string | null;
   createdAt: string;
+  // Per-user starred flag (see api/internal/files — starred_files JOIN).
+  starred?: boolean;
 };
 
 type Folder = {
@@ -155,6 +163,15 @@ export default function DrivePage() {
   const [uploading, setUploading] = useState<{ name: string; pct: number } | null>(
     null
   );
+  // Upload conflict prompt — non-null while we're waiting on the user
+  // to pick Replace / Keep / Cancel after a 409 from the server.
+  // `resolve` is the promise resolver the `upload()` fn awaits.
+  const [conflict, setConflict] = useState<
+    | ({
+        resolve: (choice: ConflictChoice) => void;
+      } & UploadConflict)
+    | null
+  >(null);
   const [err, setErr] = useState<string | null>(null);
   const [shareFor, setShareFor] = useState<FileItem | null>(null);
   const [previewFor, setPreviewFor] = useState<FileItem | null>(null);
@@ -164,12 +181,6 @@ export default function DrivePage() {
   const [sharePeopleFor, setSharePeopleFor] = useState<
     { id: string; name: string; type: "file" | "folder" } | null
   >(null);
-  // "My drive" vs "Shared with me". Sidebar pivot; drives which list
-  // endpoint we hit and whether folders render at all.
-  const [scope, setScope] = useState<"mine" | "shared">("mine");
-  const [sharedFiles, setSharedFiles] = useState<
-    (FileItem & { ownerEmail?: string; role?: string; sharedVia?: string })[]
-  >([]);
   const [search, setSearch] = useState("");
   const [dragActive, setDragActive] = useState(false);
   const [creating, setCreating] = useState(false);
@@ -200,25 +211,11 @@ export default function DrivePage() {
     setUser(getUser());
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [router, currentFolderId, scope]);
+  }, [router, currentFolderId]);
 
   async function load() {
     setLoading(true);
     try {
-      if (scope === "shared") {
-        // Shared-with-me is a flat list keyed to the user — no folder
-        // hierarchy from the viewer's perspective. We keep `files` /
-        // `folders` in sync so the rest of the page can still share
-        // filters + counts without branching everywhere.
-        const s = await api<{ files: typeof sharedFiles }>(
-          `/v1/shared-with-me`
-        );
-        setSharedFiles(s.files || []);
-        setFiles(s.files || []);
-        setFolders([]);
-        setBreadcrumbs([]);
-        return;
-      }
       const [f, d] = await Promise.all([
         api<{ files: FileItem[] }>(
           `/v1/files?folder=${encodeURIComponent(currentFolderId)}`
@@ -229,7 +226,6 @@ export default function DrivePage() {
       ]);
       setFiles(f.files);
       setFolders(d.folders);
-      setSharedFiles([]);
       if (currentFolderId) {
         const b = await api<{ breadcrumbs: Folder[] }>(
           `/v1/folders/${currentFolderId}/breadcrumbs`
@@ -245,17 +241,69 @@ export default function DrivePage() {
     }
   }
 
-  async function upload(file: File) {
+  // Open the conflict dialog and wait for the user's choice. Resolves
+  // with "replace" | "keep" | "cancel". Wrapped in a promise so the
+  // upload flow can `await` it inline.
+  function askConflict(info: UploadConflict): Promise<ConflictChoice> {
+    return new Promise((resolve) => {
+      setConflict({ ...info, resolve });
+    });
+  }
+
+  async function upload(
+    file: File,
+    conflictStrategy?: "replace" | "keep"
+  ) {
     setErr(null);
     setUploading({ name: file.name, pct: 0 });
     try {
-      const { fileId, uploadUrl } = await api<{
+      // Ask for an upload URL. The server checks for a same-name + same-type
+      // file in the current folder first; a 409 means the user has to pick
+      // Replace / Keep both / Cancel before we can proceed.
+      let createResp: {
         fileId: string;
         uploadUrl: string;
-      }>("/v1/files/upload-url", {
-        method: "POST",
-        body: JSON.stringify({ name: file.name, mime: file.type }),
-      });
+        resolvedName?: string;
+        replaced?: boolean;
+      };
+      try {
+        createResp = await api("/v1/files/upload-url", {
+          method: "POST",
+          body: JSON.stringify({
+            name: file.name,
+            mime: file.type,
+            folderId: currentFolderId || undefined,
+            conflict: conflictStrategy,
+          }),
+        });
+      } catch (e: any) {
+        if (
+          e instanceof ApiError &&
+          e.status === 409 &&
+          e.code === "name_conflict"
+        ) {
+          // Server tucks the collision details on the `error` object
+          // (existingFileId / existingName / isTemplate). Surface the
+          // dialog, then retry with whatever the user picked.
+          const raw = e.raw?.error ?? {};
+          setUploading(null);
+          const choice = await askConflict({
+            fileName: file.name,
+            existingFileId: raw.existingFileId || "",
+            existingName: raw.existingName || file.name,
+            isTemplate: !!raw.isTemplate,
+          });
+          if (choice === "cancel") {
+            toast.show("info", "Upload cancelled");
+            return;
+          }
+          await upload(file, choice);
+          return;
+        }
+        throw e;
+      }
+
+      const { fileId, uploadUrl, resolvedName, replaced } = createResp;
       await putWithProgress(uploadUrl, file, (pct) =>
         setUploading({ name: file.name, pct })
       );
@@ -263,12 +311,6 @@ export default function DrivePage() {
         `/v1/files/${fileId}/complete`,
         { method: "POST" }
       );
-      if (currentFolderId) {
-        await api(`/v1/files/${fileId}`, {
-          method: "PATCH",
-          body: JSON.stringify({ folderId: currentFolderId }),
-        });
-      }
       setUploading(null);
       await load();
       // Upload no longer auto-jumps into the designer. The file lands
@@ -276,12 +318,19 @@ export default function DrivePage() {
       // the designer from the file's row menu (or by clicking the
       // file). This matches the "I just want to keep the file" flow
       // and removes the surprise redirect for users who are mid-upload.
-      if (complete.templateId) {
-        toast.show("success", `Uploaded ${file.name}`, {
+      const displayName = resolvedName || file.name;
+      if (replaced) {
+        toast.show("success", `Replaced ${displayName}`);
+      } else if (resolvedName && resolvedName !== file.name) {
+        toast.show("success", `Uploaded as ${resolvedName}`, {
+          description: "A file with that name already existed.",
+        });
+      } else if (complete.templateId) {
+        toast.show("success", `Uploaded ${displayName}`, {
           description: "Saved to Drive — click the file to open designer.",
         });
       } else {
-        toast.show("success", `Uploaded ${file.name} to Drive`);
+        toast.show("success", `Uploaded ${displayName} to Drive`);
       }
     } catch (e: any) {
       setErr(e.message);
@@ -298,6 +347,26 @@ export default function DrivePage() {
       window.open(downloadUrl, "_blank");
     } catch (e: any) {
       toast.show("error", e.message);
+    }
+  }
+
+  // Optimistic star toggle — flip local state first, fire POST or
+  // DELETE depending on the new direction, roll back on failure.
+  // Keeps the star icon feeling instant even on high-latency links.
+  async function toggleStar(file: FileItem) {
+    const next = !file.starred;
+    setFiles((xs) =>
+      xs.map((x) => (x.id === file.id ? { ...x, starred: next } : x))
+    );
+    try {
+      await api(`/v1/files/${file.id}/star`, {
+        method: next ? "POST" : "DELETE",
+      });
+    } catch (e: any) {
+      setFiles((xs) =>
+        xs.map((x) => (x.id === file.id ? { ...x, starred: !next } : x))
+      );
+      toast.show("error", "Couldn't update star", { description: e.message });
     }
   }
 
@@ -1012,36 +1081,6 @@ export default function DrivePage() {
 
             <Separator orientation="vertical" className="hidden h-6 md:block" />
 
-            {/* My drive vs Shared with me — scope pivot. Sits at the
-                front of the filter row so it's the first thing the eye
-                lands on after the breadcrumb. */}
-            <div className="flex items-center gap-1 rounded-md border p-0.5">
-              {(
-                [
-                  { v: "mine", label: "My drive" },
-                  { v: "shared", label: "Shared with me" },
-                ] as const
-              ).map((t) => (
-                <button
-                  key={t.v}
-                  onClick={() => {
-                    setScope(t.v);
-                    setTypeFilter("all");
-                  }}
-                  className={cn(
-                    "rounded px-2 py-1 text-[11px] font-medium transition-colors",
-                    scope === t.v
-                      ? "bg-primary/10 text-primary"
-                      : "text-muted-foreground hover:text-foreground"
-                  )}
-                >
-                  {t.label}
-                </button>
-              ))}
-            </div>
-
-            <Separator orientation="vertical" className="hidden h-6 md:block" />
-
             <div className="flex flex-wrap items-center gap-1 overflow-x-auto">
               {(
                 [
@@ -1404,11 +1443,35 @@ export default function DrivePage() {
                         );
                         e.dataTransfer.effectAllowed = "move";
                       }}
-                      onClick={(e) => {
+                      onClick={async (e) => {
                         if ((e.target as HTMLElement).closest("button,a")) return;
                         if (file.templateId) {
                           router.push(`/templates/${file.templateId}/designer`);
-                        } else if (file.mime === "application/pdf") {
+                          return;
+                        }
+                        // Images / HTML / markdown uploaded before the
+                        // detector shipped have no templateId on their
+                        // files row — ask the server to backfill one
+                        // (idempotent; returns an existing ID if the
+                        // detector already ran). Falls through to the
+                        // old behaviour if the file isn't a known type.
+                        const isImage = file.mime.startsWith("image/") && !file.mime.includes("svg");
+                        if (isImage) {
+                          try {
+                            const { templateId } = await api<{ templateId: string }>(
+                              `/v1/files/${file.id}/ensure-template`,
+                              { method: "POST" }
+                            );
+                            if (templateId) {
+                              router.push(`/templates/${templateId}/designer`);
+                              return;
+                            }
+                          } catch (err: any) {
+                            toast.show("error", err.message);
+                            return;
+                          }
+                        }
+                        if (file.mime === "application/pdf") {
                           // Plain PDFs now open an in-app preview instead
                           // of a silent download. Users can still hit
                           // Download from the preview or the row menu.
@@ -1557,6 +1620,18 @@ export default function DrivePage() {
                               <Move className="h-4 w-4" />
                               Move…
                             </DropdownMenuItem>
+                            <DropdownMenuItem
+                              onClick={() => toggleStar(file)}
+                            >
+                              <Star
+                                className={cn(
+                                  "h-4 w-4",
+                                  file.starred &&
+                                    "fill-amber-400 text-amber-500"
+                                )}
+                              />
+                              {file.starred ? "Unstar" : "Star"}
+                            </DropdownMenuItem>
                             <DropdownMenuSeparator />
                             <DropdownMenuItem
                               onClick={() => remove(file)}
@@ -1618,6 +1693,7 @@ export default function DrivePage() {
                         selected={selected.has(file.id)}
                         bulkSelectActive={selected.size > 0}
                         onToggleSelect={() => toggleSelect(file.id)}
+                        onToggleStar={() => toggleStar(file)}
                         // Clicking a template card opens the designer;
                         // clicking a regular file card used to trigger a
                         // silent download, which was surprising and
@@ -1632,7 +1708,23 @@ export default function DrivePage() {
                             ? () => router.push(`/templates/${file.templateId}/designer`)
                             : file.mime === "application/pdf"
                               ? () => setPreviewFor(file)
-                              : undefined
+                              : file.mime.startsWith("image/") && !file.mime.includes("svg")
+                                ? async () => {
+                                    // Backfill the image template on demand — same
+                                    // path as the list-view click. Keeps parity
+                                    // between the two presentation modes so users
+                                    // see consistent behaviour from both.
+                                    try {
+                                      const { templateId } = await api<{ templateId: string }>(
+                                        `/v1/files/${file.id}/ensure-template`,
+                                        { method: "POST" }
+                                      );
+                                      if (templateId) router.push(`/templates/${templateId}/designer`);
+                                    } catch (err: any) {
+                                      toast.show("error", err.message);
+                                    }
+                                  }
+                                : undefined
                         }
                         onDownload={() => download(file.id)}
                         menuItems={[
@@ -1650,6 +1742,18 @@ export default function DrivePage() {
                           { label: "Share with people", icon: <Users className="h-4 w-4" />, onClick: () => setSharePeopleFor({ id: file.id, name: file.name, type: "file" }) },
                           { label: "Get link…", icon: <Share2 className="h-4 w-4" />, onClick: () => setShareFor(file) },
                           { label: "Move…", icon: <Move className="h-4 w-4" />, onClick: () => moveFile(file) },
+                          {
+                            label: file.starred ? "Unstar" : "Star",
+                            icon: (
+                              <Star
+                                className={cn(
+                                  "h-4 w-4",
+                                  file.starred && "fill-amber-400 text-amber-500"
+                                )}
+                              />
+                            ),
+                            onClick: () => toggleStar(file),
+                          },
                           { label: "Move to trash", icon: <Trash2 className="h-4 w-4" />, onClick: () => remove(file), destructive: true, separatorBefore: true },
                         ].filter(Boolean) as GridCardMenuItem[]}
                       />
@@ -1684,6 +1788,14 @@ export default function DrivePage() {
           </Card>
         </div>
       )}
+
+      <UploadConflictDialog
+        conflict={conflict}
+        onResolve={(choice) => {
+          conflict?.resolve(choice);
+          setConflict(null);
+        }}
+      />
 
       {shareFor && (
         <ShareModal

@@ -1,11 +1,12 @@
 // Package email implements pluggable transactional email delivery with a
-// small provider interface. Three providers ship today:
+// small provider interface. Four providers ship today:
 //
 //   - console : logs the send to stdout, always succeeds. Perfect for dev.
 //   - smtp    : net/smtp — covers most self-hosted deployments.
 //   - resend  : Resend.com HTTP API, JSON body with base64 attachment.
+//   - ses     : AWS SES v2 raw outbound endpoint, SigV4-signed, no SDK.
 //
-// Additional providers (Postmark, SES, Sendgrid) slot in by implementing
+// Additional providers (Postmark, Sendgrid, …) slot in by implementing
 // Provider and registering in `Build()`.
 package email
 
@@ -75,6 +76,8 @@ func Build(cfg Config) (Provider, error) {
 		return newSMTP(cfg.Extra)
 	case "resend":
 		return newResend(cfg.Extra)
+	case "ses":
+		return newSES(cfg.Extra)
 	default:
 		return nil, fmt.Errorf("unknown email provider %q", cfg.Provider)
 	}
@@ -165,7 +168,7 @@ func sendMailStartTLS(addr, host string, auth smtp.Auth, from string, to []strin
 		return err
 	}
 	defer c.Close()
-	if err := c.Hello("formly"); err != nil {
+	if err := c.Hello("drive360"); err != nil {
 		return err
 	}
 	if ok, _ := c.Extension("STARTTLS"); ok {

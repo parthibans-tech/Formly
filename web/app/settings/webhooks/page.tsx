@@ -245,7 +245,7 @@ export default function WebhooksPage() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Webhooks</h1>
           <p className="text-sm text-muted-foreground">
-            Fire HTTP POSTs to your services when things happen in Formly.
+            Fire HTTP POSTs to your services when things happen in Drive360.
             Each request is HMAC-signed so your receiver can verify
             authenticity.
           </p>
@@ -277,7 +277,7 @@ export default function WebhooksPage() {
             <EmptyState
               icon={WebhookIcon}
               title="No webhooks yet"
-              description="Subscribe your services to Formly events so you can react to generations, shares, uploads, and more."
+              description="Subscribe your services to Drive360 events so you can react to generations, shares, uploads, and more."
               action={
                 <Button onClick={() => setCreateOpen(true)} size="sm">
                   <Plus className="h-4 w-4" />
@@ -366,14 +366,14 @@ export default function WebhooksPage() {
           <CardTitle>Verifying signatures</CardTitle>
           <CardDescription>
             Each POST includes a{" "}
-            <code className="font-mono">Formly-Signature</code> header. Split
+            <code className="font-mono">Drive360-Signature</code> header. Split
             the timestamp from the signature and recompute the HMAC using your
             webhook&apos;s secret.
           </CardDescription>
         </CardHeader>
         <CardContent>
           <pre className="overflow-x-auto rounded-md border bg-muted/40 p-3 font-mono text-[11px]">
-{`Formly-Signature: t=1713876543,v1=2b1c7…8f42
+{`Drive360-Signature: t=1713876543,v1=2b1c7…8f42
 
 // Node.js verification
 import crypto from "node:crypto";
@@ -428,7 +428,7 @@ if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {
                 id="wh-url"
                 value={newURL}
                 onChange={(e) => setNewURL(e.target.value)}
-                placeholder="https://hooks.example.com/formly"
+                placeholder="https://hooks.example.com/drive360"
               />
             </div>
             <div className="space-y-1.5">

@@ -20,7 +20,7 @@ export function AuthLayout({ children }: { children: React.ReactNode }) {
             <span className="grid h-9 w-9 place-items-center rounded-md bg-white/15 backdrop-blur">
               <FileSignature className="h-5 w-5" />
             </span>
-            Formly
+            Drive360
           </Link>
         </div>
         <div className="relative space-y-6">
@@ -41,7 +41,7 @@ export function AuthLayout({ children }: { children: React.ReactNode }) {
           </ul>
         </div>
         <div className="relative text-xs text-white/70">
-          © {new Date().getFullYear()} Formly. All rights reserved.
+          © {new Date().getFullYear()} Drive360. All rights reserved.
         </div>
       </aside>
       <main className="flex min-h-screen items-center justify-center bg-background p-6">

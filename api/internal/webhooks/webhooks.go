@@ -321,7 +321,7 @@ func (h *Handler) Test(w http.ResponseWriter, r *http.Request) {
 		OrgID:     c.OrgID,
 		Timestamp: time.Now(),
 		Payload: map[string]interface{}{
-			"message": "Hello from Formly — your webhook is reachable.",
+			"message": "Hello from Drive360 — your webhook is reachable.",
 		},
 	}
 	body, _ := json.Marshal(payload)
@@ -457,8 +457,8 @@ func deliver(ctx context.Context, url, secret string, body []byte) (status strin
 		return "failed", 0, "", err, time.Since(start)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "Formly-Webhook/1.0")
-	req.Header.Set("Formly-Signature", "t="+timestamp+",v1="+signature)
+	req.Header.Set("User-Agent", "Drive360-Webhook/1.0")
+	req.Header.Set("Drive360-Signature", "t="+timestamp+",v1="+signature)
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)

@@ -88,6 +88,7 @@ import {
 } from "@/components/designer/widget-context-menu";
 import { SchemaPanel } from "@/components/designer/schema-panel";
 import { LayersPanel, type LayerWidget } from "@/components/designer/layers-panel";
+import { GroupsPanel, type GroupWidget } from "@/components/designer/groups-panel";
 import { AcroFormPanel } from "@/components/designer/acroform-panel";
 import { TabOrderPanel, type TabWidget } from "@/components/designer/tab-order-panel";
 import { isAcroFieldType } from "@/lib/acroform-types";
@@ -114,6 +115,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { InlineRenameTitle } from "@/components/designer/inline-rename-title";
+import { ApiGuideSheet } from "@/components/api-guide-trigger";
 import { Label } from "@/components/ui/label";
 import { TYPOGRAPHY_PRESETS, FONT_FAMILIES } from "@/lib/font-presets";
 import {
@@ -157,6 +159,12 @@ type Template = {
 type Props = {
   tpl: Template;
   previewUrl: string;
+  // View-only viewers from resource_shares (role=viewer) reach this page
+  // too — they should see the design but not be able to persist changes.
+  // When set, Save is disabled and autosave is short-circuited so we don't
+  // hammer the server with 403s from local edits. Local state still
+  // accepts changes (so users can poke around) — nothing persists.
+  readOnly?: boolean;
 };
 
 const PALETTE: { type: Widget["type"]; label: string; defaultW: number; defaultH: number; group?: string }[] = [
@@ -190,7 +198,7 @@ const GRID_PT = 6;
 // Autosave debounce after the last edit.
 const AUTOSAVE_MS = 1800;
 
-export default function StaticDesigner({ tpl, previewUrl }: Props) {
+export default function StaticDesigner({ tpl, previewUrl, readOnly = false }: Props) {
   const toast = useToast();
   // Hydrate persisted locked/hidden flags out of `props.*` so they survive
   // reload (see save() for the mirror side of this tunneling).
@@ -245,7 +253,7 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
   const [showThumbs, setShowThumbs] = useState(true);
   // Left rail controls which side panel is visible. Single-panel model
   // gives the canvas more room; clicking the active icon collapses it.
-  type LeftPanel = "widgets" | "pages" | "schema" | "layers" | "inspect" | "taborder" | null;
+  type LeftPanel = "widgets" | "pages" | "schema" | "layers" | "groups" | "inspect" | "taborder" | null;
   const [activePanel, setActivePanel] = useState<LeftPanel>("widgets");
   // Live preview: when on, widgets render the resolved value from the
   // sample data instead of the dataKey name — like turning on "Preview"
@@ -721,6 +729,54 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
     setSelectedIds(widgets.filter((w) => w.props?._group === groupId).map((w) => w.id));
   }
 
+  /** Rename a group — writes props._groupName on every member. Empty label
+   *  clears the name (falling back to the auto "Group xxxx" display). */
+  function renameGroup(groupId: string, name: string) {
+    const trimmed = name.trim();
+    history.commit(
+      widgets.map((w) => {
+        if (w.props?._group !== groupId) return w;
+        if (trimmed === "") {
+          // eslint-disable-next-line @typescript-eslint/no-unused-vars
+          const { _groupName, ...rest } = w.props ?? {};
+          return { ...w, props: rest };
+        }
+        return { ...w, props: { ...w.props, _groupName: trimmed } };
+      })
+    );
+  }
+
+  /** Ungroup by group id — strips _group/_groupName from every member. */
+  function ungroupById(groupId: string) {
+    history.commit(
+      widgets.map((w) => {
+        if (w.props?._group !== groupId) return w;
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        const { _group, _groupName, ...rest } = w.props ?? {};
+        return { ...w, props: rest };
+      })
+    );
+  }
+
+  /** Delete every widget that belongs to the group. */
+  function deleteGroupById(groupId: string) {
+    const remaining = widgets.filter((w) => w.props?._group !== groupId);
+    history.commit(remaining);
+    setSelectedIds((ids) =>
+      ids.filter((id) => remaining.some((w) => w.id === id))
+    );
+  }
+
+  /** Count of distinct groups on the template — drives the rail badge. */
+  const groupCount = useMemo(() => {
+    const s = new Set<string>();
+    for (const w of widgets) {
+      const g = w.props?._group as string | undefined;
+      if (g) s.add(g);
+    }
+    return s.size;
+  }, [widgets]);
+
   // WIDGET RENAME (layers panel) -----------------------------------------
   function renameWidget(id: string, label: string) {
     setWidgets((prev) =>
@@ -962,6 +1018,10 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
 
   // SAVE / AUTOSAVE ------------------------------------------------------
   const save = useCallback(async () => {
+    // Viewer shares reach this component too — short-circuit locally so
+    // autosave doesn't spam 403s for every keystroke. The top banner on
+    // the designer page already tells the user nothing will persist.
+    if (readOnly) return;
     setSaving(true);
     try {
       const payload = widgets.map((w) => ({
@@ -1005,7 +1065,7 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
     } finally {
       setSaving(false);
     }
-  }, [widgets, tpl.id, toast]);
+  }, [widgets, tpl.id, toast, readOnly]);
 
   // Debounced autosave — fires AUTOSAVE_MS after the last mutation.
   const firstRender = useRef(true);
@@ -1190,8 +1250,25 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
 
   // GENERATE / BATCH -----------------------------------------------------
   function openGenerate() {
-    const skel: Record<string, string> = {};
-    for (const w of widgets) skel[w.dataKey] = "";
+    // Seed the Generate dialog with whatever's in the designer's live
+    // sample data, falling back to empty strings for any widget key
+    // that's missing. The old implementation always blanked everything,
+    // which meant hitting Generate right after designing produced a PDF
+    // with no text overlaid — the preview showed just the empty
+    // AcroForm widget boxes with no resolved values, and users
+    // reasonably concluded "no content is displaying".
+    let base: Record<string, any> = {};
+    try {
+      const parsed = JSON.parse(sampleJSON || "{}");
+      if (parsed && typeof parsed === "object") base = parsed;
+    } catch {
+      base = {};
+    }
+    const skel: Record<string, any> = { ...base };
+    for (const w of widgets) {
+      if (!w.dataKey) continue;
+      if (!(w.dataKey in skel)) skel[w.dataKey] = "";
+    }
     setGenJSON(JSON.stringify(skel, null, 2));
     setGenOpen(true);
   }
@@ -1572,8 +1649,13 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
           </button>
           <button
             onClick={save}
-            disabled={saving}
-            className="px-4 py-2 text-sm border rounded hover:bg-gray-50 disabled:opacity-50"
+            disabled={saving || readOnly}
+            title={
+              readOnly
+                ? "View-only access — ask the owner for edit access"
+                : undefined
+            }
+            className="px-4 py-2 text-sm border rounded hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {saving ? "Saving…" : "Save"}
           </button>
@@ -1583,6 +1665,9 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
           >
             Generate
           </button>
+          {/* API integration guide — drawer with endpoint, payload, and
+              runnable snippets derived from this template's schema. */}
+          <ApiGuideSheet templateId={tpl.id} templateName={tpl.name} />
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <button
@@ -1738,6 +1823,15 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
             badge={widgets.length || undefined}
           />
           <RailBtn
+            icon={Group}
+            label="Groups"
+            active={activePanel === "groups"}
+            onClick={() =>
+              setActivePanel((p) => (p === "groups" ? null : "groups"))
+            }
+            badge={groupCount || undefined}
+          />
+          <RailBtn
             icon={ShieldCheck}
             label="Validation"
             active={activePanel === "inspect"}
@@ -1863,6 +1957,21 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
               }}
               onRename={renameWidget}
               onSelectGroup={selectGroup}
+              onGroupSelection={groupSelection}
+              onUngroupSelection={ungroupSelection}
+            />
+          </aside>
+        )}
+        {activePanel === "groups" && (
+          <aside className="w-64 shrink-0 border-r bg-muted/20">
+            <GroupsPanel
+              widgets={widgets as GroupWidget[]}
+              selectedIds={selectedIds}
+              onCreateGroup={groupSelection}
+              onRenameGroup={renameGroup}
+              onSelectGroup={selectGroup}
+              onUngroup={ungroupById}
+              onDeleteGroup={deleteGroupById}
             />
           </aside>
         )}

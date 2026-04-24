@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useMemo } from "react";
-import { MoreHorizontal, PencilLine, Download, RotateCcw, Trash2 } from "lucide-react";
+import { MoreHorizontal, PencilLine, Download, RotateCcw, Star, Trash2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -29,6 +29,10 @@ export type FileItem = {
   templateId?: string;
   folderId?: string | null;
   createdAt: string;
+  // Per-user starred flag — true when the current caller has starred
+  // this file. Optional because the server may omit it on views that
+  // don't join starred_files (older handlers, public share endpoints).
+  starred?: boolean;
 };
 
 type RowAction = {
@@ -36,6 +40,25 @@ type RowAction = {
   icon: React.ReactNode;
   onClick: (file: FileItem) => void;
   destructive?: boolean;
+};
+
+/**
+ * Optional multi-select plumbing. Opt in by passing `selection` — existing
+ * callers (recent, templates, shared) don't need to change anything. The
+ * Trash page uses this to wire up bulk restore / bulk permanent-delete.
+ */
+export type FileListSelection = {
+  /** Selected file IDs. Order doesn't matter; Set for O(1) lookup. */
+  ids: Set<string>;
+  /** Toggle a single file in/out of the selection. */
+  onToggle: (id: string) => void;
+  /**
+   * "Select all visible" handler. Receives the IDs of files that pass the
+   * current filter (since the user probably only wants to act on what
+   * they can actually see on screen). If omitted, the select-all
+   * checkbox is hidden.
+   */
+  onToggleAll?: (visibleIds: string[]) => void;
 };
 
 type Props = {
@@ -46,6 +69,15 @@ type Props = {
   view?: ViewMode;
   actorInitials?: string;
   actorLabel?: string;
+  selection?: FileListSelection;
+  /**
+   * Optional per-file star toggle. When provided, the grid cards render
+   * a star overlay on the thumbnail and list rows render a star cell
+   * before the name column. The callback is fired whenever the user
+   * clicks either affordance; the parent owns optimistic-update logic
+   * (flip `file.starred` locally, issue POST/DELETE, roll back on error).
+   */
+  onToggleStar?: (file: FileItem) => void;
 };
 
 export function FileList({
@@ -56,6 +88,8 @@ export function FileList({
   view = "grid",
   actorInitials = "?",
   actorLabel = "Modified",
+  selection,
+  onToggleStar,
 }: Props) {
   const filtered = useMemo(() => {
     const q = filter?.trim().toLowerCase();
@@ -65,6 +99,23 @@ export function FileList({
         f.name.toLowerCase().includes(q) || f.mime.toLowerCase().includes(q)
     );
   }, [files, filter]);
+
+  // Aggregate select-all state: unchecked / indeterminate / checked, based
+  // on how many visible files are in the selection set.
+  const visibleIds = useMemo(() => filtered.map((f) => f.id), [filtered]);
+  const visibleSelectedCount = useMemo(() => {
+    if (!selection) return 0;
+    let n = 0;
+    for (const id of visibleIds) if (selection.ids.has(id)) n++;
+    return n;
+  }, [selection, visibleIds]);
+  const allVisibleSelected =
+    visibleIds.length > 0 && visibleSelectedCount === visibleIds.length;
+  const someVisibleSelected =
+    visibleSelectedCount > 0 && !allVisibleSelected;
+  // True when the parent is in bulk-select mode (at least one selection).
+  // Drives the always-visible checkboxes on grid cards.
+  const bulkSelectActive = (selection?.ids.size ?? 0) > 0;
 
   if (filtered.length === 0) {
     return <>{emptyState}</>;
@@ -97,6 +148,14 @@ export function FileList({
               actorLabel={actorLabel}
               menuItems={menuItems}
               draggable={false}
+              selected={selection?.ids.has(file.id)}
+              onToggleSelect={
+                selection ? () => selection.onToggle(file.id) : undefined
+              }
+              bulkSelectActive={bulkSelectActive}
+              onToggleStar={
+                onToggleStar ? () => onToggleStar(file) : undefined
+              }
             />
           );
         })}
@@ -109,6 +168,37 @@ export function FileList({
       <table className="w-full text-sm">
         <thead>
           <tr className="border-b bg-muted/40 text-left text-xs uppercase tracking-wide text-muted-foreground">
+            {/* Only render the select-all header cell when bulk selection
+                is actually wired up by the caller (selection + onToggleAll).
+                Recent / Templates / Shared don't pass `selection`, so they
+                get the original 5-column layout unchanged. */}
+            {selection && selection.onToggleAll && (
+              <th scope="col" className="w-10 px-4 py-2.5">
+                <input
+                  type="checkbox"
+                  aria-label={
+                    allVisibleSelected
+                      ? "Clear selection"
+                      : "Select all visible"
+                  }
+                  checked={allVisibleSelected}
+                  ref={(el) => {
+                    // Native indeterminate state must be set imperatively
+                    // — React doesn't have a prop for it.
+                    if (el) el.indeterminate = someVisibleSelected;
+                  }}
+                  onChange={() => selection.onToggleAll!(visibleIds)}
+                  className="h-4 w-4 cursor-pointer"
+                />
+              </th>
+            )}
+            {onToggleStar && (
+              // Star column. Narrow fixed width so it doesn't shove the
+              // other columns around. No header label — the column is
+              // self-explanatory and a "Star" header reads like a bulk
+              // action the user expected to click.
+              <th scope="col" className="w-10 px-2 py-2.5" aria-label="Starred" />
+            )}
             <th scope="col" className="px-4 py-2.5 font-medium">Name</th>
             <th scope="col" className="px-4 py-2.5 font-medium">Type</th>
             <th scope="col" className="px-4 py-2.5 font-medium">Size</th>
@@ -120,11 +210,50 @@ export function FileList({
           {filtered.map((file) => {
             const Icon = iconForMime(file.mime);
             const rowActions = actions ? actions(file) : [];
+            const isSelected = selection?.ids.has(file.id) ?? false;
             return (
               <tr
                 key={file.id}
-                className="group border-b last:border-0 transition-colors hover:bg-accent/40"
+                className={cn(
+                  "group border-b last:border-0 transition-colors hover:bg-accent/40",
+                  isSelected && "bg-primary/5"
+                )}
               >
+                {selection && selection.onToggleAll && (
+                  <td className="px-4 py-3">
+                    <input
+                      type="checkbox"
+                      aria-label={isSelected ? "Deselect" : "Select"}
+                      checked={isSelected}
+                      onChange={() => selection.onToggle(file.id)}
+                      onClick={(e) => e.stopPropagation()}
+                      className="h-4 w-4 cursor-pointer"
+                    />
+                  </td>
+                )}
+                {onToggleStar && (
+                  <td className="px-2 py-3">
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onToggleStar(file);
+                      }}
+                      aria-label={file.starred ? "Unstar" : "Star"}
+                      aria-pressed={!!file.starred}
+                      title={file.starred ? "Starred — click to unstar" : "Star"}
+                      className="grid h-7 w-7 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                    >
+                      <Star
+                        className={cn(
+                          "h-4 w-4",
+                          file.starred
+                            ? "fill-amber-400 text-amber-500"
+                            : "opacity-60"
+                        )}
+                      />
+                    </button>
+                  </td>
+                )}
                 <td className="px-4 py-3">
                   <div className="flex items-center gap-2.5">
                     <span

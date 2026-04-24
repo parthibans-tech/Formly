@@ -84,7 +84,7 @@ func (h *Handler) Enroll(w http.ResponseWriter, r *http.Request) {
 	}
 	issuer := os.Getenv("MFA_ISSUER")
 	if issuer == "" {
-		issuer = "Formly"
+		issuer = "Drive360"
 	}
 	url := OtpauthURL(issuer, c.Email, secret)
 	audit.LogHTTP(r, h.DB, "mfa.enroll", "user", c.UserID, nil)

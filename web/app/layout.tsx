@@ -7,7 +7,7 @@ import { ConfirmProvider } from "@/components/ui/confirm";
 import { PromptProvider } from "@/components/ui/prompt";
 
 export const metadata: Metadata = {
-  title: "Formly — Document automation platform",
+  title: "Drive360 — Document automation platform",
   description:
     "Design, fill, and share PDF & HTML documents. Upload forms, map fields, generate in bulk.",
 };

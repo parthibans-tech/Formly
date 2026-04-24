@@ -169,7 +169,7 @@ export function FormLinksDialog({
           <DialogDescription>
             A shareable URL that renders a web form from this template&apos;s
             placeholders. End-users submit the form, get a PDF back — no
-            Formly account required.
+            Drive360 account required.
           </DialogDescription>
         </DialogHeader>
 
@@ -249,7 +249,7 @@ export function FormLinksDialog({
             <EmptyState
               icon={Globe2}
               title="No form links yet"
-              description="Share a link so non-Formly users can fill this template on the web."
+              description="Share a link so non-Drive360 users can fill this template on the web."
               className="border-0"
             />
           ) : (

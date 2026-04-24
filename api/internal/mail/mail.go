@@ -1,6 +1,11 @@
 // Package mail wraps the email package with HTTP handlers and persistence.
 // Separate from `internal/email` (the provider layer) so the frontend-facing
-// routes stay cohesive alongside DB audit logging.
+// routes stay cohesive alongside the audit log + super-admin tracking.
+//
+// The actual send-and-audit pipeline lives in mailer.go (Mailer struct).
+// Every other package — sharing.access_requests, team.invites, mfa,
+// scheduled.runs — should call Mailer.Send rather than building an
+// email.Provider themselves so audit + env fallback stay consistent.
 package mail
 
 import (
@@ -8,12 +13,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/docforge/api/internal/auth"
 	"github.com/docforge/api/internal/email"
-	"github.com/docforge/api/internal/events"
 	"github.com/docforge/api/internal/generate"
 	"github.com/docforge/api/internal/storage"
 	"github.com/go-chi/chi/v5"
@@ -25,22 +30,40 @@ type Handler struct {
 	DB      *pgxpool.Pool
 	Storage *storage.Client
 	Runner  *generate.Runner
+
+	// Mailer is the shared sender every other package can reach via
+	// the public Send method. We keep it on the handler so the HTTP
+	// routes (TestSend, SendTemplate) and the package's helpers
+	// share one configured instance.
+	Mailer *Mailer
 }
 
 func New(db *pgxpool.Pool, s *storage.Client, r *generate.Runner) *Handler {
-	return &Handler{DB: db, Storage: s, Runner: r}
+	return &Handler{DB: db, Storage: s, Runner: r, Mailer: NewMailer(db)}
 }
 
 // -- settings endpoints --------------------------------------------------
 
 type settingsDTO struct {
-	Provider      string                 `json:"provider"`
-	FromName      string                 `json:"fromName,omitempty"`
-	FromEmail     string                 `json:"fromEmail,omitempty"`
-	ReplyTo       string                 `json:"replyTo,omitempty"`
-	Config        map[string]interface{} `json:"config,omitempty"`
-	UpdatedAt     string                 `json:"updatedAt,omitempty"`
-	IsConfigured  bool                   `json:"isConfigured"`
+	Provider     string                 `json:"provider"`
+	FromName     string                 `json:"fromName,omitempty"`
+	FromEmail    string                 `json:"fromEmail,omitempty"`
+	ReplyTo      string                 `json:"replyTo,omitempty"`
+	Config       map[string]interface{} `json:"config,omitempty"`
+	UpdatedAt    string                 `json:"updatedAt,omitempty"`
+	IsConfigured bool                   `json:"isConfigured"`
+
+	// EnvFallback exposes whether the system has an env-based default
+	// the org will use when this row is missing. The settings page
+	// surfaces this so admins know mail will work even if they don't
+	// configure anything per-org.
+	EnvFallback *envFallbackDTO `json:"envFallback,omitempty"`
+}
+
+type envFallbackDTO struct {
+	Provider  string `json:"provider"`
+	FromEmail string `json:"fromEmail"`
+	FromName  string `json:"fromName,omitempty"`
 }
 
 func (h *Handler) GetSettings(w http.ResponseWriter, r *http.Request) {
@@ -56,7 +79,10 @@ func (h *Handler) GetSettings(w http.ResponseWriter, r *http.Request) {
 	).Scan(&provider, &fromName, &fromEmail, &replyTo, &cfg, &updatedAt)
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			writeJSON(w, 200, settingsDTO{Provider: "", IsConfigured: false})
+			writeJSON(w, 200, settingsDTO{
+				Provider: "", IsConfigured: false,
+				EnvFallback: h.envFallbackDTO(),
+			})
 			return
 		}
 		writeErr(w, 500, "db_error", err.Error())
@@ -64,9 +90,9 @@ func (h *Handler) GetSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	var extra map[string]interface{}
 	_ = json.Unmarshal(cfg, &extra)
-	// Redact obvious secrets.
+	// Redact obvious secrets before sending the row back to the browser.
 	if extra != nil {
-		for _, k := range []string{"password", "apiKey", "secret"} {
+		for _, k := range []string{"password", "apiKey", "secret", "secretKey"} {
 			if _, ok := extra[k]; ok {
 				extra[k] = "●●●●●●"
 			}
@@ -76,7 +102,19 @@ func (h *Handler) GetSettings(w http.ResponseWriter, r *http.Request) {
 		Provider: provider, FromName: fromName, FromEmail: fromEmail,
 		ReplyTo: replyTo, Config: extra,
 		UpdatedAt: updatedAt.Format(time.RFC3339), IsConfigured: true,
+		EnvFallback: h.envFallbackDTO(),
 	})
+}
+
+func (h *Handler) envFallbackDTO() *envFallbackDTO {
+	if !h.Mailer.envHasFrom {
+		return nil
+	}
+	return &envFallbackDTO{
+		Provider:  h.Mailer.envCfg.Provider,
+		FromEmail: h.Mailer.envCfg.FromEmail,
+		FromName:  h.Mailer.envCfg.FromName,
+	}
 }
 
 type saveSettingsReq struct {
@@ -154,6 +192,8 @@ func (h *Handler) SaveSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 // TestSend fires a plaintext email to the caller to verify delivery works.
+// Routes through the Mailer so it's audited like every other send and the
+// admin can see "yes, the test attempt did go out and got providerID X."
 func (h *Handler) TestSend(w http.ResponseWriter, r *http.Request) {
 	c := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
 	var req struct {
@@ -163,22 +203,20 @@ func (h *Handler) TestSend(w http.ResponseWriter, r *http.Request) {
 	if req.To == "" {
 		req.To = c.Email
 	}
-	cfg, err := h.loadConfig(r.Context(), c.OrgID)
+
+	_, err := h.Mailer.Send(r.Context(), SendOptions{
+		OrgID:  c.OrgID,
+		UserID: c.UserID,
+		Kind:   "test",
+		Source: "mail.test",
+		Message: email.Message{
+			To:       []string{req.To},
+			Subject:  "Drive360 test email",
+			TextBody: "This is a test from Drive360 — your email settings are working.",
+			HTMLBody: "<p>This is a test from <strong>Drive360</strong> — your email settings are working.</p>",
+		},
+	})
 	if err != nil {
-		writeErr(w, 400, "no_settings", "email settings are not configured")
-		return
-	}
-	prov, err := email.Build(cfg)
-	if err != nil {
-		writeErr(w, 400, "bad_config", err.Error())
-		return
-	}
-	if _, err := prov.Send(r.Context(), email.Message{
-		From: cfg.FromEmail, FromName: cfg.FromName, ReplyTo: cfg.ReplyTo,
-		To: []string{req.To}, Subject: "Formly test email",
-		TextBody: "This is a test from Formly — your email settings are working.",
-		HTMLBody: "<p>This is a test from <strong>Formly</strong> — your email settings are working.</p>",
-	}); err != nil {
 		writeErr(w, 502, "send_failed", err.Error())
 		return
 	}
@@ -211,21 +249,11 @@ func (h *Handler) SendTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.TrimSpace(req.Subject) == "" {
-		req.Subject = "Your document from Formly"
+		req.Subject = "Your document from Drive360"
 	}
 
-	cfg, err := h.loadConfig(r.Context(), c.OrgID)
-	if err != nil {
-		writeErr(w, 400, "no_settings", "email is not configured for this organization")
-		return
-	}
-	prov, err := email.Build(cfg)
-	if err != nil {
-		writeErr(w, 400, "bad_config", err.Error())
-		return
-	}
-
-	// Generate the PDF first so send failures don't lose the file.
+	// Generate the PDF first so send failures don't lose the file —
+	// the audit row will reference the OutputFileID either way.
 	res, err := h.Runner.Run(r.Context(), c.OrgID, c.UserID, tplID, req.Data, false)
 	if err != nil {
 		writeErr(w, 500, "render", err.Error())
@@ -242,120 +270,203 @@ func (h *Handler) SendTemplate(w http.ResponseWriter, r *http.Request) {
 		filename = res.OutputName
 	}
 
-	msg := email.Message{
-		From: cfg.FromEmail, FromName: cfg.FromName, ReplyTo: cfg.ReplyTo,
-		To: req.To, CC: req.CC, BCC: req.BCC,
-		Subject:  req.Subject,
-		TextBody: req.Body,
-		HTMLBody: req.HTMLBody,
-		Attachments: []email.Attachment{{
-			Filename:    filename,
-			ContentType: "application/pdf",
-			Data:        pdfBytes,
-		}},
-	}
-	sendRes, sendErr := prov.Send(r.Context(), msg)
-
-	status := "sent"
-	providerID := sendRes.ProviderID
-	var errStr *string
+	sendID, sendErr := h.Mailer.Send(r.Context(), SendOptions{
+		OrgID:        c.OrgID,
+		UserID:       c.UserID,
+		Kind:         "template",
+		Source:       "mail.send_template",
+		TemplateID:   tplID,
+		OutputFileID: res.OutputFileID,
+		Metadata: map[string]any{
+			"outputName": res.OutputName,
+		},
+		Message: email.Message{
+			To: req.To, CC: req.CC, BCC: req.BCC,
+			Subject:  req.Subject,
+			TextBody: req.Body,
+			HTMLBody: req.HTMLBody,
+			Attachments: []email.Attachment{{
+				Filename:    filename,
+				ContentType: "application/pdf",
+				Data:        pdfBytes,
+			}},
+		},
+	})
 	if sendErr != nil {
-		status = "failed"
-		s := sendErr.Error()
-		errStr = &s
-	}
-	var sendID string
-	_ = h.DB.QueryRow(r.Context(), `
-		INSERT INTO email_sends
-		  (org_id, user_id, template_id, output_file_id, recipients, cc, bcc, subject, provider, status, provider_id, error)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-		RETURNING id
-	`, c.OrgID, c.UserID, tplID, res.OutputFileID, req.To, req.CC, req.BCC, req.Subject, cfg.Provider, status, providerID, errStr).Scan(&sendID)
-
-	if sendErr != nil {
-		events.Publish(r.Context(), "email.failed", c.OrgID, map[string]interface{}{
-			"templateId":   tplID,
-			"outputFileId": res.OutputFileID,
-			"error":        sendErr.Error(),
-			"recipients":   req.To,
-		})
 		writeErr(w, 502, "send_failed", sendErr.Error())
 		return
 	}
-
-	events.Publish(r.Context(), "email.sent", c.OrgID, map[string]interface{}{
-		"emailId":      sendID,
-		"templateId":   tplID,
-		"outputFileId": res.OutputFileID,
-		"recipients":   req.To,
-		"provider":     cfg.Provider,
-		"providerId":   providerID,
-	})
 
 	writeJSON(w, 200, map[string]any{
 		"emailId":      sendID,
 		"outputFileId": res.OutputFileID,
 		"outputName":   res.OutputName,
-		"provider":     cfg.Provider,
-		"providerId":   providerID,
 	})
 }
 
 // -- audit list ----------------------------------------------------------
 
+// ListSends returns the org-scoped audit log. Filterable by ?kind, ?status,
+// and ?source so the settings page can show "just my access-request mails."
 func (h *Handler) ListSends(w http.ResponseWriter, r *http.Request) {
 	c := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
-	rows, err := h.DB.Query(r.Context(), `
-		SELECT id, template_id, output_file_id, recipients, subject, provider, status, provider_id, error, created_at
-		  FROM email_sends WHERE org_id=$1 ORDER BY created_at DESC LIMIT 100`, c.OrgID)
+	rows, err := h.querySends(r.Context(), querySendsOpts{
+		OrgID:  c.OrgID,
+		Kind:   r.URL.Query().Get("kind"),
+		Source: r.URL.Query().Get("source"),
+		Status: r.URL.Query().Get("status"),
+		Limit:  parseLimit(r.URL.Query().Get("limit"), 100, 500),
+	})
 	if err != nil {
 		writeErr(w, 500, "db_error", err.Error())
 		return
 	}
+	writeJSON(w, 200, map[string]any{"sends": rows})
+}
+
+// ListSendsAdmin is the super-admin / cross-org view. Returns sends from
+// every org in the platform with the same filters as ListSends plus an
+// optional ?orgId=… for narrowing. Gated to admin role — for a true
+// super-admin role you'd add an extra check, but we treat org admins as
+// platform admins in single-tenant deployments.
+func (h *Handler) ListSendsAdmin(w http.ResponseWriter, r *http.Request) {
+	c := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
+	if !c.IsAdmin() {
+		writeErr(w, 403, "forbidden", "admin role required")
+		return
+	}
+	rows, err := h.querySends(r.Context(), querySendsOpts{
+		AllOrgs: true,
+		OrgID:   r.URL.Query().Get("orgId"),
+		Kind:    r.URL.Query().Get("kind"),
+		Source:  r.URL.Query().Get("source"),
+		Status:  r.URL.Query().Get("status"),
+		Limit:   parseLimit(r.URL.Query().Get("limit"), 200, 1000),
+	})
+	if err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"sends": rows})
+}
+
+type querySendsOpts struct {
+	OrgID, Kind, Source, Status string
+	AllOrgs                     bool
+	Limit                       int
+}
+
+// querySends builds the SELECT dynamically because we want optional
+// filters but don't want a goose-egg query plan from a half-empty
+// query. Each filter contributes at most one positional arg.
+func (h *Handler) querySends(ctx context.Context, q querySendsOpts) ([]map[string]any, error) {
+	var (
+		clauses []string
+		args    []any
+	)
+	addArg := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+	if !q.AllOrgs {
+		clauses = append(clauses, "org_id="+addArg(q.OrgID))
+	} else if q.OrgID != "" {
+		clauses = append(clauses, "org_id="+addArg(q.OrgID))
+	}
+	if q.Kind != "" {
+		clauses = append(clauses, "kind="+addArg(q.Kind))
+	}
+	if q.Source != "" {
+		clauses = append(clauses, "source="+addArg(q.Source))
+	}
+	if q.Status != "" {
+		clauses = append(clauses, "status="+addArg(q.Status))
+	}
+	where := ""
+	if len(clauses) > 0 {
+		where = "WHERE " + strings.Join(clauses, " AND ")
+	}
+	limit := q.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+
+	sqlStr := `
+		SELECT id, org_id, user_id, template_id, output_file_id,
+		       recipients, cc, bcc, subject,
+		       provider, status, provider_id, error,
+		       kind, source, metadata, COALESCE(from_email,''), COALESCE(from_name,''),
+		       created_at
+		  FROM email_sends ` + where + `
+		 ORDER BY created_at DESC
+		 LIMIT ` + strconv.Itoa(limit)
+	rows, err := h.DB.Query(ctx, sqlStr, args...)
+	if err != nil {
+		return nil, err
+	}
 	defer rows.Close()
+
 	out := []map[string]any{}
 	for rows.Next() {
 		var (
-			id                                  string
-			templateID, outputFileID            *string
-			recipients                          []string
-			subject, provider, status           string
-			providerID, errStr                  *string
-			createdAt                           time.Time
+			id, orgID                                 string
+			userID, templateID, outputFileID          *string
+			recipients, cc, bcc                       []string
+			subject, provider, status                 string
+			providerID, errStr                        *string
+			kind, source                              string
+			metadata                                  []byte
+			fromEmail, fromName                       string
+			createdAt                                 time.Time
 		)
-		if err := rows.Scan(&id, &templateID, &outputFileID, &recipients, &subject, &provider, &status, &providerID, &errStr, &createdAt); err != nil {
+		if err := rows.Scan(
+			&id, &orgID, &userID, &templateID, &outputFileID,
+			&recipients, &cc, &bcc, &subject,
+			&provider, &status, &providerID, &errStr,
+			&kind, &source, &metadata, &fromEmail, &fromName,
+			&createdAt,
+		); err != nil {
 			continue
 		}
+		var meta map[string]any
+		_ = json.Unmarshal(metadata, &meta)
 		out = append(out, map[string]any{
 			"id":           id,
+			"orgId":        orgID,
+			"userId":       userID,
 			"templateId":   templateID,
 			"outputFileId": outputFileID,
 			"recipients":   recipients,
+			"cc":           cc,
+			"bcc":          bcc,
 			"subject":      subject,
 			"provider":     provider,
 			"status":       status,
 			"providerId":   providerID,
 			"error":        errStr,
+			"kind":         kind,
+			"source":       source,
+			"metadata":     meta,
+			"fromEmail":    fromEmail,
+			"fromName":     fromName,
 			"createdAt":    createdAt.Format(time.RFC3339),
 		})
 	}
-	writeJSON(w, 200, map[string]any{"sends": out})
+	return out, nil
 }
 
-// -- internals -----------------------------------------------------------
-
-func (h *Handler) loadConfig(ctx context.Context, orgID string) (email.Config, error) {
-	var cfg email.Config
-	var extra []byte
-	err := h.DB.QueryRow(ctx, `
-		SELECT provider, COALESCE(from_name,''), from_email, COALESCE(reply_to,''), config
-		  FROM email_settings WHERE org_id=$1`, orgID,
-	).Scan(&cfg.Provider, &cfg.FromName, &cfg.FromEmail, &cfg.ReplyTo, &extra)
-	if err != nil {
-		return email.Config{}, err
+func parseLimit(raw string, def, max int) int {
+	if raw == "" {
+		return def
 	}
-	_ = json.Unmarshal(extra, &cfg.Extra)
-	return cfg, nil
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return def
+	}
+	if n > max {
+		return max
+	}
+	return n
 }
 
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {
@@ -368,5 +479,3 @@ func writeErr(w http.ResponseWriter, code int, slug, msg string) {
 	writeJSON(w, code, map[string]any{"error": map[string]string{"code": slug, "message": msg}})
 }
 
-// Silence unused-import warning in edge cases.
-var _ = fmt.Sprintf

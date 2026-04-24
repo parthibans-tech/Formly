@@ -4,6 +4,8 @@ import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import {
   ArrowLeft,
+  CloudUpload,
+  FileCode,
   PencilLine,
   PlayCircle,
   Save,
@@ -56,6 +58,7 @@ export default function PlaygroundPage() {
   const [jsonText, setJsonText] = useState("");
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     if (!getToken()) {
@@ -101,9 +104,14 @@ export default function PlaygroundPage() {
     setRunning(true);
     try {
       const data = JSON.parse(jsonText);
+      // `preview: true` flips the server's presigned URL to inline
+      // disposition so the PDF renders in the iframe below instead of
+      // the browser prompting a download. Without it, Safari (and some
+      // Chrome configurations) save the file as soon as the iframe src
+      // updates, which defeats the whole point of the playground.
       const res = await api<{ downloadUrl: string }>(
         `/v1/templates/${tpl.id}/generate`,
-        { method: "POST", body: JSON.stringify({ data }) }
+        { method: "POST", body: JSON.stringify({ data, preview: true }) }
       );
       setPreviewUrl(res.downloadUrl);
       toast.show("success", "Rendered");
@@ -111,6 +119,30 @@ export default function PlaygroundPage() {
       toast.show("error", e.message);
     } finally {
       setRunning(false);
+    }
+  }
+
+  // saveToDrive is the opt-in "persist this render to my Drive" path —
+  // distinct from Run, which intentionally previews without creating a
+  // Drive row. We call generate WITHOUT `preview: true` so the server
+  // takes the Runner.Run branch (inserts a files row + uploads to the
+  // canonical outputs/ key) instead of RunPreview (temp blob, no row).
+  // Users who just want to eyeball the output shouldn't have their
+  // Drive polluted with dozens of near-identical PDFs.
+  async function saveToDrive() {
+    if (!tpl) return;
+    setSaving(true);
+    try {
+      const data = JSON.parse(jsonText);
+      const res = await api<{ outputFileId: string; outputName: string }>(
+        `/v1/templates/${tpl.id}/generate`,
+        { method: "POST", body: JSON.stringify({ data }) }
+      );
+      toast.show("success", `Saved "${res.outputName}" to Drive`);
+    } catch (e: any) {
+      toast.show("error", e.message);
+    } finally {
+      setSaving(false);
     }
   }
 
@@ -204,12 +236,20 @@ export default function PlaygroundPage() {
               </div>
             </div>
           </div>
-          <Button variant="ghost" size="sm" asChild>
-            <Link href={`/templates/${tpl.id}/designer`}>
-              <PencilLine className="h-4 w-4" />
-              Open designer
-            </Link>
-          </Button>
+          <div className="flex items-center gap-1">
+            <Button variant="ghost" size="sm" asChild>
+              <Link href={`/templates/${tpl.id}/api`}>
+                <FileCode className="h-4 w-4" />
+                API
+              </Link>
+            </Button>
+            <Button variant="ghost" size="sm" asChild>
+              <Link href={`/templates/${tpl.id}/designer`}>
+                <PencilLine className="h-4 w-4" />
+                Open designer
+              </Link>
+            </Button>
+          </div>
         </div>
       </header>
 
@@ -254,7 +294,17 @@ export default function PlaygroundPage() {
               Fake data
             </Button>
             <div className="flex-1" />
-            <Button size="sm" onClick={run} loading={running}>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={saveToDrive}
+              loading={saving}
+              disabled={running}
+            >
+              <CloudUpload className="h-4 w-4" />
+              Save to Drive
+            </Button>
+            <Button size="sm" onClick={run} loading={running} disabled={saving}>
               <PlayCircle className="h-4 w-4" />
               Run
             </Button>

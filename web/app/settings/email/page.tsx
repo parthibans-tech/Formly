@@ -32,10 +32,19 @@ type Settings = {
   replyTo?: string;
   config?: Record<string, any>;
   isConfigured: boolean;
+  // The server reports the env-derived fallback config so admins know
+  // mail will still work for system notifications even when the org
+  // hasn't filled out this form. Null when no fallback is configured.
+  envFallback?: {
+    provider: string;
+    fromEmail: string;
+    fromName?: string;
+  } | null;
 };
 
 type Send = {
   id: string;
+  orgId?: string;
   templateId?: string | null;
   outputFileId?: string | null;
   recipients: string[];
@@ -44,6 +53,12 @@ type Send = {
   status: string;
   providerId?: string | null;
   error?: string | null;
+  // Audit columns added in migration 026 — surface them so admins can
+  // tell at a glance which subsystem emitted each row.
+  kind?: string;
+  source?: string;
+  fromEmail?: string;
+  metadata?: Record<string, any> | null;
   createdAt: string;
 };
 
@@ -59,8 +74,10 @@ export default function EmailSettingsPage() {
   const [fromEmail, setFromEmail] = useState("");
   const [replyTo, setReplyTo] = useState("");
   const [config, setConfig] = useState<Record<string, any>>({});
+  const [envFallback, setEnvFallback] = useState<Settings["envFallback"]>(null);
 
   const [sends, setSends] = useState<Send[]>([]);
+  const [kindFilter, setKindFilter] = useState<string>("");
 
   useEffect(() => {
     (async () => {
@@ -72,9 +89,15 @@ export default function EmailSettingsPage() {
           setFromEmail(s.fromEmail || "");
           setReplyTo(s.replyTo || "");
           setConfig(s.config || {});
+        } else if (s.envFallback) {
+          // Pre-fill the form with the env defaults so a "Save settings"
+          // click locks them in per-org without re-typing.
+          setProvider(s.envFallback.provider);
+          setFromEmail(s.envFallback.fromEmail);
+          setFromName(s.envFallback.fromName || "");
         }
-        const r = await api<{ sends: Send[] }>("/v1/email/sends");
-        setSends(r.sends);
+        setEnvFallback(s.envFallback ?? null);
+        await refreshSends();
       } catch (e: any) {
         toast.show("error", e.message);
       } finally {
@@ -83,6 +106,15 @@ export default function EmailSettingsPage() {
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  async function refreshSends(kind?: string) {
+    const qs = new URLSearchParams();
+    if (kind) qs.set("kind", kind);
+    const r = await api<{ sends: Send[] }>(
+      "/v1/email/sends" + (qs.toString() ? "?" + qs.toString() : "")
+    );
+    setSends(r.sends);
+  }
 
   async function save() {
     setSaving(true);
@@ -160,7 +192,18 @@ export default function EmailSettingsPage() {
             </>
           ) : (
             <>
-              <div className="grid grid-cols-3 gap-2">
+              {envFallback && (
+                <div className="rounded-md border border-blue-200 bg-blue-50 p-3 text-xs text-blue-900 dark:border-blue-500/30 dark:bg-blue-500/10 dark:text-blue-200">
+                  <div className="font-semibold">System fallback active</div>
+                  <p className="mt-0.5">
+                    Until you save org-specific settings, mail is sent via{" "}
+                    <code className="font-mono">{envFallback.provider}</code> from{" "}
+                    <code className="font-mono">{envFallback.fromEmail}</code>{" "}
+                    (configured by environment variables).
+                  </p>
+                </div>
+              )}
+              <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
                 <ProviderTile
                   active={provider === "console"}
                   label="Console"
@@ -178,6 +221,12 @@ export default function EmailSettingsPage() {
                   label="Resend"
                   hint="resend.com HTTP API"
                   onClick={() => setProvider("resend")}
+                />
+                <ProviderTile
+                  active={provider === "ses"}
+                  label="AWS SES"
+                  hint="SES v2 — region + IAM key"
+                  onClick={() => setProvider("ses")}
                 />
               </div>
 
@@ -299,6 +348,46 @@ export default function EmailSettingsPage() {
                 </div>
               )}
 
+              {provider === "ses" && (
+                <div className="space-y-3 rounded-md border bg-muted/20 p-3">
+                  <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                    AWS SES
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div className="space-y-1.5">
+                      <Label>Access key ID</Label>
+                      <Input
+                        value={(config.accessKey as string) || ""}
+                        onChange={(e) => setCfg("accessKey", e.target.value)}
+                        placeholder="AKIA…"
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label>Secret access key</Label>
+                      <Input
+                        type="password"
+                        value={(config.secretKey as string) || ""}
+                        onChange={(e) => setCfg("secretKey", e.target.value)}
+                      />
+                    </div>
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label>Region</Label>
+                    <Input
+                      value={(config.region as string) || ""}
+                      onChange={(e) => setCfg("region", e.target.value)}
+                      placeholder="ap-south-1"
+                    />
+                    <p className="text-[10px] text-muted-foreground">
+                      The IAM user needs <code className="font-mono">ses:SendEmail</code>
+                      and <code className="font-mono">ses:SendRawEmail</code>. Both
+                      the From address and the recipients must be verified in
+                      sandbox mode.
+                    </p>
+                  </div>
+                </div>
+              )}
+
               <div className="flex items-center gap-2">
                 <Button onClick={save} loading={saving}>
                   <Mail className="h-4 w-4" />
@@ -323,10 +412,37 @@ export default function EmailSettingsPage() {
 
       <Card>
         <CardHeader>
-          <CardTitle>Recent sends</CardTitle>
-          <CardDescription>
-            Audit log of every generate-and-email call for this organization.
-          </CardDescription>
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <CardTitle>Recent sends</CardTitle>
+              <CardDescription>
+                Audit log of every email this organization has produced — template
+                deliveries, access-request notifications, system alerts.
+              </CardDescription>
+            </div>
+            <Select
+              value={kindFilter || "all"}
+              onValueChange={(v) => {
+                const next = v === "all" ? "" : v;
+                setKindFilter(next);
+                refreshSends(next).catch(() => {});
+              }}
+            >
+              <SelectTrigger className="w-44">
+                <SelectValue placeholder="All kinds" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All kinds</SelectItem>
+                <SelectItem value="template">Template</SelectItem>
+                <SelectItem value="test">Test</SelectItem>
+                <SelectItem value="invitation">Invitation</SelectItem>
+                <SelectItem value="access_request_filed">Access request filed</SelectItem>
+                <SelectItem value="access_request_approved">Access approved</SelectItem>
+                <SelectItem value="access_request_denied">Access denied</SelectItem>
+                <SelectItem value="notification">Notification</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
         </CardHeader>
         <CardContent>
           {sends.length === 0 ? (
@@ -347,6 +463,11 @@ export default function EmailSettingsPage() {
                     <div className="min-w-0 flex-1">
                       <div className="flex flex-wrap items-center gap-2 text-sm">
                         <span className="font-medium">{s.subject}</span>
+                        {s.kind && (
+                          <Badge variant="secondary" className="text-[10px]">
+                            {s.kind}
+                          </Badge>
+                        )}
                         <Badge
                           variant="outline"
                           className="font-mono text-[10px]"
@@ -362,6 +483,13 @@ export default function EmailSettingsPage() {
                       <div className="text-xs text-muted-foreground">
                         to {s.recipients.join(", ")} ·{" "}
                         {new Date(s.createdAt).toLocaleString()}
+                        {s.source && (
+                          <>
+                            {" "}
+                            ·{" "}
+                            <code className="font-mono text-[10px]">{s.source}</code>
+                          </>
+                        )}
                       </div>
                       {s.error && (
                         <pre className="mt-1 max-h-20 overflow-auto rounded bg-muted/50 p-2 font-mono text-[10px] text-destructive">

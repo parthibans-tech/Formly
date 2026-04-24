@@ -66,7 +66,7 @@ export const certificateStarter: Starter = {
 </html>
 `,
   sampleData: {
-    eyebrow: "Formly Academy",
+    eyebrow: "Drive360 Academy",
     recipient: { name: "Priya Ramesh" },
     course: {
       name: "Advanced Document Automation",

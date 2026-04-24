@@ -58,17 +58,30 @@ func Fill(pdfBytes []byte, widgets []Widget, data map[string]interface{}, l *lay
 		return nil, fmt.Errorf("build overlay: %w", err)
 	}
 
-	out, err := stampOverlay(pdfBytes, overlayBytes)
+	// ORDER MATTERS: inject AcroForm BEFORE stamping the overlay.
+	//
+	// InjectAcroForm goes through pdfcpu's ReadContext / WriteContext cycle.
+	// When that cycle runs on a PDF whose page content already contains a
+	// stamped overlay Form XObject (produced by stampOverlay via
+	// AddWatermarksFile), one of the source PDF's font dictionaries gets
+	// orphaned — pdfcpu's write-side resource tracing doesn't preserve it.
+	// The concrete symptom: renderers like pdf.js (react-pdf) display the
+	// source text as blank because the font it references is no longer in
+	// the xref table, while widget values (drawn from the overlay's own
+	// migrated fonts) still render.
+	//
+	// Running InjectAcroForm on the pristine source first, then stamping
+	// the overlay last (stampOverlay's AddWatermarksFile does proper
+	// resource migration), preserves all fonts and annotations.
+	withForm, err := InjectAcroForm(pdfBytes, widgets)
 	if err != nil {
-		return nil, err
+		// Non-fatal: fall back to the unmodified source so stamping still runs.
+		withForm = pdfBytes
 	}
 
-	// Inject AcroForm interactive fields (text, checkbox, radio, dropdown).
-	// Errors here are non-fatal — we still return the stamped PDF.
-	out, err = InjectAcroForm(out, widgets)
+	out, err := stampOverlay(withForm, overlayBytes)
 	if err != nil {
-		// Log but don't fail the whole generation.
-		_ = err
+		return nil, err
 	}
 
 	if l != nil && l.Watermark.Enabled && l.Watermark.Text != "" {

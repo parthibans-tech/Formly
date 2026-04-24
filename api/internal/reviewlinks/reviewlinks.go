@@ -1,4 +1,4 @@
-// Package reviewlinks lets users invite an external reviewer (no Formly
+// Package reviewlinks lets users invite an external reviewer (no Drive360
 // account) to preview a template, leave comments, and approve / request
 // changes. Reuses the comments + reviews tables for storage; decisions flow
 // into the same lifecycle the internal review workflow uses.

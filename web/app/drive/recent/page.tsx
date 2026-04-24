@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Clock, Download, PencilLine, Trash2 } from "lucide-react";
+import { Clock, Download, PencilLine, Star, Trash2 } from "lucide-react";
 import { api, getUser } from "@/lib/api";
 import { useToast } from "@/components/toast";
 import { useConfirm } from "@/components/ui/confirm";
@@ -49,6 +49,26 @@ export default function RecentPage() {
       window.open(downloadUrl, "_blank");
     } catch (e: any) {
       toast.show("error", e.message);
+    }
+  }
+
+  // Optimistic star toggle: flip the icon in local state immediately,
+  // issue the POST/DELETE, and roll back if the server rejects. Keeps
+  // the click feeling instant even on slow networks.
+  async function toggleStar(f: FileItem) {
+    const next = !f.starred;
+    setFiles((xs) =>
+      xs.map((x) => (x.id === f.id ? { ...x, starred: next } : x))
+    );
+    try {
+      await api(`/v1/files/${f.id}/star`, {
+        method: next ? "POST" : "DELETE",
+      });
+    } catch (e: any) {
+      setFiles((xs) =>
+        xs.map((x) => (x.id === f.id ? { ...x, starred: !next } : x))
+      );
+      toast.show("error", "Couldn't update star", { description: e.message });
     }
   }
 
@@ -99,6 +119,7 @@ export default function RecentPage() {
           view={view}
           actorInitials={initials}
           actorLabel="You opened"
+          onToggleStar={toggleStar}
           actions={(f) => [
             ...(f.templateId
               ? [
@@ -114,6 +135,11 @@ export default function RecentPage() {
               label: "Download",
               icon: <Download className="h-4 w-4" />,
               onClick: download,
+            },
+            {
+              label: f.starred ? "Unstar" : "Star",
+              icon: <Star className="h-4 w-4" />,
+              onClick: toggleStar,
             },
             {
               label: "Move to trash",

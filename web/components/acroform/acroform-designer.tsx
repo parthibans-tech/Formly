@@ -96,6 +96,7 @@ import {
 } from "./align-tools";
 import { DesignQAPanel, runAcroQA } from "./design-qa-panel";
 import { InlineRenameTitle } from "@/components/designer/inline-rename-title";
+import { ApiGuideSheet } from "@/components/api-guide-trigger";
 import { validateAll } from "@/lib/acroform-validation";
 import {
   applyStructurePatches,
@@ -127,9 +128,14 @@ type Tpl = {
 type Props = {
   tpl: Tpl;
   previewUrl: string;
+  // When true the designer renders in view-only mode — Save and
+  // Save-structure buttons are disabled and the top banner makes the
+  // restriction explicit. Viewers can still click around (inspect
+  // mappings, try Generate) but nothing they change here persists.
+  readOnly?: boolean;
 };
 
-export function AcroFormDesigner({ tpl, previewUrl }: Props) {
+export function AcroFormDesigner({ tpl, previewUrl, readOnly = false }: Props) {
   const router = useRouter();
   const toast = useToast();
   const [mappings, setMappings] = useState<MappingMap>(
@@ -836,6 +842,7 @@ export function AcroFormDesigner({ tpl, previewUrl }: Props) {
   }
 
   async function saveStructure() {
+    if (readOnly) return;
     if (pendingPatches.length === 0) return;
     setStructureSaving(true);
     setStructureErr(null);
@@ -974,6 +981,7 @@ export function AcroFormDesigner({ tpl, previewUrl }: Props) {
   }
 
   async function save() {
+    if (readOnly) return;
     setSaving(true);
     try {
       const res = await api<{ version: number }>(
@@ -1185,6 +1193,10 @@ export function AcroFormDesigner({ tpl, previewUrl }: Props) {
               </DropdownMenuContent>
             </DropdownMenu>
 
+            {/* API integration guide — drawer with endpoint, payload, and
+                runnable snippets derived live from this template's schema. */}
+            <ApiGuideSheet templateId={tpl.id} templateName={tpl.name} />
+
             <Separator orientation="vertical" className="mx-0.5 h-6" />
 
             <Button
@@ -1193,6 +1205,12 @@ export function AcroFormDesigner({ tpl, previewUrl }: Props) {
               className="h-8"
               onClick={save}
               loading={saving}
+              disabled={readOnly}
+              title={
+                readOnly
+                  ? "View-only access — ask the owner for edit access"
+                  : undefined
+              }
             >
               <Save className="h-4 w-4" /> Save
             </Button>
@@ -1269,6 +1287,12 @@ export function AcroFormDesigner({ tpl, previewUrl }: Props) {
               className="h-7 px-2 text-[11px]"
               onClick={saveStructure}
               loading={structureSaving}
+              disabled={readOnly}
+              title={
+                readOnly
+                  ? "View-only access — ask the owner for edit access"
+                  : undefined
+              }
             >
               <Save className="h-3.5 w-3.5" /> Save structure
             </Button>

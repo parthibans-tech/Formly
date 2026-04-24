@@ -71,6 +71,10 @@ type registerReq struct {
 type authResp struct {
 	Token string `json:"token"`
 	User  user   `json:"user"`
+	// ForcePasswordReset is set when a super-admin has flagged this
+	// user via /v1/admin/users/:id/force-password-reset. The web app
+	// honors it by routing the user straight to /set-password.
+	ForcePasswordReset bool `json:"forcePasswordReset,omitempty"`
 }
 
 type user struct {
@@ -143,11 +147,15 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 	var (
 		id, orgID, name, hash, role string
+		lockedAt                    *time.Time
+		lockedReason                *string
+		forcePwReset                bool
 	)
 	err := h.DB.QueryRow(r.Context(),
-		`SELECT id, org_id, name, password_hash, COALESCE(role,'editor')
+		`SELECT id, org_id, name, password_hash, COALESCE(role,'editor'),
+		        locked_at, locked_reason, force_pw_reset
 		   FROM users WHERE email=$1`, req.Email,
-	).Scan(&id, &orgID, &name, &hash, &role)
+	).Scan(&id, &orgID, &name, &hash, &role, &lockedAt, &lockedReason, &forcePwReset)
 	if err != nil {
 		writeErr(w, 401, "invalid_credentials", "bad email or password")
 		return
@@ -156,6 +164,21 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		h.audit(r, "auth.login.failed", "", "", req.Email,
 			map[string]any{"reason": "bad_password"})
 		writeErr(w, 401, "invalid_credentials", "bad email or password")
+		return
+	}
+	// Lock check happens AFTER password verification so an attacker
+	// can't enumerate locked accounts via the response code — they get
+	// the same "invalid_credentials" path until they prove the password,
+	// then learn the account is frozen.
+	if lockedAt != nil {
+		reason := ""
+		if lockedReason != nil {
+			reason = *lockedReason
+		}
+		h.audit(r, "auth.login.locked", id, orgID, req.Email,
+			map[string]any{"reason": reason})
+		writeErr(w, 403, "account_locked",
+			"this account is temporarily locked — contact support")
 		return
 	}
 
@@ -182,10 +205,84 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	if h.OnLogin != nil {
 		h.OnLogin(r.Context(), id, orgID, token, clientIP(r), r.UserAgent())
 	}
-	h.audit(r, "auth.login", id, orgID, req.Email, nil)
-	writeJSON(w, 200, authResp{Token: token, User: user{
-		ID: id, Email: req.Email, Name: name, OrgID: orgID, Role: role,
-	}})
+	h.audit(r, "auth.login", id, orgID, req.Email,
+		map[string]any{"forcePasswordReset": forcePwReset})
+	writeJSON(w, 200, authResp{
+		Token: token,
+		User: user{
+			ID: id, Email: req.Email, Name: name, OrgID: orgID, Role: role,
+		},
+		ForcePasswordReset: forcePwReset,
+	})
+}
+
+// SetPassword lets a user change their own password. Used by:
+//   - the regular "change password" form in /settings/security
+//   - the forced-reset flow after a super-admin flips force_pw_reset
+//
+// We require the current password EXCEPT when the force-reset flag is
+// set — in that case the previous password is, by definition, no
+// longer trusted. The flag is cleared atomically with the new hash so
+// a window where both are set can't exist.
+func (h *Handler) SetPassword(w http.ResponseWriter, r *http.Request) {
+	c, _ := r.Context().Value(UserCtxKey).(*Claims)
+	if c == nil {
+		writeErr(w, 401, "unauthorized", "missing claims")
+		return
+	}
+	var req struct {
+		CurrentPassword string `json:"currentPassword"`
+		NewPassword     string `json:"newPassword"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, "invalid_body", err.Error())
+		return
+	}
+	if len(req.NewPassword) < 8 {
+		writeErr(w, 400, "short_password", "password must be at least 8 characters")
+		return
+	}
+
+	var hash string
+	var forcePwReset bool
+	if err := h.DB.QueryRow(r.Context(),
+		`SELECT password_hash, force_pw_reset FROM users WHERE id=$1`,
+		c.UserID,
+	).Scan(&hash, &forcePwReset); err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+
+	// Skip the current-password check when this is a forced reset —
+	// the user can't possibly know it's still valid (and may not be
+	// the one who set it, e.g. password handed out by support).
+	if !forcePwReset {
+		if bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.CurrentPassword)) != nil {
+			h.audit(r, "auth.set_password.failed", c.UserID, c.OrgID, c.Email,
+				map[string]any{"reason": "bad_current_password"})
+			writeErr(w, 401, "invalid_credentials", "current password is wrong")
+			return
+		}
+	}
+
+	newHash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), 12)
+	if err != nil {
+		writeErr(w, 500, "hash", err.Error())
+		return
+	}
+	if _, err := h.DB.Exec(r.Context(), `
+		UPDATE users
+		   SET password_hash=$1,
+		       force_pw_reset=false,
+		       updated_at=now()
+		 WHERE id=$2`, string(newHash), c.UserID); err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+
+	h.audit(r, "auth.set_password", c.UserID, c.OrgID, c.Email,
+		map[string]any{"forced": forcePwReset})
+	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
 // Logout revokes the current session token (best-effort audit log too).

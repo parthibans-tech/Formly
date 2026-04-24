@@ -81,6 +81,23 @@ func (c *Client) PresignGet(ctx context.Context, key, filename string, ttl time.
 	return u.String(), nil
 }
 
+// PresignGetInline returns a presigned GET URL with an explicit
+// `Content-Disposition: inline` response override, so browsers render
+// the payload in-place (e.g. an iframe'd PDF) instead of offering a
+// download. Used by the preview/playground paths — the regular
+// PresignGet falls back to whatever the stored object declares, which
+// Safari in particular interprets as "attachment" for PDFs and triggers
+// a save prompt even when the caller intended an inline render.
+func (c *Client) PresignGetInline(ctx context.Context, key string, ttl time.Duration) (string, error) {
+	params := url.Values{}
+	params.Set("response-content-disposition", "inline")
+	u, err := c.publicMC.PresignedGetObject(ctx, c.bucket, key, ttl, params)
+	if err != nil {
+		return "", err
+	}
+	return u.String(), nil
+}
+
 func (c *Client) StatObject(ctx context.Context, key string) (minio.ObjectInfo, error) {
 	return c.mc.StatObject(ctx, c.bucket, key, minio.StatObjectOptions{})
 }

@@ -512,7 +512,7 @@ export function CollabDrawer({
               <Label className="text-xs">Invite an external reviewer</Label>
               <p className="text-[10px] text-muted-foreground">
                 Creates a one-time review URL. Guests can leave comments and
-                approve without a Formly account.
+                approve without a Drive360 account.
               </p>
               <Input
                 value={guestEmail}

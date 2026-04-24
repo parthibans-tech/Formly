@@ -74,6 +74,7 @@ import {
 } from "@/components/designer/command-palette";
 import { ShortcutHelp, modSymbol } from "@/components/designer/shortcut-help";
 import { InlineRenameTitle } from "@/components/designer/inline-rename-title";
+import { ApiGuideSheet } from "@/components/api-guide-trigger";
 
 type Template = {
   id: string;
@@ -90,10 +91,16 @@ type Template = {
   };
 };
 
-type Props = { tpl: Template };
+type Props = {
+  tpl: Template;
+  // Viewers (resource_shares role=viewer) can reach this page but any
+  // PUT to /config or /source will 403 — short-circuit save locally and
+  // disable the Save button so the restriction is obvious up-front.
+  readOnly?: boolean;
+};
 type EditorTab = "design" | "code";
 
-export default function HtmlDesigner({ tpl: initialTpl }: Props) {
+export default function HtmlDesigner({ tpl: initialTpl, readOnly = false }: Props) {
   const toast = useToast();
   const [tpl, setTpl] = useState(initialTpl);
   const [source, setSource] = useState("");
@@ -187,6 +194,7 @@ export default function HtmlDesigner({ tpl: initialTpl }: Props) {
   }, [source, sampleJSON, tpl.id]);
 
   async function saveI18n(next: Translations) {
+    if (readOnly) return;
     setSavingI18n(true);
     try {
       const merged = {
@@ -210,6 +218,7 @@ export default function HtmlDesigner({ tpl: initialTpl }: Props) {
   }
 
   async function saveComputed(defs: ComputedDef[]) {
+    if (readOnly) return;
     setSavingComputed(true);
     try {
       const merged = { ...(tpl.config || {}), computed: defs };
@@ -228,6 +237,7 @@ export default function HtmlDesigner({ tpl: initialTpl }: Props) {
   }
 
   async function savePageLayout(next: PageLayout) {
+    if (readOnly) return;
     setSavingLayout(true);
     try {
       const merged = { ...(tpl.config || {}), pageLayout: next };
@@ -246,6 +256,7 @@ export default function HtmlDesigner({ tpl: initialTpl }: Props) {
   }
 
   async function save(forceOverwrite = false) {
+    if (readOnly) return;
     setSaving(true);
     try {
       const body: any = { source };
@@ -382,9 +393,22 @@ export default function HtmlDesigner({ tpl: initialTpl }: Props) {
   }, []);
 
   function openGenerate() {
-    setGenData(
-      JSON.stringify(skeleton(tpl.config.placeholders || []), null, 2)
-    );
+    // Prefer the sample data the user has been tweaking in the live
+    // preview — otherwise we'd silently overwrite their edits the moment
+    // they click Generate. Fall back to skeleton() only when the
+    // sampleJSON is blank/invalid so the dialog still opens with
+    // plausible defaults for fresh templates.
+    let seeded: Record<string, any> | null = null;
+    try {
+      const parsed = JSON.parse(sampleJSON || "{}");
+      if (parsed && typeof parsed === "object" && Object.keys(parsed).length > 0) {
+        seeded = parsed;
+      }
+    } catch {
+      seeded = null;
+    }
+    const base = seeded ?? skeleton(tpl.config.placeholders || []);
+    setGenData(JSON.stringify(base, null, 2));
     setGenOpen(true);
   }
 
@@ -580,6 +604,11 @@ export default function HtmlDesigner({ tpl: initialTpl }: Props) {
                 </DropdownMenuContent>
               </DropdownMenu>
 
+              {/* API guide — one-click drawer with endpoint/payload/snippets
+                  derived from this template's schema. Sibling of the menu so
+                  integrators don't have to dig two levels to find docs. */}
+              <ApiGuideSheet templateId={tpl.id} templateName={tpl.name} />
+
               {/* Collaborate — kept outside the menu because it's social/live */}
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -607,6 +636,12 @@ export default function HtmlDesigner({ tpl: initialTpl }: Props) {
                 className="gap-1.5"
                 onClick={() => save(false)}
                 loading={saving}
+                disabled={readOnly}
+                title={
+                  readOnly
+                    ? "View-only access — ask the owner for edit access"
+                    : undefined
+                }
               >
                 <Save className="h-4 w-4" />
                 <span className="hidden sm:inline">

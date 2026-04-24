@@ -1,6 +1,6 @@
 // Package formlinks implements public "fill this template" URLs. Anyone with
 // the link can open an auto-generated form, submit data, and get a rendered
-// PDF — no Formly account required.
+// PDF — no Drive360 account required.
 package formlinks
 
 import (

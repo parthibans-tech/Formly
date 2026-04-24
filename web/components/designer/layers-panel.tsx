@@ -10,7 +10,16 @@
 //   • filter by label / type / dataKey
 
 import { useState } from "react";
-import { Eye, EyeOff, GripVertical, Lock, LockOpen, Users } from "lucide-react";
+import {
+  Eye,
+  EyeOff,
+  Group as GroupIcon,
+  GripVertical,
+  Lock,
+  LockOpen,
+  Ungroup,
+  Users,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 
 export type LayerWidget = {
@@ -33,6 +42,10 @@ type Props = {
   onRename: (id: string, label: string) => void;
   /** Select all members of a group */
   onSelectGroup: (groupId: string) => void;
+  /** Group the current selection (panel-side equivalent of ⌘G). */
+  onGroupSelection?: () => void;
+  /** Ungroup every group that overlaps with the current selection. */
+  onUngroupSelection?: () => void;
 };
 
 // Short badge shown in the type column.
@@ -63,6 +76,8 @@ export function LayersPanel({
   onToggleHide,
   onRename,
   onSelectGroup,
+  onGroupSelection,
+  onUngroupSelection,
 }: Props) {
   const [query, setQuery] = useState("");
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -72,6 +87,12 @@ export function LayersPanel({
 
   // Highest z-index at top (front layer first — same convention as Figma).
   const sorted = [...widgets].sort((a, b) => b.zIndex - a.zIndex);
+
+  // Enable/disable group-action buttons based on current selection state.
+  const canGroup = selectedIds.length >= 2;
+  const hasGroupInSelection = widgets.some(
+    (w) => selectedIds.includes(w.id) && !!w.props?._group
+  );
 
   const filtered = query.trim()
     ? sorted.filter((w) => {
@@ -122,7 +143,51 @@ export function LayersPanel({
         <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
           Layers
         </span>
-        <span className="text-[10px] text-muted-foreground">{widgets.length}</span>
+        <div className="flex items-center gap-1">
+          {onGroupSelection && (
+            <button
+              type="button"
+              disabled={!canGroup}
+              onClick={onGroupSelection}
+              title={
+                canGroup
+                  ? "Group selection (⌘G)"
+                  : "Select 2 or more widgets to group them"
+              }
+              className={cn(
+                "rounded p-0.5",
+                canGroup
+                  ? "text-violet-500 hover:bg-violet-500/10"
+                  : "cursor-not-allowed text-muted-foreground/50"
+              )}
+            >
+              <GroupIcon className="h-3.5 w-3.5" />
+            </button>
+          )}
+          {onUngroupSelection && (
+            <button
+              type="button"
+              disabled={!hasGroupInSelection}
+              onClick={onUngroupSelection}
+              title={
+                hasGroupInSelection
+                  ? "Ungroup selection (⌘⇧G)"
+                  : "Select a grouped widget to ungroup"
+              }
+              className={cn(
+                "rounded p-0.5",
+                hasGroupInSelection
+                  ? "text-muted-foreground hover:bg-muted"
+                  : "cursor-not-allowed text-muted-foreground/50"
+              )}
+            >
+              <Ungroup className="h-3.5 w-3.5" />
+            </button>
+          )}
+          <span className="ml-1 text-[10px] text-muted-foreground">
+            {widgets.length}
+          </span>
+        </div>
       </div>
 
       {/* Filter */}
