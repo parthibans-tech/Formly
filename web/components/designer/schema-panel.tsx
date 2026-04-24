@@ -4,36 +4,57 @@
 // sample JSON exposes. Click a key to bind it to the currently-selected
 // widget. Also warns about dataKeys that don't exist in the sample.
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   Braces,
   ChevronDown,
   ChevronRight,
+  Download,
   Hash,
   List,
+  MoreHorizontal,
   Search,
   ToggleLeft,
   Type,
 } from "lucide-react";
 import { buildSchema, collectPaths, keyExists, type SchemaNode } from "@/lib/schema-utils";
+import {
+  downloadJSON,
+  downloadSkeleton,
+  downloadTypeScript,
+  copyToClipboard,
+} from "@/lib/schema-export";
 import { cn } from "@/lib/utils";
 import { Input } from "@/components/ui/input";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 
 type Props = {
   sampleJSON: string;
-  usedKeys: string[];             // all widget dataKeys in the template
-  selectedDataKey?: string;       // highlight when it matches
-  onBind: (path: string) => void; // click a leaf → bind to selected widget
-  onEditSample: () => void;       // "Edit sample" opens textarea elsewhere
+  templateName?: string;           // used for download filenames
+  usedKeys: string[];              // all widget dataKeys in the template
+  selectedDataKey?: string;        // highlight when it matches
+  onBind: (path: string) => void;  // click a leaf → bind to selected widget
+  onEditSample: () => void;        // "Edit sample" opens textarea elsewhere
+  onSyncSample: () => void;        // add missing widget keys into the sample
+  onExportFull: () => void;        // export complete template config
 };
 
 export function SchemaPanel({
   sampleJSON,
+  templateName = "schema",
   usedKeys,
   selectedDataKey,
   onBind,
   onEditSample,
+  onSyncSample,
+  onExportFull,
 }: Props) {
   const [query, setQuery] = useState("");
   const { tree, paths, parseErr } = useMemo(() => {
@@ -56,13 +77,75 @@ export function SchemaPanel({
         <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
           Data schema
         </span>
-        <button
-          type="button"
-          onClick={onEditSample}
-          className="text-[11px] text-primary hover:underline"
-        >
-          Edit sample
-        </button>
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            onClick={onEditSample}
+            className="text-[11px] text-primary hover:underline"
+          >
+            Edit
+          </button>
+          {/* Export drop-down */}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                title="Export schema"
+                className="grid h-5 w-5 place-items-center rounded text-muted-foreground hover:bg-muted"
+              >
+                <MoreHorizontal className="h-3 w-3" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-60 text-xs">
+              <DropdownMenuItem onClick={onExportFull} className="font-medium">
+                <Download className="mr-2 h-3 w-3" />
+                Full config (widgets + layout + data)
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onClick={() => {
+                  try {
+                    const d = JSON.parse(sampleJSON || "{}");
+                    downloadJSON(JSON.stringify(d, null, 2), `${templateName}.json`);
+                  } catch { /* invalid JSON */ }
+                }}
+              >
+                <Download className="mr-2 h-3 w-3" />
+                Sample data → JSON
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => {
+                  try {
+                    const d = JSON.parse(sampleJSON || "{}");
+                    downloadTypeScript(d, `${templateName}.ts`);
+                  } catch { /* invalid JSON */ }
+                }}
+              >
+                <Download className="mr-2 h-3 w-3" />
+                Sample data → TypeScript interface
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => {
+                  try {
+                    const d = JSON.parse(sampleJSON || "{}");
+                    downloadSkeleton(d, `${templateName}-skeleton.json`);
+                  } catch { /* invalid JSON */ }
+                }}
+              >
+                <Download className="mr-2 h-3 w-3" />
+                Sample data → skeleton payload
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onClick={async () => {
+                  await copyToClipboard(sampleJSON);
+                }}
+              >
+                Copy JSON to clipboard
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
       </div>
       <div className="px-3 pb-2">
         <div className="relative">
@@ -84,10 +167,26 @@ export function SchemaPanel({
 
       {unknownKeys.length > 0 && (
         <div className="mx-3 mb-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-2 py-1.5 text-[11px] text-amber-700">
-          <div className="font-medium">
-            {unknownKeys.length} widget{unknownKeys.length === 1 ? "" : "s"} bound to missing keys
+          <div className="flex items-start justify-between gap-2">
+            <div>
+              <div className="font-medium">
+                {unknownKeys.length} widget{unknownKeys.length === 1 ? "" : "s"} bound to missing keys
+              </div>
+              <p className="mt-0.5 text-[10px] opacity-80">
+                These dataKeys aren&apos;t in the sample — they were added after
+                the sample was last saved. Click <strong>Sync</strong> to add
+                them automatically.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={onSyncSample}
+              className="shrink-0 rounded border border-amber-500/60 bg-amber-500/10 px-2 py-0.5 text-[10px] font-semibold text-amber-800 hover:bg-amber-500/20"
+            >
+              Sync
+            </button>
           </div>
-          <ul className="mt-0.5 truncate">
+          <ul className="mt-1.5 space-y-0.5">
             {unknownKeys.slice(0, 5).map((k) => (
               <li key={k} className="truncate font-mono text-[10px]">
                 • {k}

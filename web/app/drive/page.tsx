@@ -88,6 +88,12 @@ import { createHtmlTemplate } from "@/lib/create-html";
 import { createMarkdownTemplate } from "@/lib/create-markdown";
 import { createBlankPdfTemplate, type BlankPdfOpts } from "@/lib/create-pdf";
 import { AppShell } from "@/components/app-shell";
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
 import { StarterBrowser } from "@/components/starter-browser";
 import { BlankPdfDialog } from "@/components/blank-pdf-dialog";
 import { FormBuilderDialog } from "@/components/form-builder-dialog";
@@ -1544,21 +1550,22 @@ export default function DrivePage() {
         />
       )}
 
-      {detailsFor && (
-        <DetailsPanel
-          file={detailsFor}
-          onClose={() => setDetailsFor(null)}
-          onOpenShare={() => {
-            setShareFor(detailsFor);
-          }}
-          onDownload={() => download(detailsFor.id)}
-          onMove={() => moveFile(detailsFor)}
-          onRemove={() => {
+      <DetailsPanel
+        file={detailsFor}
+        open={!!detailsFor}
+        onOpenChange={(o) => !o && setDetailsFor(null)}
+        onOpenShare={() => {
+          if (detailsFor) setShareFor(detailsFor);
+        }}
+        onDownload={() => detailsFor && download(detailsFor.id)}
+        onMove={() => detailsFor && moveFile(detailsFor)}
+        onRemove={() => {
+          if (detailsFor) {
             remove(detailsFor);
             setDetailsFor(null);
-          }}
-        />
-      )}
+          }
+        }}
+      />
 
       <StarterBrowser
         open={browserOpen}
@@ -1935,117 +1942,121 @@ function StatCard({
 
 function DetailsPanel({
   file,
-  onClose,
+  open,
+  onOpenChange,
   onOpenShare,
   onDownload,
   onMove,
   onRemove,
 }: {
-  file: FileItem;
-  onClose: () => void;
+  file: FileItem | null;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
   onOpenShare: () => void;
   onDownload: () => void;
   onMove: () => void;
   onRemove: () => void;
 }) {
-  const Icon = iconForMime(file.mime);
   return (
-    <aside
-      role="complementary"
-      aria-label="File details"
-      className="fixed right-0 top-0 z-40 flex h-full w-full max-w-sm animate-slide-in-right flex-col border-l bg-background shadow-xl"
-    >
-      <div className="flex items-center justify-between border-b px-4 py-3">
-        <h2 className="text-sm font-semibold">Details</h2>
-        <Button
-          variant="ghost"
-          size="icon"
-          onClick={onClose}
-          aria-label="Close details"
-        >
-          <X className="h-4 w-4" />
-        </Button>
-      </div>
-      <div className="flex-1 overflow-y-auto p-4">
-        <div className="mb-4 flex flex-col items-center text-center">
-          <span
-            className={cn(
-              "grid h-16 w-16 place-items-center rounded-xl bg-muted",
-              colorForMime(file.mime)
-            )}
-          >
-            <Icon className="h-8 w-8" />
-          </span>
-          <div className="mt-3 break-words text-sm font-medium">
-            {file.name}
-          </div>
-          {file.templateId && (
-            <Badge variant="secondary" className="mt-1 text-[10px]">
-              Template
-            </Badge>
-          )}
-        </div>
+    <Sheet open={open} onOpenChange={onOpenChange}>
+      <SheetContent side="right" className="flex w-full max-w-sm flex-col p-0">
+        <SheetHeader className="pr-10">
+          <SheetTitle>Details</SheetTitle>
+        </SheetHeader>
 
-        <dl className="space-y-3 text-xs">
-          <div className="flex items-start justify-between gap-4 border-t pt-3">
-            <dt className="font-medium text-muted-foreground">Type</dt>
-            <dd className="text-right">{prettyMime(file.mime)}</dd>
-          </div>
-          <div className="flex items-start justify-between gap-4 border-t pt-3">
-            <dt className="font-medium text-muted-foreground">Size</dt>
-            <dd className="text-right">{fmtSize(file.size)}</dd>
-          </div>
-          <div className="flex items-start justify-between gap-4 border-t pt-3">
-            <dt className="font-medium text-muted-foreground">Status</dt>
-            <dd className="text-right capitalize">{file.status}</dd>
-          </div>
-          <div className="flex items-start justify-between gap-4 border-t pt-3">
-            <dt className="font-medium text-muted-foreground">Modified</dt>
-            <dd className="text-right">
-              {new Date(file.createdAt).toLocaleString()}
-            </dd>
-          </div>
-          <div className="flex items-start justify-between gap-4 border-t pt-3">
-            <dt className="font-medium text-muted-foreground">ID</dt>
-            <dd className="truncate font-mono text-[10px] text-muted-foreground">
-              {file.id}
-            </dd>
-          </div>
-        </dl>
-      </div>
+        {file && (
+          <>
+            <div className="flex-1 overflow-y-auto p-4">
+              {/* File icon + name */}
+              <div className="mb-4 flex flex-col items-center text-center">
+                <span
+                  className={cn(
+                    "grid h-16 w-16 place-items-center rounded-xl bg-muted",
+                    colorForMime(file.mime)
+                  )}
+                >
+                  {(() => {
+                    const Icon = iconForMime(file.mime);
+                    return <Icon className="h-8 w-8" />;
+                  })()}
+                </span>
+                <div className="mt-3 break-words text-sm font-medium">
+                  {file.name}
+                </div>
+                {file.templateId && (
+                  <Badge variant="secondary" className="mt-1 text-[10px]">
+                    Template
+                  </Badge>
+                )}
+              </div>
 
-      <div className="flex flex-col gap-2 border-t p-4">
-        {file.templateId && (
-          <Button asChild variant="outline" size="sm">
-            <Link href={`/templates/${file.templateId}/designer`}>
-              <PencilLine className="h-4 w-4" />
-              Open in designer
-            </Link>
-          </Button>
+              {/* Metadata */}
+              <dl className="space-y-3 text-xs">
+                <div className="flex items-start justify-between gap-4 border-t pt-3">
+                  <dt className="font-medium text-muted-foreground">Type</dt>
+                  <dd className="text-right">{prettyMime(file.mime)}</dd>
+                </div>
+                <div className="flex items-start justify-between gap-4 border-t pt-3">
+                  <dt className="font-medium text-muted-foreground">Size</dt>
+                  <dd className="text-right">{fmtSize(file.size)}</dd>
+                </div>
+                <div className="flex items-start justify-between gap-4 border-t pt-3">
+                  <dt className="font-medium text-muted-foreground">Status</dt>
+                  <dd className="text-right capitalize">{file.status}</dd>
+                </div>
+                <div className="flex items-start justify-between gap-4 border-t pt-3">
+                  <dt className="font-medium text-muted-foreground">
+                    Modified
+                  </dt>
+                  <dd className="text-right">
+                    {new Date(file.createdAt).toLocaleString()}
+                  </dd>
+                </div>
+                <div className="flex items-start justify-between gap-4 border-t pt-3">
+                  <dt className="font-medium text-muted-foreground">ID</dt>
+                  <dd className="truncate font-mono text-[10px] text-muted-foreground">
+                    {file.id}
+                  </dd>
+                </div>
+              </dl>
+            </div>
+
+            {/* Actions */}
+            <div className="flex flex-col gap-2 border-t p-4">
+              {file.templateId && (
+                <Button asChild variant="outline" size="sm">
+                  <Link href={`/templates/${file.templateId}/designer`}>
+                    <PencilLine className="h-4 w-4" />
+                    Open in designer
+                  </Link>
+                </Button>
+              )}
+              <Button variant="outline" size="sm" onClick={onDownload}>
+                <Download className="h-4 w-4" />
+                Download
+              </Button>
+              <Button variant="outline" size="sm" onClick={onOpenShare}>
+                <Share2 className="h-4 w-4" />
+                Share
+              </Button>
+              <Button variant="outline" size="sm" onClick={onMove}>
+                <Move className="h-4 w-4" />
+                Move…
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={onRemove}
+                className="text-destructive hover:text-destructive"
+              >
+                <Trash2 className="h-4 w-4" />
+                Move to trash
+              </Button>
+            </div>
+          </>
         )}
-        <Button variant="outline" size="sm" onClick={onDownload}>
-          <Download className="h-4 w-4" />
-          Download
-        </Button>
-        <Button variant="outline" size="sm" onClick={onOpenShare}>
-          <Share2 className="h-4 w-4" />
-          Share
-        </Button>
-        <Button variant="outline" size="sm" onClick={onMove}>
-          <Move className="h-4 w-4" />
-          Move…
-        </Button>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={onRemove}
-          className="text-destructive hover:text-destructive"
-        >
-          <Trash2 className="h-4 w-4" />
-          Move to trash
-        </Button>
-      </div>
-    </aside>
+      </SheetContent>
+    </Sheet>
   );
 }
 

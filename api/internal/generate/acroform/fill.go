@@ -11,11 +11,17 @@ import (
 )
 
 // Mapping describes how an input data key maps onto an AcroForm PDF field.
+//
+// Transform is a json.RawMessage to support both the legacy format
+// (plain string op name, e.g. "uppercase") and the structured form
+// (JSON object {"op":"...","params":{...}}). Decode via parseTransform.
 type Mapping struct {
-	DataKey   string `json:"dataKey"`
-	Default   string `json:"default,omitempty"`
-	Required  bool   `json:"required,omitempty"`
-	Transform string `json:"transform,omitempty"`
+	DataKey   string          `json:"dataKey"`
+	Default   string          `json:"default,omitempty"`
+	Required  bool            `json:"required,omitempty"`
+	Transform json.RawMessage `json:"transform,omitempty"`
+	Section   string          `json:"section,omitempty"`
+	Flatten   *bool           `json:"flatten,omitempty"`
 }
 
 // FieldSpec describes a known PDF form field (name + type) as extracted at upload time.
@@ -91,7 +97,7 @@ func resolveValues(fields []FieldSpec, mappings map[string]Mapping, input map[st
 				continue
 			}
 		}
-		out[f.Name] = applyTransform(raw, m.Transform)
+		out[f.Name] = applyTransformV2(raw, parseTransform(m.Transform), input)
 	}
 
 	// Reject unknown keys so callers get fast feedback on typos.
@@ -103,26 +109,6 @@ func resolveValues(fields []FieldSpec, mappings map[string]Mapping, input map[st
 	return out, nil
 }
 
-func applyTransform(v interface{}, t string) interface{} {
-	s, ok := v.(string)
-	if !ok {
-		// Non-string values pass through (bool for checkboxes, number for currency).
-		return v
-	}
-	switch t {
-	case "uppercase":
-		return strings.ToUpper(s)
-	case "lowercase":
-		return strings.ToLower(s)
-	case "currency":
-		// Simple pass-through; a full impl would parse float + format.
-		return s
-	case "date":
-		return s
-	default:
-		return s
-	}
-}
 
 type fillForm struct {
 	Forms []map[string][]fillEntry `json:"forms"`

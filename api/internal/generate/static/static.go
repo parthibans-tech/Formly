@@ -9,10 +9,14 @@ package static
 
 import (
 	"bytes"
+	"encoding/base64"
 	"fmt"
 	"image/png"
+	"io"
+	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/boombuler/barcode"
 	"github.com/boombuler/barcode/code128"
@@ -58,6 +62,15 @@ func Fill(pdfBytes []byte, widgets []Widget, data map[string]interface{}, l *lay
 	if err != nil {
 		return nil, err
 	}
+
+	// Inject AcroForm interactive fields (text, checkbox, radio, dropdown).
+	// Errors here are non-fatal — we still return the stamped PDF.
+	out, err = InjectAcroForm(out, widgets)
+	if err != nil {
+		// Log but don't fail the whole generation.
+		_ = err
+	}
+
 	if l != nil && l.Watermark.Enabled && l.Watermark.Text != "" {
 		out, err = stampTextWatermark(out, l.Watermark)
 		if err != nil {
@@ -93,7 +106,7 @@ func stampTextWatermark(src []byte, w layout.Watermark) ([]byte, error) {
 		size = 120
 	}
 	// pdfcpu watermark description — keep concise, see pdfcpu docs for grammar.
-	desc := fmt.Sprintf("points:%d, rot:%d, opacity:%.2f, pos:c, sc:1", size, angle, op)
+	desc := fmt.Sprintf("points:%d, rot:%d, opacity:%.2f, pos:c, scale:1 abs", size, angle, op)
 	wmDef, err := pdfcpuapi.TextWatermark(w.Text, desc, true, false, types.POINTS)
 	if err != nil {
 		return nil, err
@@ -135,14 +148,16 @@ func buildOverlay(pages []pageDim, widgets []Widget, data map[string]interface{}
 	pdf := fpdf.New("P", "pt", "Letter", "")
 	pdf.SetAutoPageBreak(false, 0)
 
+	totalPages := len(pages)
 	for i, p := range pages {
 		pdf.AddPageFormat("P", fpdf.SizeType{Wd: p.W, Ht: p.H})
 		pageNum := i + 1
 		for _, wd := range widgets {
-			if wd.Page != pageNum {
+			// Page 0 means "every page" — used by watermark + pageNumber.
+			if wd.Page != 0 && wd.Page != pageNum {
 				continue
 			}
-			drawWidget(pdf, wd, p, data)
+			drawWidget(pdf, wd, p, pageNum, totalPages, data)
 		}
 	}
 
@@ -153,34 +168,89 @@ func buildOverlay(pages []pageDim, widgets []Widget, data map[string]interface{}
 	return buf.Bytes(), nil
 }
 
-func drawWidget(pdf *fpdf.Fpdf, wd Widget, p pageDim, data map[string]interface{}) {
+func drawWidget(pdf *fpdf.Fpdf, wd Widget, p pageDim, pageNum, totalPages int, data map[string]interface{}) {
 	// Convert PDF space (bottom-left origin) to fpdf space (top-left origin) for drawing.
 	topY := p.H - wd.Y - wd.H
-
-	raw := lookup(data, wd.DataKey)
-	value := fmt.Sprint(raw)
 
 	props := wd.Props
 	if props == nil {
 		props = map[string]interface{}{}
 	}
+
+	// Honour the per-widget `_hidden` flag and optional showIf expression so
+	// the designer's conditional-visibility feature carries through to render.
+	if truthy(props["_hidden"]) {
+		return
+	}
+
+	raw := lookup(data, wd.DataKey)
+	value := fmt.Sprint(raw)
+	if raw == nil {
+		value = ""
+	}
+
 	fontSize := floatProp(props, "fontSize", 12)
 	fontFamily := stringProp(props, "fontFamily", "Helvetica")
 	color := stringProp(props, "color", "#111827")
 	r, g, b := hexToRGB(color)
 	pdf.SetTextColor(r, g, b)
-	pdf.SetFont(fontFamily, "", fontSize)
+
+	// Build fpdf style string from individual boolean props.
+	// Supports any combination of Bold / Italic / Underline.
+	fontStyle := ""
+	if boolProp(props, "bold", false) {
+		fontStyle += "B"
+	}
+	if boolProp(props, "italic", false) {
+		fontStyle += "I"
+	}
+	if boolProp(props, "underline", false) {
+		fontStyle += "U"
+	}
+	pdf.SetFont(fontFamily, fontStyle, fontSize)
+
+	// Per-widget opacity via PDF transparency groups.
+	// Restores to fully-opaque after this widget is drawn.
+	if op := floatProp(props, "opacity", 1.0); op < 1.0 {
+		pdf.SetAlpha(op, "Normal")
+		defer pdf.SetAlpha(1.0, "Normal")
+	}
+
+	// Box-style helpers shared by all text-bearing widgets:
+	// background fill, border, and inner padding.
+	bgColor := stringProp(props, "backgroundColor", "")
+	bdrColor := stringProp(props, "borderColor", "")
+	bdrWidth := floatProp(props, "borderWidth", 0)
+	padding := floatProp(props, "padding", 0)
+	lineHeight := floatProp(props, "lineHeight", 1.15)
+
+	// drawTextBox renders an optional fill rect and border rect behind text.
+	drawTextBox := func() {
+		if bgColor != "" {
+			br, bg, bb := hexToRGB(bgColor)
+			pdf.SetFillColor(br, bg, bb)
+			pdf.Rect(wd.X, topY, wd.W, wd.H, "F")
+		}
+		if bdrColor != "" && bdrWidth > 0 {
+			bdr, bdg, bdb := hexToRGB(bdrColor)
+			pdf.SetDrawColor(bdr, bdg, bdb)
+			pdf.SetLineWidth(bdrWidth)
+			pdf.Rect(wd.X, topY, wd.W, wd.H, "D")
+		}
+	}
 
 	switch wd.Type {
 	case "text", "number", "currency", "date", "":
 		if value == "" {
 			return
 		}
-		pdf.SetXY(wd.X, topY)
-		pdf.CellFormat(wd.W, wd.H, value, "", 0, stringProp(props, "align", "L"), false, 0, "")
+		drawTextBox()
+		pdf.SetXY(wd.X+padding, topY+padding)
+		pdf.CellFormat(wd.W-2*padding, wd.H-2*padding, value, "", 0, stringProp(props, "align", "L"), false, 0, "")
 	case "multiline":
-		pdf.SetXY(wd.X, topY)
-		pdf.MultiCell(wd.W, fontSize*1.15, value, "", stringProp(props, "align", "L"), false)
+		drawTextBox()
+		pdf.SetXY(wd.X+padding, topY+padding)
+		pdf.MultiCell(wd.W-2*padding, fontSize*lineHeight, value, "", stringProp(props, "align", "L"), false)
 	case "checkbox":
 		checked := truthy(raw)
 		pdf.SetDrawColor(r, g, b)
@@ -189,6 +259,81 @@ func drawWidget(pdf *fpdf.Fpdf, wd Widget, p pageDim, data map[string]interface{
 			pdf.Line(wd.X+2, topY+2, wd.X+wd.W-2, topY+wd.H-2)
 			pdf.Line(wd.X+wd.W-2, topY+2, wd.X+2, topY+wd.H-2)
 		}
+
+	case "radio":
+		// Render as a circle. Checked when the data value equals the export value.
+		exportVal := stringProp(props, "acroExportValue", "")
+		checked := exportVal != "" && value == exportVal
+		pdf.SetDrawColor(r, g, b)
+		cx := wd.X + wd.W/2
+		cy := topY + wd.H/2
+		rad := wd.W / 2
+		if wd.H < wd.W {
+			rad = wd.H / 2
+		}
+		pdf.Circle(cx, cy, rad, "D")
+		if checked {
+			innerRad := rad * 0.55
+			pdf.SetFillColor(r, g, b)
+			pdf.Circle(cx, cy, innerRad, "F")
+		}
+
+	case "signature-field":
+		// Dashed border placeholder with an "X Sign here" label.
+		pdf.SetDrawColor(r, g, b)
+		pdf.SetLineWidth(0.75)
+		pdf.SetDashPattern([]float64{4, 2}, 0)
+		pdf.Rect(wd.X, topY, wd.W, wd.H, "D")
+		pdf.SetDashPattern([]float64{}, 0) // reset to solid
+		// Horizontal baseline near the bottom of the box.
+		baseY := topY + wd.H - 6
+		pdf.SetLineWidth(0.5)
+		pdf.Line(wd.X+4, baseY, wd.X+wd.W-4, baseY)
+		// Label
+		pdf.SetFont(fontFamily, "I", fontSize*0.8)
+		pdf.SetXY(wd.X+4, topY+2)
+		pdf.CellFormat(wd.W-8, wd.H-8, "\u00d7 Sign here", "", 0, "L", false, 0, "")
+
+	case "button":
+		// Filled button rectangle with centred label text.
+		label := stringProp(props, "acroButtonLabel", wd.DataKey)
+		// Apply default button visual if the user hasn't set box-style props.
+		if bgColor == "" {
+			br, bg, bb := hexToRGB("#e5e7eb")
+			pdf.SetFillColor(br, bg, bb)
+			pdf.Rect(wd.X, topY, wd.W, wd.H, "F")
+		}
+		if bdrColor == "" || bdrWidth <= 0 {
+			bdr, bdg, bdb := hexToRGB("#9ca3af")
+			pdf.SetDrawColor(bdr, bdg, bdb)
+			pdf.SetLineWidth(0.5)
+			pdf.Rect(wd.X, topY, wd.W, wd.H, "D")
+		}
+		drawTextBox()
+		pdf.SetXY(wd.X+padding, topY+padding)
+		pdf.CellFormat(wd.W-2*padding, wd.H-2*padding, label, "", 0, "C", false, 0, "")
+
+	case "dropdown":
+		// Render as a text box showing the selected option label (or dataKey).
+		if value == "" {
+			return
+		}
+		drawTextBox()
+		// Find the label for the selected value in acroOptions.
+		displayText := value
+		if opts, ok := props["acroOptions"].([]interface{}); ok {
+			for _, o := range opts {
+				if m, ok2 := o.(map[string]interface{}); ok2 {
+					if v, _ := m["value"].(string); v == value {
+						if l, _ := m["label"].(string); l != "" {
+							displayText = l
+						}
+					}
+				}
+			}
+		}
+		pdf.SetXY(wd.X+padding, topY+padding)
+		pdf.CellFormat(wd.W-2*padding, wd.H-2*padding, displayText, "", 0, stringProp(props, "align", "L"), false, 0, "")
 	case "qr":
 		if value == "" {
 			return
@@ -210,11 +355,242 @@ func drawWidget(pdf *fpdf.Fpdf, wd Widget, p pageDim, data map[string]interface{
 		}
 		pdf.ImageOptions(imageName, wd.X, topY, wd.W, wd.H, false,
 			fpdf.ImageOptions{ImageType: "png"}, 0, "")
+	case "image", "signature":
+		// Both render the same way — a signature is just an image widget
+		// whose source happens to be a user-drawn PNG. Accepts:
+		//   • data:<mime>;base64,... URIs (e.g. signature canvases)
+		//   • http(s):// URLs
+		//   • raw base64 strings
+		// If no data is present, draws a dashed placeholder box so the
+		// author can see the widget footprint without it disappearing.
+		src := stringProp(props, "src", "")
+		if src == "" {
+			src = value
+		}
+		if src == "" {
+			pdf.SetDrawColor(200, 200, 200)
+			pdf.SetLineWidth(0.5)
+			pdf.Rect(wd.X, topY, wd.W, wd.H, "D")
+			return
+		}
+		imageName := fmt.Sprintf("%s-%s", wd.Type, wd.ID)
+		imgType, imgBytes, err := loadImage(src)
+		if err != nil {
+			return
+		}
+		pdf.RegisterImageOptionsReader(imageName, fpdf.ImageOptions{ImageType: imgType}, bytes.NewReader(imgBytes))
+		fitMode := stringProp(props, "fit", "contain")
+		drawImage(pdf, imageName, wd.X, topY, wd.W, wd.H, imgType, fitMode)
+
+	case "rectangle", "shape":
+		// Filled / stroked rectangle — adds dividers, callouts, signature
+		// boxes. Supports fill + stroke + rounded corners.
+		stroke := stringProp(props, "borderColor", "")
+		fill := stringProp(props, "backgroundColor", "")
+		lw := floatProp(props, "borderWidth", 0)
+		radius := floatProp(props, "borderRadius", 0)
+		style := ""
+		if fill != "" {
+			fr, fg, fb := hexToRGB(fill)
+			pdf.SetFillColor(fr, fg, fb)
+			style += "F"
+		}
+		if stroke != "" && lw > 0 {
+			sr, sg, sb := hexToRGB(stroke)
+			pdf.SetDrawColor(sr, sg, sb)
+			pdf.SetLineWidth(lw)
+			style += "D"
+		}
+		if style == "" {
+			return
+		}
+		if radius > 0 {
+			pdf.RoundedRect(wd.X, topY, wd.W, wd.H, radius, "1234", style)
+		} else {
+			pdf.Rect(wd.X, topY, wd.W, wd.H, style)
+		}
+
+	case "line", "divider":
+		// Horizontal divider by default. `orientation: "vertical"` flips.
+		lw := floatProp(props, "borderWidth", 0.5)
+		pdf.SetLineWidth(lw)
+		pdf.SetDrawColor(r, g, b)
+		if stringProp(props, "orientation", "horizontal") == "vertical" {
+			cx := wd.X + wd.W/2
+			pdf.Line(cx, topY, cx, topY+wd.H)
+		} else {
+			cy := topY + wd.H/2
+			pdf.Line(wd.X, cy, wd.X+wd.W, cy)
+		}
+
+	case "pageNumber":
+		// Auto-updating "{page} / {pages}" or custom template in
+		// `props.format` (e.g. "Page {page} of {pages}").
+		format := stringProp(props, "format", "{page} / {pages}")
+		rendered := strings.NewReplacer(
+			"{page}", fmt.Sprintf("%d", pageNum),
+			"{pages}", fmt.Sprintf("%d", totalPages),
+		).Replace(format)
+		drawTextBox()
+		pdf.SetXY(wd.X+padding, topY+padding)
+		pdf.CellFormat(wd.W-2*padding, wd.H-2*padding, rendered, "", 0, stringProp(props, "align", "C"), false, 0, "")
+
+	case "watermark":
+		// Diagonal text watermark per widget placement. Unlike the layout-
+		// level watermark (whole-document), this one lives at a fixed spot
+		// and rotates in place. Uses the widget rect as a centering hint.
+		text := stringProp(props, "text", value)
+		if text == "" {
+			text = "DRAFT"
+		}
+		opacity := floatProp(props, "opacity", 0.15)
+		// fpdf lacks true alpha without extensions; fake it by mixing the
+		// color toward white. Safe approximation for light watermarks.
+		mr, mg, mb := mixToward(r, g, b, 255, 255, 255, 1-opacity)
+		pdf.SetTextColor(mr, mg, mb)
+		pdf.SetFont(fontFamily, "B", fontSize*3)
+		angle := floatProp(props, "angle", -30)
+		cx := wd.X + wd.W/2
+		cy := topY + wd.H/2
+		pdf.TransformBegin()
+		pdf.TransformRotate(angle, cx, cy)
+		pdf.SetXY(wd.X, topY)
+		pdf.CellFormat(wd.W, wd.H, text, "", 0, "C", false, 0, "")
+		pdf.TransformEnd()
+
+	case "repeat", "table":
+		// Repeating row-per-array-entry list. `dataKey` should resolve to a
+		// []interface{}; each entry is a map whose keys become column
+		// substitutions in `props.rowTemplate` (e.g. "{name} — {amount}").
+		// Multi-column tables can be built by placing several widgets that
+		// share the same `dataKey` but different `rowTemplate`s.
+		items, _ := lookup(data, wd.DataKey).([]interface{})
+		tpl := stringProp(props, "rowTemplate", "{.}")
+		rowH := floatProp(props, "rowHeight", fontSize*lineHeight)
+		drawTextBox()
+		maxRows := int((wd.H - 2*padding) / rowH)
+		if maxRows <= 0 {
+			maxRows = 1
+		}
+		for i, it := range items {
+			if i >= maxRows {
+				break
+			}
+			row := renderRowTemplate(tpl, it)
+			pdf.SetXY(wd.X+padding, topY+padding+float64(i)*rowH)
+			pdf.CellFormat(wd.W-2*padding, rowH, row, "", 0, stringProp(props, "align", "L"), false, 0, "")
+		}
+
 	default:
 		// Unknown type: render as text so authors can see the raw value and fix it.
-		pdf.SetXY(wd.X, topY)
-		pdf.CellFormat(wd.W, wd.H, value, "", 0, "L", false, 0, "")
+		drawTextBox()
+		pdf.SetXY(wd.X+padding, topY+padding)
+		pdf.CellFormat(wd.W-2*padding, wd.H-2*padding, value, "", 0, "L", false, 0, "")
 	}
+}
+
+// drawImage places the pre-registered image at (x, y, w, h) honouring
+// a `fit` mode. "contain" preserves aspect ratio; "stretch" fills the box.
+func drawImage(pdf *fpdf.Fpdf, name string, x, y, w, h float64, imgType, fit string) {
+	switch fit {
+	case "stretch":
+		pdf.ImageOptions(name, x, y, w, h, false,
+			fpdf.ImageOptions{ImageType: imgType}, 0, "")
+	default:
+		// "contain": let fpdf compute the aspect-correct width using h=0.
+		info := pdf.RegisterImageOptions(name, fpdf.ImageOptions{ImageType: imgType})
+		if info == nil {
+			pdf.ImageOptions(name, x, y, w, h, false,
+				fpdf.ImageOptions{ImageType: imgType}, 0, "")
+			return
+		}
+		iw, ih := info.Extent()
+		if iw <= 0 || ih <= 0 {
+			return
+		}
+		scale := w / iw
+		if ih*scale > h {
+			scale = h / ih
+		}
+		tw := iw * scale
+		th := ih * scale
+		ox := x + (w-tw)/2
+		oy := y + (h-th)/2
+		pdf.ImageOptions(name, ox, oy, tw, th, false,
+			fpdf.ImageOptions{ImageType: imgType}, 0, "")
+	}
+}
+
+// loadImage accepts a data URI, http(s) URL, or raw base64 and returns
+// the decoded bytes + fpdf image type string ("png" | "jpg").
+func loadImage(src string) (string, []byte, error) {
+	src = strings.TrimSpace(src)
+	imgType := "png"
+	if strings.HasPrefix(src, "data:") {
+		// data:<mime>;base64,<payload>
+		comma := strings.Index(src, ",")
+		if comma < 0 {
+			return "", nil, fmt.Errorf("bad data uri")
+		}
+		meta := src[:comma]
+		payload := src[comma+1:]
+		if strings.Contains(meta, "jpeg") || strings.Contains(meta, "jpg") {
+			imgType = "jpg"
+		}
+		b, err := base64.StdEncoding.DecodeString(payload)
+		if err != nil {
+			return "", nil, err
+		}
+		return imgType, b, nil
+	}
+	if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Get(src)
+		if err != nil {
+			return "", nil, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			return "", nil, fmt.Errorf("image fetch %d", resp.StatusCode)
+		}
+		// Infer type from Content-Type, fall back to extension.
+		ct := resp.Header.Get("Content-Type")
+		if strings.Contains(ct, "jpeg") || strings.HasSuffix(strings.ToLower(src), ".jpg") || strings.HasSuffix(strings.ToLower(src), ".jpeg") {
+			imgType = "jpg"
+		}
+		b, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
+		if err != nil {
+			return "", nil, err
+		}
+		return imgType, b, nil
+	}
+	// Assume raw base64.
+	b, err := base64.StdEncoding.DecodeString(src)
+	if err != nil {
+		return "", nil, err
+	}
+	return imgType, b, nil
+}
+
+// renderRowTemplate replaces `{key}` substitutions with values from a row.
+// The special `{.}` token stringifies the whole row (useful for scalar
+// arrays like `[]string`).
+func renderRowTemplate(tpl string, row interface{}) string {
+	if m, ok := row.(map[string]interface{}); ok {
+		out := tpl
+		for k, v := range m {
+			out = strings.ReplaceAll(out, "{"+k+"}", fmt.Sprint(v))
+		}
+		return strings.ReplaceAll(out, "{.}", fmt.Sprint(row))
+	}
+	return strings.ReplaceAll(tpl, "{.}", fmt.Sprint(row))
+}
+
+// mixToward blends (r1,g1,b1) toward (r2,g2,b2) by weight 0..1.
+func mixToward(r1, g1, b1, r2, g2, b2 int, w float64) (int, int, int) {
+	return int(float64(r1)*(1-w) + float64(r2)*w),
+		int(float64(g1)*(1-w) + float64(g2)*w),
+		int(float64(b1)*(1-w) + float64(b2)*w)
 }
 
 func stampOverlay(src, overlay []byte) ([]byte, error) {
@@ -236,7 +612,7 @@ func stampOverlay(src, overlay []byte) ([]byte, error) {
 	}
 	defer os.Remove(outPath)
 
-	wm, err := pdfcpuapi.PDFWatermark(ovPath, "pos:c, sc:1 abs, opacity:1, rot:0", true, false, types.POINTS)
+	wm, err := pdfcpuapi.PDFWatermark(ovPath, "pos:c, scale:1 abs, opacity:1, rot:0", true, false, types.POINTS)
 	if err != nil {
 		return nil, err
 	}
@@ -326,6 +702,19 @@ func stringProp(p map[string]interface{}, key, def string) string {
 	return def
 }
 
+func boolProp(p map[string]interface{}, key string, def bool) bool {
+	if v, ok := p[key]; ok {
+		switch x := v.(type) {
+		case bool:
+			return x
+		case string:
+			s := strings.ToLower(strings.TrimSpace(x))
+			return s == "true" || s == "1" || s == "yes"
+		}
+	}
+	return def
+}
+
 // registerQRImage encodes a QR for `value` and registers it with fpdf under
 // `name` so drawWidget can stamp it onto the overlay. Image size is derived
 // from the widget; fpdf rescales on Image().
@@ -390,4 +779,3 @@ func hexToRGB(h string) (int, int, int) {
 	fmt.Sscanf(h, "%02x%02x%02x", &r, &g, &b)
 	return r, g, b
 }
-

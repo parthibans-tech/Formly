@@ -25,14 +25,26 @@ import {
   AlignLeft,
   AlignRight,
   AlignVerticalJustifyCenter,
+  Bold,
+  Check,
   ChevronsDown,
   ChevronsUp,
+  Clipboard,
+  Code2,
+  Download,
+  FileJson,
+  Group,
+  PackageOpen,
+  Layers,
+  ShieldCheck,
   Copy as CopyIcon,
   Database,
   Eye,
   EyeOff,
   Files,
   Grid3x3,
+  Hash,
+  Italic,
   Keyboard,
   LayoutGrid,
   Lock,
@@ -46,6 +58,7 @@ import {
   Settings2,
   Shapes,
   Trash2,
+  Underline,
   Undo2,
 } from "lucide-react";
 import {
@@ -72,6 +85,15 @@ import {
   type MenuItem,
 } from "@/components/designer/widget-context-menu";
 import { SchemaPanel } from "@/components/designer/schema-panel";
+import { LayersPanel, type LayerWidget } from "@/components/designer/layers-panel";
+import { AcroFormPanel } from "@/components/designer/acroform-panel";
+import { TabOrderPanel, type TabWidget } from "@/components/designer/tab-order-panel";
+import { isAcroFieldType } from "@/lib/acroform-types";
+import {
+  ValidationPanel,
+  runValidation,
+  type ValidWidget,
+} from "@/components/designer/validation-panel";
 import {
   applyTransforms,
   collectPaths,
@@ -90,6 +112,15 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { TYPOGRAPHY_PRESETS, FONT_FAMILIES } from "@/lib/font-presets";
+import {
+  copyToClipboard,
+  downloadFullExport,
+  downloadJSON,
+  downloadSkeleton,
+  downloadTypeScript,
+  toTypeScript,
+} from "@/lib/schema-export";
 
 pdfjs.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.js`;
 
@@ -125,15 +156,26 @@ type Props = {
   previewUrl: string;
 };
 
-const PALETTE: { type: Widget["type"]; label: string; defaultW: number; defaultH: number }[] = [
-  { type: "text", label: "Text", defaultW: 160, defaultH: 18 },
-  { type: "multiline", label: "Multiline", defaultW: 200, defaultH: 60 },
-  { type: "date", label: "Date", defaultW: 110, defaultH: 18 },
-  { type: "number", label: "Number", defaultW: 90, defaultH: 18 },
-  { type: "currency", label: "Currency", defaultW: 120, defaultH: 18 },
-  { type: "checkbox", label: "Checkbox", defaultW: 16, defaultH: 16 },
-  { type: "qr", label: "QR code", defaultW: 80, defaultH: 80 },
-  { type: "barcode", label: "Barcode", defaultW: 160, defaultH: 48 },
+const PALETTE: { type: Widget["type"]; label: string; defaultW: number; defaultH: number; group?: string }[] = [
+  { type: "text", label: "Text", defaultW: 160, defaultH: 18, group: "Text" },
+  { type: "multiline", label: "Multiline", defaultW: 200, defaultH: 60, group: "Text" },
+  { type: "date", label: "Date", defaultW: 110, defaultH: 18, group: "Text" },
+  { type: "number", label: "Number", defaultW: 90, defaultH: 18, group: "Text" },
+  { type: "currency", label: "Currency", defaultW: 120, defaultH: 18, group: "Text" },
+  { type: "checkbox", label: "Checkbox", defaultW: 16, defaultH: 16, group: "Form" },
+  { type: "radio", label: "Radio button", defaultW: 14, defaultH: 14, group: "Form" },
+  { type: "dropdown", label: "Dropdown", defaultW: 140, defaultH: 18, group: "Form" },
+  { type: "signature-field", label: "Sig. field", defaultW: 200, defaultH: 50, group: "Form" },
+  { type: "button", label: "Button", defaultW: 100, defaultH: 22, group: "Form" },
+  { type: "qr", label: "QR code", defaultW: 80, defaultH: 80, group: "Media" },
+  { type: "barcode", label: "Barcode", defaultW: 160, defaultH: 48, group: "Media" },
+  { type: "image", label: "Image", defaultW: 160, defaultH: 100, group: "Media" },
+  { type: "signature", label: "Signature", defaultW: 180, defaultH: 60, group: "Media" },
+  { type: "rectangle", label: "Rectangle", defaultW: 160, defaultH: 60, group: "Shape" },
+  { type: "line", label: "Divider", defaultW: 200, defaultH: 1, group: "Shape" },
+  { type: "pageNumber", label: "Page number", defaultW: 80, defaultH: 16, group: "Auto" },
+  { type: "watermark", label: "Watermark", defaultW: 360, defaultH: 60, group: "Auto" },
+  { type: "repeat", label: "Repeat list", defaultW: 260, defaultH: 120, group: "Data" },
 ];
 
 // Default zoom — Cmd+0 returns to this. Range is ZOOM_MIN…ZOOM_MAX.
@@ -190,7 +232,7 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
   const [showThumbs, setShowThumbs] = useState(true);
   // Left rail controls which side panel is visible. Single-panel model
   // gives the canvas more room; clicking the active icon collapses it.
-  type LeftPanel = "widgets" | "pages" | "schema" | null;
+  type LeftPanel = "widgets" | "pages" | "schema" | "layers" | "inspect" | "taborder" | null;
   const [activePanel, setActivePanel] = useState<LeftPanel>("widgets");
   // Live preview: when on, widgets render the resolved value from the
   // sample data instead of the dataKey name — like turning on "Preview"
@@ -212,6 +254,7 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
     }
   });
   const [editSampleOpen, setEditSampleOpen] = useState(false);
+  const [copiedSchema, setCopiedSchema] = useState(false);
   const [bulkRenameOpen, setBulkRenameOpen] = useState(false);
   const [bulkFind, setBulkFind] = useState("");
   const [bulkReplace, setBulkReplace] = useState("");
@@ -260,6 +303,16 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
     }
   }, [sampleJSON]);
   const sampleKeys = useMemo(() => collectPaths(sample), [sample]);
+
+  // Validation issues — recomputed whenever widgets or page dims change.
+  const validationIssues = useMemo(
+    () => runValidation(widgets as ValidWidget[], pageDims, sampleKeys),
+    [widgets, pageDims, sampleKeys]
+  );
+  const issueCount = useMemo(
+    () => validationIssues.filter((i) => i.severity !== "info").length,
+    [validationIssues]
+  );
 
   const pageRefs = useRef<Record<number, HTMLDivElement | null>>({});
 
@@ -617,6 +670,73 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
     );
   }
 
+  // GROUP / UNGROUP -------------------------------------------------------
+  // Cmd+G assigns a shared _group ID to all selected widgets so they move
+  // together. Cmd+Shift+G removes the shared grouping.
+  function groupSelection() {
+    if (selectedIds.length < 2) return;
+    const gid = `g-${Date.now().toString(36)}`;
+    history.commit(
+      widgets.map((w) =>
+        selectedSet.has(w.id)
+          ? { ...w, props: { ...w.props, _group: gid } }
+          : w
+      )
+    );
+  }
+  function ungroupSelection() {
+    if (selectedIds.length === 0) return;
+    const groupIds = new Set(
+      selectedIds
+        .map((id) => widgets.find((w) => w.id === id)?.props?._group)
+        .filter(Boolean) as string[]
+    );
+    if (groupIds.size === 0) return;
+    history.commit(
+      widgets.map((w) => {
+        if (w.props?._group && groupIds.has(w.props._group as string)) {
+          // eslint-disable-next-line @typescript-eslint/no-unused-vars
+          const { _group, ...rest } = w.props;
+          return { ...w, props: rest };
+        }
+        return w;
+      })
+    );
+  }
+  /** Select every widget that shares a group ID. */
+  function selectGroup(groupId: string) {
+    setSelectedIds(widgets.filter((w) => w.props?._group === groupId).map((w) => w.id));
+  }
+
+  // WIDGET RENAME (layers panel) -----------------------------------------
+  function renameWidget(id: string, label: string) {
+    setWidgets((prev) =>
+      prev.map((w) =>
+        w.id === id
+          ? { ...w, props: { ...w.props, _label: label || undefined } }
+          : w
+      )
+    );
+  }
+
+  // LAYERS REORDER -------------------------------------------------------
+  // Drag a layer row over another → swap z-indices so the dragged widget
+  // takes the z-position of the drop target and vice versa.
+  function reorderLayer(draggedId: string, targetId: string) {
+    const dragged = widgets.find((w) => w.id === draggedId);
+    const target = widgets.find((w) => w.id === targetId);
+    if (!dragged || !target) return;
+    const dragZ = dragged.zIndex;
+    const targZ = target.zIndex;
+    history.commit(
+      widgets.map((w) => {
+        if (w.id === draggedId) return { ...w, zIndex: targZ };
+        if (w.id === targetId) return { ...w, zIndex: dragZ };
+        return w;
+      })
+    );
+  }
+
   // MARQUEE --------------------------------------------------------------
   // Begin marquee when the user mousedowns on empty space inside a page.
   // Coordinates are BROWSER-relative to the page.
@@ -854,6 +974,18 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
         method: "PUT",
         body: JSON.stringify({ widgets: payload }),
       });
+      // Persist sample data alongside widgets so it survives page refresh.
+      try {
+        const sampleData = JSON.parse(sampleJSON || "{}");
+        const mergedConfig = { ...currentConfig, sampleData };
+        await api(`/v1/templates/${tpl.id}/config`, {
+          method: "PUT",
+          body: JSON.stringify({ config: mergedConfig }),
+        });
+        setCurrentConfig(mergedConfig);
+      } catch {
+        // Non-fatal — sample data is UI-only, don't block save on parse error.
+      }
       setLastSaved(new Date());
     } catch (e: any) {
       toast.show("error", e.message);
@@ -965,6 +1097,17 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
         // Don't clash with browser back — require Shift for hide.
         e.preventDefault();
         toggleHide();
+        return;
+      }
+      // Group / ungroup
+      if (mod && e.key.toLowerCase() === "g" && !e.shiftKey) {
+        e.preventDefault();
+        groupSelection();
+        return;
+      }
+      if (mod && e.key.toLowerCase() === "g" && e.shiftKey) {
+        e.preventDefault();
+        ungroupSelection();
         return;
       }
 
@@ -1083,6 +1226,42 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
   // Bind the clicked schema path to the currently-selected widget(s). If
   // more than one widget is selected, only the primary one is rebound —
   // bulk rebinding isn't the common intent.
+  // SYNC SAMPLE -----------------------------------------------------------
+  // Merges every widget dataKey that's currently missing from the sample
+  // into the sample JSON, using an empty-string placeholder value.
+  // Dot-paths are expanded into nested objects:
+  //   "invoice.total" → { invoice: { total: "" } }
+  function syncSampleFromWidgets() {
+    const missingKeys = widgets
+      .map((w) => w.dataKey)
+      .filter((k) => k && !keyExists(sampleKeys, k));
+    if (missingKeys.length === 0) return;
+
+    let current: Record<string, any> = {};
+    try {
+      current = JSON.parse(sampleJSON || "{}");
+    } catch { /* keep empty */ }
+
+    function setNestedKey(obj: Record<string, any>, dotPath: string): void {
+      const parts = dotPath.split(".");
+      let cur = obj;
+      for (let i = 0; i < parts.length - 1; i++) {
+        if (cur[parts[i]] == null || typeof cur[parts[i]] !== "object") {
+          cur[parts[i]] = {};
+        }
+        cur = cur[parts[i]];
+      }
+      const leaf = parts[parts.length - 1];
+      if (cur[leaf] === undefined) cur[leaf] = "";
+    }
+
+    for (const key of missingKeys) {
+      setNestedKey(current, key);
+    }
+    setSampleJSON(JSON.stringify(current, null, 2));
+    toast.show("success", `Added ${missingKeys.length} missing key${missingKeys.length === 1 ? "" : "s"} to sample`);
+  }
+
   function bindSelectedTo(path: string) {
     if (!selected) {
       toast.show("info", "Select a widget first, then click a key to bind.");
@@ -1149,6 +1328,9 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
       { id: "arr:back", label: "Send to back", hint: `${M}⇧[`, group: "Arrange", run: sendToBack },
       { id: "arr:fwd", label: "Bring forward", hint: `${M}]`, group: "Arrange", run: bringForward },
       { id: "arr:bwd", label: "Send backward", hint: `${M}[`, group: "Arrange", run: sendBackward },
+      { id: "arr:group", label: "Group selection", hint: `${M}G`, group: "Arrange", run: groupSelection },
+      { id: "arr:ungroup", label: "Ungroup selection", hint: `${M}⇧G`, group: "Arrange", run: ungroupSelection },
+      { id: "arr:inspect", label: "Open validation panel", group: "Arrange", run: () => setActivePanel("inspect") },
       {
         id: "edit:lock",
         label: "Lock / unlock selection",
@@ -1212,6 +1394,50 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
       },
       { id: "data:sample", label: "Edit sample JSON", group: "Data", run: () => setEditSampleOpen(true) },
       { id: "data:rename", label: "Bulk rename data key", group: "Data", run: () => setBulkRenameOpen(true) },
+      {
+        id: "data:export:full",
+        label: "Export full template config (widgets + layout + data)",
+        group: "Data",
+        run: () => downloadFullExport(tpl, widgets, currentConfig, sampleJSON),
+      },
+      {
+        id: "data:export:json",
+        label: "Export schema → JSON",
+        group: "Data",
+        run: () => {
+          try {
+            downloadJSON(JSON.stringify(JSON.parse(sampleJSON || "{}"), null, 2), `${tpl.name || "schema"}.json`);
+          } catch { toast.show("error", "Sample data is not valid JSON"); }
+        },
+      },
+      {
+        id: "data:export:ts",
+        label: "Export schema → TypeScript interface",
+        group: "Data",
+        run: () => {
+          try {
+            downloadTypeScript(JSON.parse(sampleJSON || "{}"), `${tpl.name || "schema"}.ts`);
+          } catch { toast.show("error", "Sample data is not valid JSON"); }
+        },
+      },
+      {
+        id: "data:export:skeleton",
+        label: "Export skeleton payload",
+        group: "Data",
+        run: () => {
+          try {
+            downloadSkeleton(JSON.parse(sampleJSON || "{}"), `${tpl.name || "payload"}-skeleton.json`);
+          } catch { toast.show("error", "Sample data is not valid JSON"); }
+        },
+      },
+      {
+        id: "data:export:copy",
+        label: "Copy schema JSON to clipboard",
+        group: "Data",
+        run: () => copyToClipboard(sampleJSON).then((ok) => {
+          if (ok) toast.show("success", "Schema JSON copied to clipboard");
+        }),
+      },
       { id: "file:save", label: "Save now", hint: `${M}S`, group: "File", run: save },
       { id: "file:generate", label: "Generate PDF", group: "File", run: openGenerate },
       { id: "file:batch", label: "Batch generate from CSV", group: "File", run: () => setBatchOpen(true) },
@@ -1234,23 +1460,44 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
     save,
   ]);
 
-  const paletteEls = useMemo(
-    () =>
-      PALETTE.map((p) => (
-        <div
-          key={p.type}
-          draggable
-          onDragStart={(e) => onPaletteDragStart(e, p.type)}
-          onDoubleClick={() => insertFromPalette(p.type)}
-          title="Drag to page, or double-click to insert"
-          className="px-3 py-2 border rounded bg-white cursor-grab hover:border-blue-500 text-sm select-none"
-        >
-          {p.label}
-        </div>
-      )),
+  const paletteEls = useMemo(() => {
+    // Group by category so the expanded palette (now ~15 types) stays
+    // scannable. Preserves original order within each group.
+    const groups: Record<string, typeof PALETTE> = {};
+    const order: string[] = [];
+    for (const p of PALETTE) {
+      const g = p.group || "Misc";
+      if (!groups[g]) {
+        groups[g] = [];
+        order.push(g);
+      }
+      groups[g].push(p);
+    }
+    return (
+      <div className="space-y-3">
+        {order.map((g) => (
+          <div key={g} className="space-y-1.5">
+            <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+              {g}
+            </div>
+            {groups[g].map((p) => (
+              <div
+                key={p.type}
+                draggable
+                onDragStart={(e) => onPaletteDragStart(e, p.type)}
+                onDoubleClick={() => insertFromPalette(p.type)}
+                title="Drag to page, or double-click to insert"
+                className="cursor-grab select-none rounded border bg-white px-3 py-1.5 text-sm hover:border-blue-500"
+              >
+                {p.label}
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+    );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [widgets.length, pageDims]
-  );
+  }, [widgets.length, pageDims]);
 
   const savedHint = saving
     ? "Saving…"
@@ -1468,6 +1715,32 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
               setActivePanel((p) => (p === "schema" ? null : "schema"))
             }
           />
+          <RailBtn
+            icon={Layers}
+            label="Layers"
+            active={activePanel === "layers"}
+            onClick={() =>
+              setActivePanel((p) => (p === "layers" ? null : "layers"))
+            }
+            badge={widgets.length || undefined}
+          />
+          <RailBtn
+            icon={ShieldCheck}
+            label="Validation"
+            active={activePanel === "inspect"}
+            onClick={() =>
+              setActivePanel((p) => (p === "inspect" ? null : "inspect"))
+            }
+            badge={issueCount || undefined}
+          />
+          <RailBtn
+            icon={Hash}
+            label="Tab order"
+            active={activePanel === "taborder"}
+            onClick={() =>
+              setActivePanel((p) => (p === "taborder" ? null : "taborder"))
+            }
+          />
           <div className="my-1 h-px w-6 bg-border" />
           <RailBtn
             icon={livePreview ? EyeOff : Eye}
@@ -1495,7 +1768,7 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
             <div className="mb-2 text-xs uppercase tracking-wide text-gray-500">
               Widgets
             </div>
-            <div className="space-y-2">{paletteEls}</div>
+            {paletteEls}
             <div className="pt-4 text-[10px] leading-relaxed text-gray-500">
               Drag onto page. Double-click to insert at origin.
             </div>
@@ -1548,10 +1821,72 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
           <aside className="w-64 shrink-0 border-r bg-muted/20">
             <SchemaPanel
               sampleJSON={sampleJSON}
+              templateName={tpl.name}
               usedKeys={widgets.map((w) => w.dataKey).filter(Boolean)}
               selectedDataKey={selected?.dataKey}
               onBind={bindSelectedTo}
               onEditSample={() => setEditSampleOpen(true)}
+              onSyncSample={syncSampleFromWidgets}
+              onExportFull={() => downloadFullExport(tpl, widgets, currentConfig, sampleJSON)}
+            />
+          </aside>
+        )}
+        {activePanel === "layers" && (
+          <aside className="w-56 shrink-0 border-r bg-muted/20">
+            <LayersPanel
+              widgets={widgets as LayerWidget[]}
+              selectedIds={selectedIds}
+              onSelect={setSelectedIds}
+              onReorder={reorderLayer}
+              onToggleLock={(id) => {
+                setWidgets((prev) =>
+                  prev.map((w) => (w.id === id ? { ...w, locked: !w.locked } : w))
+                );
+              }}
+              onToggleHide={(id) => {
+                setWidgets((prev) =>
+                  prev.map((w) => (w.id === id ? { ...w, hidden: !w.hidden } : w))
+                );
+              }}
+              onRename={renameWidget}
+              onSelectGroup={selectGroup}
+            />
+          </aside>
+        )}
+        {activePanel === "inspect" && (
+          <aside className="w-64 shrink-0 border-r bg-muted/20">
+            <ValidationPanel
+              issues={validationIssues}
+              onSelectWidget={(id) => {
+                setSelectedIds([id]);
+                // Scroll widget into view
+                const w = widgets.find((x) => x.id === id);
+                if (w) {
+                  const el = pageRefs.current[w.page || 1];
+                  el?.scrollIntoView({ behavior: "smooth", block: "center" });
+                }
+              }}
+            />
+          </aside>
+        )}
+        {activePanel === "taborder" && (
+          <aside className="w-56 shrink-0 border-r bg-muted/20">
+            <TabOrderPanel
+              widgets={widgets as TabWidget[]}
+              selectedIds={selectedIds}
+              onSelect={(id) => setSelectedIds([id])}
+              onReorder={(orderedIds) => {
+                setWidgets((prev) =>
+                  prev.map((w) => {
+                    const idx = orderedIds.indexOf(w.id);
+                    if (idx === -1) return w;
+                    return {
+                      ...w,
+                      props: { ...w.props, acroTabOrder: idx + 1 },
+                    };
+                  })
+                );
+              }}
             />
           </aside>
         )}
@@ -1745,7 +2080,15 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
                                     : [...cur, w.id]
                                 );
                               } else {
-                                setSelectedIds([w.id]);
+                                // If the widget belongs to a group, select all members
+                                const gid = w.props?._group as string | undefined;
+                                if (gid) {
+                                  setSelectedIds(
+                                    widgets.filter((x) => x.props?._group === gid).map((x) => x.id)
+                                  );
+                                } else {
+                                  setSelectedIds([w.id]);
+                                }
                               }
                             }}
                             onContextMenu={(e) => {
@@ -1786,13 +2129,20 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
                               className={
                                 "pointer-events-none px-1 truncate block " +
                                 (showPreview
-                                  ? "text-[11px] text-foreground"
+                                  ? "text-[11px] text-foreground" +
+                                    (w.props?.bold ? " font-bold" : "") +
+                                    (w.props?.italic ? " italic" : "") +
+                                    (w.props?.underline ? " underline" : "")
                                   : "font-mono text-[10px] text-blue-900")
                               }
                             >
                               {w.locked ? "🔒 " : ""}
                               {w.hidden ? "👁 " : ""}
                               {keyMissing ? "⚠ " : ""}
+                              {w.type === "radio" ? "◉ " : ""}
+                              {w.type === "dropdown" ? "▾ " : ""}
+                              {w.type === "signature-field" ? "✎ " : ""}
+                              {w.type === "button" ? "▶ " : ""}
                               {showPreview ? displayValue : w.dataKey}
                             </span>
                             {isPrimary && !w.locked && (
@@ -1873,35 +2223,205 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
               </div>
 
               {selected.type !== "checkbox" &&
+                selected.type !== "radio" &&
                 selected.type !== "qr" &&
-                selected.type !== "barcode" && (
-                  <>
-                    <Field label="Font size">
-                      <NumInput
-                        value={selected.props?.fontSize ?? 12}
-                        onChange={(v) => updateSelectedProp("fontSize", v)}
-                      />
-                    </Field>
-                    <Field label="Color">
-                      <input
-                        type="color"
-                        className="w-full h-8 border rounded"
-                        value={selected.props?.color || "#111827"}
-                        onChange={(e) => updateSelectedProp("color", e.target.value)}
-                      />
-                    </Field>
-                    <Field label="Alignment">
+                selected.type !== "barcode" &&
+                selected.type !== "image" &&
+                selected.type !== "signature" &&
+                selected.type !== "signature-field" &&
+                selected.type !== "button" &&
+                selected.type !== "rectangle" &&
+                selected.type !== "line" && (
+                  <div className="space-y-2 rounded-md border p-2">
+                    <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                      Typography
+                    </div>
+
+                    {/* Preset chips */}
+                    <div className="flex flex-wrap gap-1">
+                      {TYPOGRAPHY_PRESETS.map((p) => (
+                        <button
+                          key={p.id}
+                          type="button"
+                          onClick={() => {
+                            const patch: Record<string, any> = { ...p.props };
+                            // strip undefined keys so they don't overwrite existing values
+                            Object.keys(patch).forEach(
+                              (k) => patch[k] === undefined && delete patch[k]
+                            );
+                            updateSelected({
+                              props: { ...selected.props, ...patch },
+                            });
+                          }}
+                          className="rounded border px-2 py-0.5 text-[10px] font-medium hover:bg-muted/60"
+                        >
+                          {p.label}
+                        </button>
+                      ))}
+                    </div>
+
+                    {/* Font family */}
+                    <Field label="Font family">
                       <select
-                        className="w-full border rounded px-2 py-1 text-sm"
-                        value={selected.props?.align || "L"}
-                        onChange={(e) => updateSelectedProp("align", e.target.value)}
+                        className="w-full rounded border px-2 py-1 text-xs"
+                        value={(selected.props?.fontFamily as string) || "Helvetica"}
+                        onChange={(e) => updateSelectedProp("fontFamily", e.target.value)}
                       >
-                        <option value="L">Left</option>
-                        <option value="C">Center</option>
-                        <option value="R">Right</option>
+                        {FONT_FAMILIES.map((f) => (
+                          <option key={f.value} value={f.value}>
+                            {f.label}
+                          </option>
+                        ))}
                       </select>
                     </Field>
-                  </>
+
+                    {/* Size + style toggles on one row */}
+                    <div className="flex items-end gap-2">
+                      <div className="flex-1">
+                        <Field label="Size (pt)">
+                          <NumInput
+                            value={selected.props?.fontSize ?? 12}
+                            onChange={(v) => updateSelectedProp("fontSize", v)}
+                          />
+                        </Field>
+                      </div>
+                      {/* B / I / U toggles */}
+                      <div className="flex gap-1 pb-0.5">
+                        {(
+                          [
+                            { key: "bold",      Icon: Bold,      title: "Bold" },
+                            { key: "italic",    Icon: Italic,    title: "Italic" },
+                            { key: "underline", Icon: Underline, title: "Underline" },
+                          ] as const
+                        ).map(({ key, Icon, title }) => (
+                          <button
+                            key={key}
+                            type="button"
+                            title={title}
+                            onClick={() =>
+                              updateSelectedProp(key, !selected.props?.[key])
+                            }
+                            className={`grid h-7 w-7 place-items-center rounded border text-xs transition-colors ${
+                              selected.props?.[key]
+                                ? "bg-primary text-primary-foreground border-primary"
+                                : "hover:bg-muted/60"
+                            }`}
+                          >
+                            <Icon className="h-3 w-3" />
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Color + Alignment */}
+                    <div className="grid grid-cols-2 gap-2">
+                      <Field label="Color">
+                        <input
+                          type="color"
+                          className="h-8 w-full rounded border"
+                          value={(selected.props?.color as string) || "#111827"}
+                          onChange={(e) => updateSelectedProp("color", e.target.value)}
+                        />
+                      </Field>
+                      <Field label="Align">
+                        <select
+                          className="w-full rounded border px-2 py-1 text-xs"
+                          value={(selected.props?.align as string) || "L"}
+                          onChange={(e) => updateSelectedProp("align", e.target.value)}
+                        >
+                          <option value="L">Left</option>
+                          <option value="C">Center</option>
+                          <option value="R">Right</option>
+                        </select>
+                      </Field>
+                    </div>
+
+                    {/* Line height — only meaningful for multiline/repeat */}
+                    {(selected.type === "multiline" || selected.type === "repeat") && (
+                      <Field label="Line height (×)">
+                        <NumInput
+                          value={
+                            selected.props?.lineHeight != null
+                              ? Number(selected.props.lineHeight)
+                              : 1.15
+                          }
+                          onChange={(v) => updateSelectedProp("lineHeight", v)}
+                          step={0.05}
+                        />
+                      </Field>
+                    )}
+                  </div>
+                )}
+
+              {/* ---- Box style: background, border, padding, opacity ---- */}
+              {selected.type !== "checkbox" &&
+                selected.type !== "radio" &&
+                selected.type !== "qr" &&
+                selected.type !== "barcode" &&
+                selected.type !== "image" &&
+                selected.type !== "signature" &&
+                selected.type !== "signature-field" &&
+                selected.type !== "rectangle" &&
+                selected.type !== "line" && (
+                  <div className="space-y-2 rounded-md border p-2">
+                    <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                      Box style
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <Field label="Background">
+                        <input
+                          type="color"
+                          className="h-8 w-full rounded border"
+                          value={(selected.props?.backgroundColor as string) || "#ffffff"}
+                          onChange={(e) =>
+                            updateSelectedProp("backgroundColor", e.target.value)
+                          }
+                        />
+                      </Field>
+                      <Field label="Border color">
+                        <input
+                          type="color"
+                          className="h-8 w-full rounded border"
+                          value={(selected.props?.borderColor as string) || "#111827"}
+                          onChange={(e) =>
+                            updateSelectedProp("borderColor", e.target.value)
+                          }
+                        />
+                      </Field>
+                      <Field label="Border width (pt)">
+                        <NumInput
+                          value={Number(selected.props?.borderWidth ?? 0)}
+                          onChange={(v) => updateSelectedProp("borderWidth", v)}
+                          step={0.25}
+                        />
+                      </Field>
+                      <Field label="Padding (pt)">
+                        <NumInput
+                          value={Number(selected.props?.padding ?? 0)}
+                          onChange={(v) => updateSelectedProp("padding", v)}
+                          step={1}
+                        />
+                      </Field>
+                    </div>
+                    <Field label="Opacity (0 – 1)">
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="range"
+                          min={0}
+                          max={1}
+                          step={0.05}
+                          className="flex-1"
+                          value={Number(selected.props?.opacity ?? 1)}
+                          onChange={(e) =>
+                            updateSelectedProp("opacity", parseFloat(e.target.value))
+                          }
+                        />
+                        <span className="w-8 text-right text-xs tabular-nums">
+                          {Number(selected.props?.opacity ?? 1).toFixed(2)}
+                        </span>
+                      </div>
+                    </Field>
+                  </div>
                 )}
 
               {selected.type === "barcode" && (
@@ -1924,6 +2444,217 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
                   The <code>dataKey</code> value in the payload encodes the{" "}
                   {selected.type === "qr" ? "QR" : "barcode"} image at render time.
                 </p>
+              )}
+
+              {(selected.type === "image" || selected.type === "signature") && (
+                <>
+                  <Field label="Image source (data URI, URL, or base64)">
+                    <input
+                      className="w-full border rounded px-2 py-1 font-mono text-xs"
+                      value={(selected.props?.src as string) || ""}
+                      onChange={(e) => updateSelectedProp("src", e.target.value)}
+                      placeholder={
+                        selected.type === "signature"
+                          ? "data:image/png;base64,… (leave blank to bind via dataKey)"
+                          : "https://… or data:image/…;base64,…"
+                      }
+                    />
+                  </Field>
+                  <Field label="Fit">
+                    <select
+                      className="w-full border rounded px-2 py-1 text-sm"
+                      value={(selected.props?.fit as string) || "contain"}
+                      onChange={(e) => updateSelectedProp("fit", e.target.value)}
+                    >
+                      <option value="contain">Contain (preserve ratio)</option>
+                      <option value="stretch">Stretch (fill box)</option>
+                    </select>
+                  </Field>
+                  <p className="rounded bg-muted/30 p-2 text-[10px] text-muted-foreground">
+                    If <code>src</code> is empty, the resolved{" "}
+                    <code>dataKey</code> is used instead — handy for signatures
+                    drawn at fill time.
+                  </p>
+                  <Field label="Opacity (0 – 1)">
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="range" min={0} max={1} step={0.05} className="flex-1"
+                        value={Number(selected.props?.opacity ?? 1)}
+                        onChange={(e) => updateSelectedProp("opacity", parseFloat(e.target.value))}
+                      />
+                      <span className="w-8 text-right text-xs tabular-nums">
+                        {Number(selected.props?.opacity ?? 1).toFixed(2)}
+                      </span>
+                    </div>
+                  </Field>
+                </>
+              )}
+
+              {selected.type === "rectangle" && (
+                <div className="space-y-2 rounded-md border p-2">
+                  <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                    Shape style
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <Field label="Fill">
+                      <input
+                        type="color"
+                        className="h-8 w-full rounded border"
+                        value={(selected.props?.backgroundColor as string) || "#f3f4f6"}
+                        onChange={(e) => updateSelectedProp("backgroundColor", e.target.value)}
+                      />
+                    </Field>
+                    <Field label="Border color">
+                      <input
+                        type="color"
+                        className="h-8 w-full rounded border"
+                        value={(selected.props?.borderColor as string) || "#111827"}
+                        onChange={(e) => updateSelectedProp("borderColor", e.target.value)}
+                      />
+                    </Field>
+                    <Field label="Border width">
+                      <NumInput
+                        value={Number(selected.props?.borderWidth ?? 0.5)}
+                        onChange={(v) => updateSelectedProp("borderWidth", v)}
+                        step={0.25}
+                      />
+                    </Field>
+                    <Field label="Corner radius">
+                      <NumInput
+                        value={Number(selected.props?.borderRadius ?? 0)}
+                        onChange={(v) => updateSelectedProp("borderRadius", v)}
+                        step={1}
+                      />
+                    </Field>
+                  </div>
+                  <Field label="Opacity (0 – 1)">
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="range" min={0} max={1} step={0.05} className="flex-1"
+                        value={Number(selected.props?.opacity ?? 1)}
+                        onChange={(e) => updateSelectedProp("opacity", parseFloat(e.target.value))}
+                      />
+                      <span className="w-8 text-right text-xs tabular-nums">
+                        {Number(selected.props?.opacity ?? 1).toFixed(2)}
+                      </span>
+                    </div>
+                  </Field>
+                </div>
+              )}
+
+              {selected.type === "line" && (
+                <div className="space-y-2 rounded-md border p-2">
+                  <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                    Line style
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <Field label="Orientation">
+                      <select
+                        className="w-full rounded border px-2 py-1 text-xs"
+                        value={(selected.props?.orientation as string) || "horizontal"}
+                        onChange={(e) => updateSelectedProp("orientation", e.target.value)}
+                      >
+                        <option value="horizontal">Horizontal</option>
+                        <option value="vertical">Vertical</option>
+                      </select>
+                    </Field>
+                    <Field label="Color">
+                      <input
+                        type="color"
+                        className="h-8 w-full rounded border"
+                        value={(selected.props?.color as string) || "#111827"}
+                        onChange={(e) => updateSelectedProp("color", e.target.value)}
+                      />
+                    </Field>
+                  </div>
+                  <Field label="Thickness (pt)">
+                    <NumInput
+                      value={Number(selected.props?.borderWidth ?? 0.5)}
+                      onChange={(v) => updateSelectedProp("borderWidth", v)}
+                      step={0.25}
+                    />
+                  </Field>
+                  <Field label="Opacity (0 – 1)">
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="range" min={0} max={1} step={0.05} className="flex-1"
+                        value={Number(selected.props?.opacity ?? 1)}
+                        onChange={(e) => updateSelectedProp("opacity", parseFloat(e.target.value))}
+                      />
+                      <span className="w-8 text-right text-xs tabular-nums">
+                        {Number(selected.props?.opacity ?? 1).toFixed(2)}
+                      </span>
+                    </div>
+                  </Field>
+                </div>
+              )}
+
+              {selected.type === "pageNumber" && (
+                <Field label="Format">
+                  <input
+                    className="w-full border rounded px-2 py-1 font-mono text-xs"
+                    value={(selected.props?.format as string) || "{page} / {pages}"}
+                    onChange={(e) => updateSelectedProp("format", e.target.value)}
+                    placeholder="Page {page} of {pages}"
+                  />
+                </Field>
+              )}
+
+              {selected.type === "watermark" && (
+                <>
+                  <Field label="Text">
+                    <input
+                      className="w-full border rounded px-2 py-1 text-sm"
+                      value={(selected.props?.text as string) || "DRAFT"}
+                      onChange={(e) => updateSelectedProp("text", e.target.value)}
+                    />
+                  </Field>
+                  <div className="grid grid-cols-2 gap-2">
+                    <Field label="Angle (°)">
+                      <NumInput
+                        value={Number(selected.props?.angle ?? -30)}
+                        onChange={(v) => updateSelectedProp("angle", v)}
+                      />
+                    </Field>
+                    <Field label="Opacity (0 – 1)">
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="range" min={0} max={1} step={0.05} className="flex-1"
+                          value={Number(selected.props?.opacity ?? 0.15)}
+                          onChange={(e) =>
+                            updateSelectedProp("opacity", parseFloat(e.target.value))
+                          }
+                        />
+                        <span className="w-8 text-right text-xs tabular-nums">
+                          {Number(selected.props?.opacity ?? 0.15).toFixed(2)}
+                        </span>
+                      </div>
+                    </Field>
+                  </div>
+                </>
+              )}
+
+              {selected.type === "repeat" && (
+                <>
+                  <Field label="Row template">
+                    <input
+                      className="w-full border rounded px-2 py-1 font-mono text-xs"
+                      value={(selected.props?.rowTemplate as string) || "{.}"}
+                      onChange={(e) => updateSelectedProp("rowTemplate", e.target.value)}
+                      placeholder="{name} — {amount}"
+                    />
+                  </Field>
+                  <Field label="Row height (pt)">
+                    <NumInput
+                      value={Number(selected.props?.rowHeight ?? 16)}
+                      onChange={(v) => updateSelectedProp("rowHeight", v)}
+                    />
+                  </Field>
+                  <p className="rounded bg-muted/30 p-2 text-[10px] text-muted-foreground">
+                    Bind <code>dataKey</code> to an array. Each <code>{"{key}"}</code>{" "}
+                    in the template is replaced per row.
+                  </p>
+                </>
               )}
 
               {/* ---- Data binding / transforms / validation / showIf ---- */}
@@ -2028,6 +2759,22 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
                   </Field>
                 </div>
               </div>
+
+              {/* AcroForm interactive field panel — shown for form-capable widget types */}
+              {isAcroFieldType(selected.type) && (
+                <AcroFormPanel
+                  type={selected.type}
+                  props={selected.props ?? {}}
+                  onChange={(key, value) => updateSelectedProp(key, value)}
+                  allWidgets={widgets
+                    .filter(
+                      (w) =>
+                        w.id !== selected.id &&
+                        ["text", "number", "currency"].includes(w.type)
+                    )
+                    .map((w) => ({ id: w.id, dataKey: w.dataKey, type: w.type }))}
+                />
+              )}
 
               <div className="flex gap-2 pt-1">
                 <button
@@ -2223,24 +2970,164 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
           { keys: `${M}[`, label: "Send backward", group: "Arrange" },
           { keys: `${M}⇧]`, label: "Bring to front", group: "Arrange" },
           { keys: `${M}⇧[`, label: "Send to back", group: "Arrange" },
+          { keys: `${M}G`, label: "Group selection", group: "Arrange" },
+          { keys: `${M}⇧G`, label: "Ungroup selection", group: "Arrange" },
         ]}
       />
 
       {/* Edit sample JSON */}
       <Dialog open={editSampleOpen} onOpenChange={setEditSampleOpen}>
-        <DialogContent className="sm:max-w-xl">
+        <DialogContent className="sm:max-w-2xl">
           <DialogHeader>
             <DialogTitle>Sample data</DialogTitle>
             <DialogDescription>
-              Used by the schema panel and live preview. Keys shown here are
-              the shape your Generate call should send.
+              Used by the schema panel and live preview. The keys define the
+              shape your Generate call must send.
             </DialogDescription>
           </DialogHeader>
+
           <textarea
-            className="min-h-[240px] w-full rounded-md border bg-background p-3 font-mono text-xs"
+            className="min-h-[260px] w-full rounded-md border bg-background p-3 font-mono text-xs"
             value={sampleJSON}
             onChange={(e) => setSampleJSON(e.target.value)}
           />
+
+          {/* Export toolbar */}
+          <div className="rounded-md border bg-muted/30 p-3">
+            <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+              Export
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {/* ---- Full template config (widgets + layout + sample) ---- */}
+              <Button
+                size="sm"
+                className="gap-1.5 text-xs"
+                onClick={() =>
+                  downloadFullExport(
+                    tpl,
+                    widgets,
+                    currentConfig,
+                    sampleJSON
+                  )
+                }
+              >
+                <PackageOpen className="h-3.5 w-3.5" />
+                Full config (widgets + layout + data)
+              </Button>
+
+              {/* ---- Sample-data-only exports ---- */}
+              <div className="w-full border-t pt-2 text-[10px] font-medium text-muted-foreground">
+                Sample data only
+              </div>
+
+              {/* Download JSON */}
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1.5 text-xs"
+                onClick={() => {
+                  try {
+                    const parsed = JSON.parse(sampleJSON || "{}");
+                    downloadJSON(
+                      JSON.stringify(parsed, null, 2),
+                      `${tpl.name || "schema"}.json`
+                    );
+                  } catch {
+                    toast.show("error", "Sample data is not valid JSON");
+                  }
+                }}
+              >
+                <FileJson className="h-3.5 w-3.5" />
+                Download JSON
+              </Button>
+
+              {/* Download TypeScript interface */}
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1.5 text-xs"
+                onClick={() => {
+                  try {
+                    const parsed = JSON.parse(sampleJSON || "{}");
+                    downloadTypeScript(parsed, `${tpl.name || "schema"}.ts`);
+                  } catch {
+                    toast.show("error", "Sample data is not valid JSON");
+                  }
+                }}
+              >
+                <Code2 className="h-3.5 w-3.5" />
+                Download .ts
+              </Button>
+
+              {/* Download skeleton payload */}
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1.5 text-xs"
+                onClick={() => {
+                  try {
+                    const parsed = JSON.parse(sampleJSON || "{}");
+                    downloadSkeleton(parsed, `${tpl.name || "payload"}-skeleton.json`);
+                  } catch {
+                    toast.show("error", "Sample data is not valid JSON");
+                  }
+                }}
+              >
+                <Download className="h-3.5 w-3.5" />
+                Skeleton payload
+              </Button>
+
+              {/* Copy JSON to clipboard */}
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1.5 text-xs"
+                onClick={async () => {
+                  const ok = await copyToClipboard(sampleJSON);
+                  if (ok) {
+                    setCopiedSchema(true);
+                    setTimeout(() => setCopiedSchema(false), 1800);
+                  }
+                }}
+              >
+                {copiedSchema ? (
+                  <Check className="h-3.5 w-3.5 text-emerald-500" />
+                ) : (
+                  <Clipboard className="h-3.5 w-3.5" />
+                )}
+                {copiedSchema ? "Copied!" : "Copy JSON"}
+              </Button>
+
+              {/* Copy TypeScript interface to clipboard */}
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1.5 text-xs"
+                onClick={async () => {
+                  try {
+                    const parsed = JSON.parse(sampleJSON || "{}");
+                    const ts = toTypeScript(parsed);
+                    await copyToClipboard(ts);
+                    toast.show("success", "TypeScript interface copied to clipboard");
+                  } catch {
+                    toast.show("error", "Sample data is not valid JSON");
+                  }
+                }}
+              >
+                <Clipboard className="h-3.5 w-3.5" />
+                Copy as TypeScript
+              </Button>
+            </div>
+            <p className="mt-2 text-[10px] text-muted-foreground">
+              <strong>Full config</strong> — every widget (type, position,
+              size, props), page layout settings, and sample data in one file.
+              Use it as a backup or to reproduce this template elsewhere.{" "}
+              <strong>Skeleton payload</strong> — same shape as the sample but
+              all values zeroed (<code>""</code>, <code>0</code>,{" "}
+              <code>false</code>) — a starter for API integration tests.
+            </p>
+          </div>
+
           <DialogFooter>
             <Button variant="outline" onClick={() => setEditSampleOpen(false)}>
               Close
@@ -2322,6 +3209,8 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
             sendBackward,
             bringToFront,
             sendToBack,
+            groupSelection,
+            ungroupSelection,
             align: alignSelection,
           })}
         />
@@ -2339,12 +3228,20 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
-function NumInput({ value, onChange }: { value: number; onChange: (v: number) => void }) {
+function NumInput({
+  value,
+  onChange,
+  step,
+}: {
+  value: number;
+  onChange: (v: number) => void;
+  step?: number;
+}) {
   return (
     <input
       type="number"
-      step="0.1"
-      className="w-full border rounded px-2 py-1 text-sm"
+      step={step ?? 0.1}
+      className="w-full rounded border px-2 py-1 text-sm"
       value={Number(value.toFixed(2))}
       onChange={(e) => {
         const v = parseFloat(e.target.value);
@@ -2416,17 +3313,59 @@ function AlignBtn({
 }
 
 function defaultProps(type: string): Record<string, any> {
+  const textBase = {
+    fontSize: 12,
+    fontFamily: "Helvetica",
+    bold: false,
+    italic: false,
+    underline: false,
+    color: "#111827",
+    align: "L",
+    lineHeight: 1.15,
+    opacity: 1,
+  };
   switch (type) {
     case "checkbox":
       return { color: "#111827" };
+    case "radio":
+      return { color: "#111827", acroGroupName: "", acroExportValue: "" };
+    case "dropdown":
+      return { ...textBase, acroOptions: [] };
+    case "signature-field":
+      return { color: "#111827", acroLockAfterSign: false };
+    case "button":
+      return {
+        acroButtonLabel: "Button",
+        acroButtonAction: "none",
+        backgroundColor: "#e5e7eb",
+        borderColor: "#9ca3af",
+        borderWidth: 0.5,
+        color: "#111827",
+        fontSize: 11,
+        fontFamily: "Helvetica",
+        align: "C",
+      };
     case "multiline":
-      return { fontSize: 11, fontFamily: "Helvetica", color: "#111827", align: "L" };
+      return { ...textBase, fontSize: 11 };
     case "qr":
       return {};
     case "barcode":
       return { barcodeKind: "code128" };
+    case "image":
+    case "signature":
+      return { fit: "contain", opacity: 1 };
+    case "rectangle":
+      return { backgroundColor: "#f3f4f6", borderColor: "#111827", borderWidth: 0.5, borderRadius: 0, opacity: 1 };
+    case "line":
+      return { color: "#111827", borderWidth: 0.5, orientation: "horizontal", opacity: 1 };
+    case "pageNumber":
+      return { ...textBase, format: "{page} / {pages}", align: "C", fontSize: 10, color: "#6b7280" };
+    case "watermark":
+      return { text: "DRAFT", angle: -30, opacity: 0.15, color: "#111827", fontSize: 18 };
+    case "repeat":
+      return { ...textBase, rowTemplate: "{name} — {amount}", rowHeight: 16, fontSize: 11 };
     default:
-      return { fontSize: 12, fontFamily: "Helvetica", color: "#111827", align: "L" };
+      return { ...textBase };
   }
 }
 
@@ -2519,6 +3458,8 @@ function buildContextMenuItems(p: {
   sendBackward: () => void;
   bringToFront: () => void;
   sendToBack: () => void;
+  groupSelection: () => void;
+  ungroupSelection: () => void;
   align: (mode: "left" | "center" | "right" | "top" | "middle" | "bottom") => void;
 }): MenuItem[] {
   const { M, selectedCount } = p;
@@ -2540,6 +3481,9 @@ function buildContextMenuItems(p: {
       hint: `${M}⇧H`,
       run: p.toggleHide,
     },
+    { kind: "separator" },
+    { kind: "item", label: "Group",   hint: `${M}G`,  disabled: !multi, run: p.groupSelection },
+    { kind: "item", label: "Ungroup", hint: `${M}⇧G`,                   run: p.ungroupSelection },
     { kind: "separator" },
     { kind: "item", label: "Bring forward", hint: `${M}]`, run: p.bringForward },
     { kind: "item", label: "Send backward", hint: `${M}[`, run: p.sendBackward },

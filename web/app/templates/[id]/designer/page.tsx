@@ -16,6 +16,7 @@ import { useToast } from "@/components/toast";
 import StaticDesigner from "@/components/static-designer";
 import HtmlDesigner from "@/components/html-designer";
 import MarkdownDesigner from "@/components/markdown-designer";
+import { AcroFormDesigner } from "@/components/acroform/acroform-designer";
 import { BatchDialog } from "@/components/batch-dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -308,6 +309,22 @@ export default function DesignerPage() {
           version: tpl.version,
           config: tpl.config || {},
         }}
+      />
+    );
+  }
+
+  if (tpl.mode === "acroform" && previewUrl) {
+    return (
+      <AcroFormDesigner
+        tpl={{
+          id: tpl.id,
+          name: tpl.name,
+          mode: tpl.mode,
+          version: tpl.version,
+          fields: (tpl.fields as any) || [],
+          config: (tpl.config as any) || {},
+        }}
+        previewUrl={previewUrl}
       />
     );
   }
