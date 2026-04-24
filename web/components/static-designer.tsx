@@ -4,7 +4,9 @@ import Link from "next/link";
 import { Document, Page, pdfjs } from "react-pdf";
 import "react-pdf/dist/esm/Page/AnnotationLayer.css";
 import "react-pdf/dist/esm/Page/TextLayer.css";
-import { api, pollJob } from "@/lib/api";
+import { api } from "@/lib/api";
+import { runGenerate } from "@/lib/generate";
+import { GeneratedPreviewDialog } from "@/components/generated-preview-dialog";
 import { useToast } from "@/components/toast";
 import { browserToPdf, pdfToBrowser, PageInfo } from "@/lib/pdf-coords";
 import { PageLayoutDialog } from "@/components/page-layout-dialog";
@@ -111,6 +113,7 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { InlineRenameTitle } from "@/components/designer/inline-rename-title";
 import { Label } from "@/components/ui/label";
 import { TYPOGRAPHY_PRESETS, FONT_FAMILIES } from "@/lib/font-presets";
 import {
@@ -219,6 +222,16 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
   const [layoutOpen, setLayoutOpen] = useState(false);
   const [savingLayout, setSavingLayout] = useState(false);
   const [currentConfig, setCurrentConfig] = useState(tpl.config || {});
+  // Local name overlay for inline rename; parent prop is authoritative at
+  // mount, header updates optimistically from server-confirmed rename.
+  const [tplName, setTplName] = useState<string>(tpl.name);
+  // Post-generate preview dialog state. Replaces the old
+  // `window.open(downloadUrl)` auto-download.
+  const [genResult, setGenResult] = useState<{
+    downloadUrl: string;
+    outputFileId?: string;
+    fileName: string;
+  } | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [showGrid, setShowGrid] = useState(false);
@@ -1183,26 +1196,21 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
     setGenOpen(true);
   }
 
-  async function runGenerate() {
+  async function runGenerateFlow() {
     setGenBusy(true);
     setGenProgress(null);
     try {
       const data = JSON.parse(genJSON);
-      const res = await api<{ downloadUrl?: string; jobId?: string; outputFileId?: string }>(
-        `/v1/templates/${tpl.id}/generate`,
-        { method: "POST", body: JSON.stringify({ data, async: genAsync }) }
-      );
-      if (res.jobId) {
-        setGenProgress("queued…");
-        const done = await pollJob(res.jobId, (j) => setGenProgress(`${j.status}…`));
-        if (done.status === "failed") throw new Error(done.error || "job failed");
-        if (done.outputFileId) {
-          const dl = await api<{ downloadUrl: string }>(`/v1/files/${done.outputFileId}/download`);
-          window.open(dl.downloadUrl, "_blank");
-        }
-      } else if (res.downloadUrl) {
-        window.open(res.downloadUrl, "_blank");
-      }
+      const result = await runGenerate(tpl.id, {
+        data,
+        async: genAsync,
+        onProgress: setGenProgress,
+      });
+      setGenResult({
+        downloadUrl: result.downloadUrl,
+        outputFileId: result.outputFileId,
+        fileName: `${tplName}.pdf`,
+      });
       setGenOpen(false);
     } catch (e: any) {
       toast.show("error", e.message);
@@ -1516,7 +1524,12 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
       <header className="bg-white border-b px-6 py-3 flex items-center justify-between">
         <div className="flex items-center gap-3">
           <Link href="/drive" className="text-blue-600 hover:underline text-sm">← Drive</Link>
-          <h1 className="font-semibold">{tpl.name}</h1>
+          <InlineRenameTitle
+            templateId={tpl.id}
+            name={tplName}
+            onRenamed={setTplName}
+            className="font-semibold"
+          />
           <span className="text-xs uppercase tracking-wide bg-gray-100 px-2 py-0.5 rounded">static</span>
           <span className="text-xs text-gray-500">v{tpl.version}</span>
           <span
@@ -2920,7 +2933,7 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
                 Cancel
               </button>
               <button
-                onClick={runGenerate}
+                onClick={runGenerateFlow}
                 disabled={genBusy}
                 className="px-4 py-1.5 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
               >
@@ -3215,6 +3228,13 @@ export default function StaticDesigner({ tpl, previewUrl }: Props) {
           })}
         />
       )}
+      <GeneratedPreviewDialog
+        open={!!genResult}
+        onOpenChange={(o) => !o && setGenResult(null)}
+        downloadUrl={genResult?.downloadUrl ?? null}
+        outputFileId={genResult?.outputFileId}
+        fileName={genResult?.fileName ?? `${tplName}.pdf`}
+      />
     </div>
   );
 }

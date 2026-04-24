@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { Folder as FolderIcon, MoreHorizontal, PencilLine, Trash2 } from "lucide-react";
+import { Folder as FolderIcon, MoreHorizontal, PencilLine, Trash2, Users } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -27,6 +27,7 @@ type Props = {
   onDrop: (fileId: string) => void;
   onRename: () => void;
   onDelete: () => void;
+  onShare?: () => void;
 };
 
 export function FolderGridCard({
@@ -37,6 +38,7 @@ export function FolderGridCard({
   onDrop,
   onRename,
   onDelete,
+  onShare,
 }: Props) {
   return (
     <div
@@ -89,6 +91,12 @@ export function FolderGridCard({
             <PencilLine className="h-4 w-4" />
             Rename
           </DropdownMenuItem>
+          {onShare && (
+            <DropdownMenuItem onClick={onShare}>
+              <Users className="h-4 w-4" />
+              Share with people
+            </DropdownMenuItem>
+          )}
           <DropdownMenuSeparator />
           <DropdownMenuItem onClick={onDelete} destructive>
             <Trash2 className="h-4 w-4" />

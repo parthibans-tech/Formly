@@ -20,7 +20,9 @@ import {
   TriangleAlert,
   Wrench,
 } from "lucide-react";
-import { api, pollJob } from "@/lib/api";
+import { api } from "@/lib/api";
+import { runGenerate } from "@/lib/generate";
+import { GeneratedPreviewDialog } from "@/components/generated-preview-dialog";
 import { useToast } from "@/components/toast";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -53,6 +55,7 @@ import {
   type Command,
 } from "@/components/designer/command-palette";
 import { ShortcutHelp, modSymbol } from "@/components/designer/shortcut-help";
+import { InlineRenameTitle } from "@/components/designer/inline-rename-title";
 
 type Template = {
   id: string;
@@ -93,6 +96,12 @@ export default function MarkdownDesigner({ tpl: initialTpl }: Props) {
   const [genAsync, setGenAsync] = useState(false);
   const [genBusy, setGenBusy] = useState(false);
   const [genProgress, setGenProgress] = useState<string | null>(null);
+  // Post-generate preview state — see GeneratedPreviewDialog for UX.
+  const [genResult, setGenResult] = useState<{
+    downloadUrl: string;
+    outputFileId?: string;
+    fileName: string;
+  } | null>(null);
   const [genData, setGenData] = useState("{}");
   const previewTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -341,35 +350,21 @@ export default function MarkdownDesigner({ tpl: initialTpl }: Props) {
     setGenOpen(true);
   }
 
-  async function runGenerate() {
+  async function runGenerateFlow() {
     setGenBusy(true);
     setGenProgress(null);
     try {
       const data = JSON.parse(genData);
-      const res = await api<{
-        downloadUrl?: string;
-        jobId?: string;
-        outputFileId?: string;
-      }>(`/v1/templates/${tpl.id}/generate`, {
-        method: "POST",
-        body: JSON.stringify({ data, async: genAsync }),
+      const result = await runGenerate(tpl.id, {
+        data,
+        async: genAsync,
+        onProgress: setGenProgress,
       });
-      if (res.jobId) {
-        setGenProgress("queued…");
-        const done = await pollJob(res.jobId, (j) =>
-          setGenProgress(`${j.status}…`)
-        );
-        if (done.status === "failed")
-          throw new Error(done.error || "job failed");
-        if (done.outputFileId) {
-          const dl = await api<{ downloadUrl: string }>(
-            `/v1/files/${done.outputFileId}/download`
-          );
-          window.open(dl.downloadUrl, "_blank");
-        }
-      } else if (res.downloadUrl) {
-        window.open(res.downloadUrl, "_blank");
-      }
+      setGenResult({
+        downloadUrl: result.downloadUrl,
+        outputFileId: result.outputFileId,
+        fileName: `${tpl.name}.pdf`,
+      });
       setGenOpen(false);
     } catch (e: any) {
       toast.show("error", e.message);
@@ -394,7 +389,12 @@ export default function MarkdownDesigner({ tpl: initialTpl }: Props) {
             </Button>
             <Separator orientation="vertical" className="h-6" />
             <div className="min-w-0">
-              <h1 className="truncate text-sm font-semibold">{tpl.name}</h1>
+              <InlineRenameTitle
+                templateId={tpl.id}
+                name={tpl.name}
+                onRenamed={(n) => setTpl((prev) => ({ ...prev, name: n }))}
+                className="text-sm font-semibold"
+              />
               <div className="flex items-center gap-2">
                 <Badge variant="outline" className="uppercase text-[10px]">
                   Markdown
@@ -669,7 +669,7 @@ export default function MarkdownDesigner({ tpl: initialTpl }: Props) {
             >
               Cancel
             </Button>
-            <Button onClick={runGenerate} loading={genBusy}>
+            <Button onClick={runGenerateFlow} loading={genBusy}>
               <PlayCircle className="h-4 w-4" />
               Generate &amp; download
             </Button>
@@ -757,6 +757,13 @@ export default function MarkdownDesigner({ tpl: initialTpl }: Props) {
           { keys: `${modSymbol()}B`, label: "Bold selection", group: "Markdown" },
           { keys: `${modSymbol()}I`, label: "Italic selection", group: "Markdown" },
         ]}
+      />
+      <GeneratedPreviewDialog
+        open={!!genResult}
+        onOpenChange={(o) => !o && setGenResult(null)}
+        downloadUrl={genResult?.downloadUrl ?? null}
+        outputFileId={genResult?.outputFileId}
+        fileName={genResult?.fileName ?? `${tpl.name}.pdf`}
       />
     </div>
   );

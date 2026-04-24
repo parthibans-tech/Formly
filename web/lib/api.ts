@@ -21,6 +21,35 @@ export function getUser() {
   return raw ? JSON.parse(raw) : null;
 }
 
+// ApiError preserves the server's structured error envelope so callers
+// can branch on `code` / inspect `fields` (used by the AcroForm 422
+// validation response) instead of trying to parse a concatenated
+// message string. Legacy `catch (e) { e.message }` callers still work
+// because ApiError extends Error.
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code: string;
+  // Present on 422 validation_failed responses — one entry per failed
+  // field with `field` (PDF field name), `dataKey`, and `message`.
+  readonly fields?: Array<{ field: string; dataKey: string; message: string }>;
+  readonly raw: any;
+
+  constructor(
+    status: number,
+    code: string,
+    message: string,
+    raw: any,
+    fields?: ApiError["fields"]
+  ) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+    this.raw = raw;
+    this.fields = fields;
+  }
+}
+
 export async function api<T = any>(path: string, init: RequestInit = {}): Promise<T> {
   const token = getToken();
   const isFormData = init.body instanceof FormData;
@@ -33,8 +62,15 @@ export async function api<T = any>(path: string, init: RequestInit = {}): Promis
     },
   });
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: { message: res.statusText } }));
-    throw new Error(err.error?.message || "request failed");
+    const body = await res.json().catch(() => ({ error: { message: res.statusText } }));
+    const err = body.error ?? {};
+    throw new ApiError(
+      res.status,
+      err.code ?? "request_failed",
+      err.message ?? "request failed",
+      body,
+      Array.isArray(err.fields) ? err.fields : undefined
+    );
   }
   if (res.status === 204) return undefined as unknown as T;
   return res.json();

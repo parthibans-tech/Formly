@@ -1,18 +1,34 @@
 "use client";
 
 // A single mapping row — name + type metadata, required toggle, data key,
-// default, transform editor, per-field flatten toggle, inspector trigger,
-// and live preview of the final transformed value.
+// default, transform pipeline editor, validation rules, fillWhen editor,
+// per-field flatten toggle, inspector trigger, live preview, and inline
+// validation errors.
 
-import { forwardRef, useMemo } from "react";
-import { Info, Lock } from "lucide-react";
+import { forwardRef, useMemo, useState } from "react";
+import {
+  AlertCircle,
+  ChevronDown,
+  ChevronRight,
+  Filter,
+  Info,
+  Lock,
+  MapPin,
+  ShieldCheck,
+} from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { applyTransform, normalizeTransform } from "@/lib/acroform-transforms";
+import {
+  applyTransformPipeline,
+  normalizePipeline,
+} from "@/lib/acroform-transforms";
+import type { FieldError } from "@/lib/acroform-validation";
 import type { AcroFormField, AcroMapping } from "./types";
 import { TransformEditor } from "./transform-editor";
+import { ValidationRulesEditor } from "./validation-rules-editor";
+import { ConditionalEditor } from "./conditional-editor";
 
 type Props = {
   field: AcroFormField;
@@ -21,11 +37,18 @@ type Props = {
   allFieldDataKeys: string[];
   sampleData: Record<string, any>;
   selectedCount?: number;
+  errors?: FieldError[];
   onSelect: () => void;
   onChange: (patch: Partial<AcroMapping>) => void;
   onOpenInspector: () => void;
   onToggleMultiSelect?: () => void;
   multiSelected?: boolean;
+  // Only provided for rect-less ("supplement-only") fields — the ones
+  // pdfcpu's FormFields API surfaced but the /Annots walker couldn't
+  // geometrically locate. Clicking hands the designer the field name
+  // so the next drawn rectangle binds to this field instead of
+  // creating a new one.
+  onPlace?: () => void;
 };
 
 export const MappingRow = forwardRef<HTMLDivElement, Props>(function MappingRow(
@@ -35,21 +58,30 @@ export const MappingRow = forwardRef<HTMLDivElement, Props>(function MappingRow(
     selected,
     allFieldDataKeys,
     sampleData,
+    errors = [],
     onSelect,
     onChange,
     onOpenInspector,
     onToggleMultiSelect,
     multiSelected,
+    onPlace,
   }: Props,
   ref
 ) {
+  const needsPlacement = !field.rect && !!onPlace;
+  const [advancedOpen, setAdvancedOpen] = useState(
+    !!mapping.validation || !!mapping.fillWhen
+  );
+
   const preview = useMemo(() => {
     if (!mapping.dataKey) return null;
     const raw = sampleData[mapping.dataKey] ?? mapping.default;
     if (raw === undefined) return null;
-    const out = applyTransform(raw, normalizeTransform(mapping.transform), sampleData);
+    const out = applyTransformPipeline(raw, mapping.transform, sampleData);
     return out;
   }, [mapping, sampleData]);
+
+  const hasErrors = errors.length > 0;
 
   return (
     <div
@@ -57,7 +89,8 @@ export const MappingRow = forwardRef<HTMLDivElement, Props>(function MappingRow(
       onClick={onSelect}
       className={cn(
         "cursor-pointer space-y-3 p-4 transition-colors",
-        selected ? "bg-primary/5" : "hover:bg-muted/30"
+        selected ? "bg-primary/5" : "hover:bg-muted/30",
+        hasErrors && "border-l-2 border-l-red-500"
       )}
     >
       <div className="flex items-start justify-between gap-2">
@@ -75,6 +108,18 @@ export const MappingRow = forwardRef<HTMLDivElement, Props>(function MappingRow(
           <div className="min-w-0">
             <div className="flex items-center gap-1.5">
               <span className="truncate font-mono text-sm">{field.name}</span>
+              {mapping.fillWhen && (
+                <Filter
+                  className="h-3 w-3 text-amber-600"
+                  aria-label="Conditional fill"
+                />
+              )}
+              {mapping.validation && (
+                <ShieldCheck
+                  className="h-3 w-3 text-emerald-600"
+                  aria-label="Has validation"
+                />
+              )}
               <Button
                 variant="ghost"
                 size="sm"
@@ -94,7 +139,23 @@ export const MappingRow = forwardRef<HTMLDivElement, Props>(function MappingRow(
               {field.maxLen ? ` • maxLen ${field.maxLen}` : ""}
               {field.readOnly ? " • read-only" : ""}
               {field.multiline ? " • multiline" : ""}
+              {needsPlacement ? " • no position" : ""}
             </div>
+            {needsPlacement && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="mt-1 h-6 gap-1 px-2 text-[11px]"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onPlace!();
+                }}
+                title="Draw a rectangle on the PDF to position this field"
+              >
+                <MapPin className="h-3 w-3" />
+                Place on PDF
+              </Button>
+            )}
           </div>
         </div>
         <div className="flex items-center gap-2">
@@ -153,15 +214,66 @@ export const MappingRow = forwardRef<HTMLDivElement, Props>(function MappingRow(
         <TransformEditor
           value={mapping.transform}
           allFieldDataKeys={allFieldDataKeys}
-          onChange={(t) => onChange({ transform: t.op === "none" ? undefined : t })}
+          onChange={(t) => {
+            if (Array.isArray(t)) {
+              const pipeline = normalizePipeline(t);
+              if (pipeline.length === 0) onChange({ transform: undefined });
+              else if (pipeline.length === 1) onChange({ transform: pipeline[0] });
+              else onChange({ transform: pipeline });
+            } else {
+              onChange({ transform: t.op === "none" ? undefined : t });
+            }
+          }}
         />
       </div>
 
-      {preview !== null && (
+      <div onClick={(e) => e.stopPropagation()}>
+        <button
+          type="button"
+          onClick={() => setAdvancedOpen((o) => !o)}
+          className="flex w-full items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
+        >
+          {advancedOpen ? (
+            <ChevronDown className="h-3 w-3" />
+          ) : (
+            <ChevronRight className="h-3 w-3" />
+          )}
+          Advanced (validation, conditions)
+        </button>
+        {advancedOpen && (
+          <div className="mt-2 space-y-2">
+            <ValidationRulesEditor
+              value={mapping.validation}
+              field={field}
+              onChange={(rule) => onChange({ validation: rule })}
+            />
+            <ConditionalEditor
+              value={mapping.fillWhen}
+              allFieldDataKeys={allFieldDataKeys}
+              sampleData={sampleData}
+              onChange={(expr) => onChange({ fillWhen: expr })}
+            />
+          </div>
+        )}
+      </div>
+
+      {hasErrors ? (
+        <div className="space-y-1 rounded-md border border-red-500/40 bg-red-500/5 px-2 py-1.5">
+          {errors.map((e, i) => (
+            <div
+              key={i}
+              className="flex items-start gap-1 text-[11px] text-red-700 dark:text-red-300"
+            >
+              <AlertCircle className="mt-0.5 h-3 w-3 shrink-0" />
+              <span>{e.message}</span>
+            </div>
+          ))}
+        </div>
+      ) : preview !== null ? (
         <div className="rounded-md border border-emerald-500/30 bg-emerald-500/5 px-2 py-1 font-mono text-[11px] text-emerald-700 dark:text-emerald-300">
           Preview: {preview || "(empty)"}
         </div>
-      )}
+      ) : null}
     </div>
   );
 });

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"github.com/docforge/api/internal/compute"
 	"github.com/docforge/api/internal/generate"
 	"github.com/docforge/api/internal/generate/acroform"
+	gdoc "github.com/docforge/api/internal/generate/doc"
 	ghtml "github.com/docforge/api/internal/generate/html"
 	gmarkdown "github.com/docforge/api/internal/generate/markdown"
 	gstatic "github.com/docforge/api/internal/generate/static"
@@ -52,13 +54,21 @@ func New(db *pgxpool.Pool, s *storage.Client) *Handler {
 // Markdown files → mode=markdown with extracted placeholders.
 // Anything else → no template.
 func (h *Handler) DetectAndCreate(ctx context.Context, fileID, orgID, name, mime, storageKey string) (string, error) {
+	// Auto-suffix the template name if another active template in this org
+	// already owns it — we never reject an upload over a name collision,
+	// the user can rename afterwards. The underlying file keeps its
+	// original filename (files.name is independent of templates.name).
+	resolved, err := h.resolveUniqueTemplateName(ctx, orgID, name)
+	if err != nil {
+		return "", err
+	}
 	switch {
 	case isPDF(mime, name):
-		return h.detectPDF(ctx, fileID, orgID, name, storageKey)
+		return h.detectPDF(ctx, fileID, orgID, resolved, storageKey)
 	case isMarkdown(mime, name):
-		return h.detectMarkdown(ctx, fileID, orgID, name, storageKey)
+		return h.detectMarkdown(ctx, fileID, orgID, resolved, storageKey)
 	case isHTML(mime, name):
-		return h.detectHTML(ctx, fileID, orgID, name, storageKey)
+		return h.detectHTML(ctx, fileID, orgID, resolved, storageKey)
 	}
 	return "", nil
 }
@@ -190,10 +200,21 @@ func (h *Handler) detectMarkdown(ctx context.Context, fileID, orgID, name, stora
 }
 
 type fieldDTO struct {
-	Name    string   `json:"name"`
-	Type    string   `json:"type"`
-	Page    int      `json:"page"`
-	Options []string `json:"options,omitempty"`
+	Name     string         `json:"name"`
+	Type     string         `json:"type"`
+	Page     int            `json:"page"`
+	Options  []string       `json:"options,omitempty"`
+	Rect     *acroform.Rect `json:"rect,omitempty"`
+	PageSize *acroform.Size `json:"pageSize,omitempty"`
+	Flags    int            `json:"flags,omitempty"`
+	MaxLen   int            `json:"maxLen,omitempty"`
+	Tooltip  string         `json:"tooltip,omitempty"`
+	ReadOnly bool           `json:"readOnly,omitempty"`
+	Required bool           `json:"required,omitempty"`
+	Multiline bool          `json:"multiline,omitempty"`
+	Password bool           `json:"password,omitempty"`
+	Combo    bool           `json:"combo,omitempty"`
+	MultiSelect bool        `json:"multiSelect,omitempty"`
 }
 
 type templateDTO struct {
@@ -227,24 +248,36 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		dto.ConfigJSON = map[string]interface{}{}
 	}
 
-	rows, err := h.DB.Query(r.Context(),
-		`SELECT name, type, COALESCE(page,0), COALESCE(options,'[]'::jsonb)
-		 FROM template_fields WHERE template_id=$1 ORDER BY page, name`, id,
-	)
-	if err != nil {
-		writeErr(w, 500, "db_error", err.Error())
-		return
+	// For AcroForm templates, re-extract fields directly from the PDF so we
+	// return full geometry (rect, pageSize, flags, tooltip, maxLen) needed by
+	// the visual designer overlay. Falls back to the DB row shape on error
+	// or when re-extraction returns an empty slice (so field names always
+	// appear for the binding UI, even if geometry recovery failed).
+	if dto.Mode == "acroform" {
+		if fields, rerr := reextractAcroformFields(r.Context(), h, id, c.OrgID); rerr == nil && len(fields) > 0 {
+			dto.Fields = fields
+		}
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var f fieldDTO
-		var optsRaw []byte
-		if err := rows.Scan(&f.Name, &f.Type, &f.Page, &optsRaw); err != nil {
+	if dto.Fields == nil {
+		rows, err := h.DB.Query(r.Context(),
+			`SELECT name, type, COALESCE(page,0), COALESCE(options,'[]'::jsonb)
+			 FROM template_fields WHERE template_id=$1 ORDER BY page, name`, id,
+		)
+		if err != nil {
 			writeErr(w, 500, "db_error", err.Error())
 			return
 		}
-		_ = json.Unmarshal(optsRaw, &f.Options)
-		dto.Fields = append(dto.Fields, f)
+		defer rows.Close()
+		for rows.Next() {
+			var f fieldDTO
+			var optsRaw []byte
+			if err := rows.Scan(&f.Name, &f.Type, &f.Page, &optsRaw); err != nil {
+				writeErr(w, 500, "db_error", err.Error())
+				return
+			}
+			_ = json.Unmarshal(optsRaw, &f.Options)
+			dto.Fields = append(dto.Fields, f)
+		}
 	}
 	if dto.Fields == nil {
 		dto.Fields = []fieldDTO{}
@@ -261,6 +294,110 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, 200, dto)
+}
+
+// Rename updates a template's display name, also syncing the underlying
+// files.name so Drive listings don't drift. Route: PATCH /v1/templates/:id.
+//
+// Uniqueness is enforced per org, case-insensitive, against active
+// (non-trashed) templates — a collision returns 409 `name_conflict` so
+// the designer can surface a friendly inline error rather than silently
+// picking a different name (which rename, unlike create, should never do).
+//
+// Both rows update in a single tx. files.name is rewritten to preserve the
+// original extension the Drive UI uses for icon selection — e.g. renaming
+// "Q1 invoice.pdf" to "Q2 summary" yields files.name = "Q2 summary.pdf".
+func (h *Handler) Rename(w http.ResponseWriter, r *http.Request) {
+	c := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
+	id := chi.URLParam(r, "id")
+
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, "invalid_body", err.Error())
+		return
+	}
+	trimmed := strings.TrimSpace(req.Name)
+	if trimmed == "" {
+		writeErr(w, 400, "invalid_name", "name cannot be empty")
+		return
+	}
+	if len(trimmed) > 255 {
+		writeErr(w, 400, "invalid_name", "name is too long (max 255 chars)")
+		return
+	}
+
+	// Look up the existing row so we can (a) verify ownership and (b) keep
+	// the current file extension when rewriting files.name.
+	var fileID, currentName, currentFileName string
+	if err := h.DB.QueryRow(r.Context(),
+		`SELECT t.file_id, t.name, f.name
+		   FROM templates t
+		   JOIN files f ON f.id = t.file_id
+		  WHERE t.id = $1 AND t.org_id = $2`,
+		id, c.OrgID,
+	).Scan(&fileID, &currentName, &currentFileName); err != nil {
+		writeErr(w, 404, "not_found", "template not found")
+		return
+	}
+
+	// Early out when the user submits the same name — avoids a spurious
+	// uniqueness false-positive against the template's own row.
+	if trimmed == currentName {
+		writeJSON(w, 200, map[string]any{"id": id, "name": currentName, "fileName": currentFileName})
+		return
+	}
+
+	if err := h.ensureUniqueTemplateName(r.Context(), c.OrgID, trimmed, id); err != nil {
+		if errors.Is(err, errNameConflict) {
+			writeErr(w, 409, "name_conflict", err.Error())
+			return
+		}
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+
+	// Keep the existing file extension on files.name so Drive's icon/mime
+	// inference doesn't flip. If the current filename had no extension (rare)
+	// we just use the trimmed name verbatim.
+	ext := filepath.Ext(currentFileName)
+	newFileName := trimmed
+	if ext != "" && !strings.HasSuffix(strings.ToLower(trimmed), strings.ToLower(ext)) {
+		newFileName = trimmed + ext
+	}
+
+	tx, err := h.DB.Begin(r.Context())
+	if err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+	defer tx.Rollback(r.Context())
+
+	if _, err := tx.Exec(r.Context(),
+		`UPDATE templates SET name=$1, updated_at=now() WHERE id=$2 AND org_id=$3`,
+		trimmed, id, c.OrgID,
+	); err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+	if _, err := tx.Exec(r.Context(),
+		`UPDATE files SET name=$1, updated_at=now() WHERE id=$2 AND org_id=$3`,
+		newFileName, fileID, c.OrgID,
+	); err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+
+	writeJSON(w, 200, map[string]any{
+		"id":       id,
+		"name":     trimmed,
+		"fileName": newFileName,
+	})
 }
 
 type configReq struct {
@@ -395,6 +532,16 @@ func (h *Handler) Generate(w http.ResponseWriter, r *http.Request) {
 	// Sync path: delegate to the shared Runner.
 	res, err := h.Runner.Run(r.Context(), c.OrgID, c.UserID, id, req.Data, req.Flatten)
 	if err != nil {
+		// Validation failures are a 422 with a structured `fields` list so
+		// the client can render inline per-field messages rather than
+		// trying to parse a concatenated string. Everything else is a 400
+		// (bad input) — preserving the legacy shape for non-validation
+		// failures like PDF read errors.
+		var fe *acroform.FillErrors
+		if errors.As(err, &fe) && fe != nil && len(fe.Errors) > 0 {
+			writeValidationErr(w, fe.Errors)
+			return
+		}
 		writeErr(w, 400, "fill_failed", err.Error())
 		return
 	}
@@ -778,6 +925,15 @@ func (h *Handler) CreateFormTemplate(w http.ResponseWriter, r *http.Request) {
 	if !strings.HasSuffix(strings.ToLower(req.Name), ".pdf") {
 		req.Name += ".pdf"
 	}
+	// Ensure the final name doesn't collide with another active template in
+	// the org — we auto-suffix "Untitled form.pdf" → "Untitled form (2).pdf"
+	// rather than rejecting the create, because the user is mid-flow.
+	unique, err := h.resolveUniqueTemplateName(r.Context(), c.OrgID, req.Name)
+	if err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+	req.Name = unique
 	if len(req.Fields) == 0 {
 		writeErr(w, 400, "no_fields", "at least one field is required")
 		return
@@ -1036,6 +1192,13 @@ func (h *Handler) CreateBlankPDF(w http.ResponseWriter, r *http.Request) {
 	if !strings.HasSuffix(strings.ToLower(req.Name), ".pdf") {
 		req.Name += ".pdf"
 	}
+	// Auto-suffix if the chosen name collides with another active template.
+	unique, err := h.resolveUniqueTemplateName(r.Context(), c.OrgID, req.Name)
+	if err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+	req.Name = unique
 	if req.Pages < 1 {
 		req.Pages = 1
 	}
@@ -1100,6 +1263,140 @@ func (h *Handler) CreateBlankPDF(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// CreateDocTemplate creates a new template in doc mode. The body may seed the
+// initial AST; if omitted we create a one-paragraph skeleton so the editor
+// opens cleanly instead of blank.
+//
+// The source bytes are stored as a JSON envelope in the files table so the
+// rest of the system (versioning, storage, dedupe) treats doc-mode sources
+// identically to html/markdown sources — just a different content-type.
+func (h *Handler) CreateDocTemplate(w http.ResponseWriter, r *http.Request) {
+	c := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
+	var req struct {
+		Name     string          `json:"name"`
+		Doc      json.RawMessage `json:"doc,omitempty"`      // optional seed AST; expected shape: {type:"doc", content:[…]}
+		ThemeCss string          `json:"themeCss,omitempty"` // optional per-template CSS; prepended to preview/render
+		FolderID string          `json:"folderId,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, "invalid_body", err.Error())
+		return
+	}
+	if req.Name == "" {
+		req.Name = "Untitled document"
+	}
+	// Auto-suffix if another active template in this org already claims the
+	// same name (case-insensitive). Applies to the authored name, not the
+	// normalised .docast filename.
+	if uniq, err := h.resolveUniqueTemplateName(r.Context(), c.OrgID, req.Name); err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	} else {
+		req.Name = uniq
+	}
+
+	// Seed the envelope: use the caller's doc if valid, otherwise an empty
+	// doc with one paragraph so the editor has something to land on. The
+	// themeCss field rides alongside the AST — never inside it — so edits
+	// to styling don't invalidate node IDs or diagnostics.
+	var envelope []byte
+	if len(req.Doc) > 0 {
+		// Validate the seed so we never persist an envelope that won't parse
+		// on subsequent Preview/Render calls. We wrap it in the versioned
+		// outer envelope — the client only supplies the inner `doc` tree.
+		envMap := map[string]any{
+			"version": gdoc.ASTVersion,
+			"doc":     req.Doc,
+		}
+		if req.ThemeCss != "" {
+			envMap["themeCss"] = req.ThemeCss
+		}
+		envelope, _ = json.Marshal(envMap)
+		if _, err := gdoc.ParseStoredDoc(envelope); err != nil {
+			writeErr(w, 400, "invalid_doc", err.Error())
+			return
+		}
+	} else if req.ThemeCss != "" {
+		envelope, _ = json.Marshal(map[string]any{
+			"version":  gdoc.ASTVersion,
+			"doc":      map[string]any{"type": "doc", "content": []any{map[string]any{"type": "paragraph", "content": []any{map[string]any{"type": "text", "text": ""}}}}},
+			"themeCss": req.ThemeCss,
+		})
+	} else {
+		envelope = []byte(`{"version":1,"doc":{"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":""}]}]}}`)
+	}
+
+	// Insert the file row first so we have a file_id for the template row.
+	name := req.Name
+	// Normalize a .docast extension purely for human identification in file
+	// listings; the mode column is the source of truth for how to render.
+	if !strings.HasSuffix(strings.ToLower(name), ".docast") {
+		name += ".docast"
+	}
+	var fileID string
+	if err := h.DB.QueryRow(r.Context(),
+		`INSERT INTO files (org_id, owner_id, name, mime, size, storage_key, status)
+		 VALUES ($1,$2,$3,'application/json',$4,'','active') RETURNING id`,
+		c.OrgID, c.UserID, name, len(envelope),
+	).Scan(&fileID); err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+	key := fmt.Sprintf("orgs/%s/files/%s/%s", c.OrgID, fileID, name)
+	if _, err := h.DB.Exec(r.Context(),
+		`UPDATE files SET storage_key=$1 WHERE id=$2`, key, fileID,
+	); err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+	if err := h.Storage.PutBytes(r.Context(), key, "application/json", envelope); err != nil {
+		writeErr(w, 500, "storage", err.Error())
+		return
+	}
+
+	// Seed placeholders from whatever the AST references so the schema
+	// sidebar is populated immediately.
+	placeholders := gdoc.ExtractPlaceholders(string(envelope))
+	cfgBytes, _ := json.Marshal(map[string]any{"placeholders": placeholders})
+
+	tx, err := h.DB.Begin(r.Context())
+	if err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+	defer tx.Rollback(r.Context())
+
+	var tplID string
+	if err := tx.QueryRow(r.Context(),
+		`INSERT INTO templates (org_id, file_id, mode, name, config_json) VALUES ($1,$2,'doc',$3,$4) RETURNING id`,
+		c.OrgID, fileID, req.Name, cfgBytes,
+	).Scan(&tplID); err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+	if _, err := tx.Exec(r.Context(),
+		`UPDATE files SET template_id=$1 WHERE id=$2`, tplID, fileID,
+	); err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+
+	if req.FolderID != "" {
+		_, _ = h.DB.Exec(r.Context(),
+			`UPDATE files SET folder_id=$1 WHERE id=$2 AND org_id=$3`,
+			req.FolderID, fileID, c.OrgID)
+	}
+
+	writeJSON(w, 200, map[string]any{
+		"fileId":     fileID,
+		"templateId": tplID,
+	})
+}
+
 func normalizePageSize(s string) string {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "a4":
@@ -1147,8 +1444,8 @@ func (h *Handler) Preview(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "not_found", "template not found")
 		return
 	}
-	if mode != "html" && mode != "markdown" {
-		writeErr(w, 400, "wrong_mode", "preview is only supported for html/markdown templates")
+	if mode != "html" && mode != "markdown" && mode != "doc" {
+		writeErr(w, 400, "wrong_mode", "preview is only supported for html/markdown/doc templates")
 		return
 	}
 	pageLayout := layout.FromConfig(cfgRaw)
@@ -1171,25 +1468,33 @@ func (h *Handler) Preview(w http.ResponseWriter, r *http.Request) {
 		srcStr = string(data)
 	}
 
+	// The html/markdown preview renderers now return BEST-EFFORT html
+	// alongside any execute-time error, so the designer iframe can show a
+	// partial render (simple `{{ .field }}` refs resolved via regex) even
+	// when a single pipe or comparison fails. The UI banner carries the
+	// error text so the author sees precisely which expression tripped.
 	var (
-		out string
+		out         string
+		previewE    error
+		docDiags    []gdoc.Diagnostic
 	)
-	if mode == "markdown" {
-		rendered, mderr := gmarkdown.PreviewWithLocale(srcStr, mergedData, pageLayout, locale, i18nCfg)
-		if mderr != nil {
-			writeJSON(w, 200, map[string]any{"html": "", "error": mderr.Error()})
-			return
-		}
-		out = rendered
-	} else {
-		rendered, herr := ghtml.PreviewWithLocale(srcStr, mergedData, pageLayout, locale, i18nCfg)
-		if herr != nil {
-			writeJSON(w, 200, map[string]any{"html": "", "error": herr.Error()})
-			return
-		}
-		out = rendered
+	switch mode {
+	case "markdown":
+		out, previewE = gmarkdown.PreviewWithLocale(srcStr, mergedData, pageLayout, locale, i18nCfg)
+	case "doc":
+		out, docDiags, previewE = gdoc.PreviewWithLocale(srcStr, mergedData, pageLayout, locale, i18nCfg)
+	default:
+		out, previewE = ghtml.PreviewWithLocale(srcStr, mergedData, pageLayout, locale, i18nCfg)
 	}
 	resp := map[string]any{"html": out}
+	if previewE != nil {
+		resp["error"] = previewE.Error()
+	}
+	if len(docDiags) > 0 {
+		// Attach structured per-node diagnostics so the designer can pin
+		// warnings to specific blocks in the editor outline.
+		resp["diagnostics"] = docDiags
+	}
 	if len(computeErrors) > 0 {
 		resp["computeErrors"] = computeErrors
 	}
@@ -1253,15 +1558,19 @@ func (h *Handler) UpdateSource(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if mode != "html" && mode != "markdown" {
-		writeErr(w, 400, "wrong_mode", "source edits only supported for html/markdown templates")
+	if mode != "html" && mode != "markdown" && mode != "doc" {
+		writeErr(w, 400, "wrong_mode", "source edits only supported for html/markdown/doc templates")
 		return
 	}
 
 	// Overwrite the file in MinIO.
 	contentType := "text/html"
-	if mode == "markdown" {
+	switch mode {
+	case "markdown":
 		contentType = "text/markdown"
+	case "doc":
+		// doc mode stores a JSON envelope, not HTML.
+		contentType = "application/json"
 	}
 	if err := h.Storage.PutBytes(r.Context(), storageKey, contentType, []byte(req.Source)); err != nil {
 		writeErr(w, 500, "storage", err.Error())
@@ -1271,9 +1580,12 @@ func (h *Handler) UpdateSource(w http.ResponseWriter, r *http.Request) {
 	// Re-extract placeholders and merge into config.
 	cfg := map[string]interface{}{}
 	_ = json.Unmarshal(cfgRaw, &cfg)
-	if mode == "markdown" {
+	switch mode {
+	case "markdown":
 		cfg["placeholders"] = gmarkdown.ExtractPlaceholders(req.Source)
-	} else {
+	case "doc":
+		cfg["placeholders"] = gdoc.ExtractPlaceholders(req.Source)
+	default:
 		cfg["placeholders"] = ghtml.ExtractPlaceholders(req.Source)
 	}
 	newCfg, _ := json.Marshal(cfg)
@@ -1345,6 +1657,79 @@ func isPDF(mime, name string) bool {
 	return strings.EqualFold(filepath.Ext(name), ".pdf")
 }
 
+// errNameConflict is the sentinel returned by ensureUniqueTemplateName when
+// another active (non-trashed) template in the same org already carries the
+// given name. Handlers surface it as HTTP 409 `name_conflict`.
+var errNameConflict = errors.New("a template with this name already exists in this workspace")
+
+// ensureUniqueTemplateName verifies no other active template in the same
+// org holds `name` (case-insensitive). Trashed files are excluded so a user
+// can always reclaim a name they recently deleted. Pass `excludeID` to skip
+// the template being renamed — "" for create.
+//
+// Check is done against the live pool before the create/update tx opens.
+// There's a tiny race window where two parallel creates could both see
+// "free"; we accept it because templates are created interactively and the
+// second save surfaces a clean 409 to the user. Promote to a DB UNIQUE
+// index if contention ever appears (requires de-duping existing rows first).
+func (h *Handler) ensureUniqueTemplateName(ctx context.Context, orgID, name, excludeID string) error {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return fmt.Errorf("template name cannot be empty")
+	}
+	var excl any // NULL when creating; the template's own id when renaming
+	if excludeID != "" {
+		excl = excludeID
+	}
+	var exists bool
+	if err := h.DB.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM templates t
+			JOIN files f ON f.id = t.file_id
+			WHERE t.org_id = $1
+			  AND lower(t.name) = lower($2)
+			  AND f.trashed_at IS NULL
+			  AND ($3::uuid IS NULL OR t.id <> $3::uuid)
+		)`, orgID, trimmed, excl).Scan(&exists); err != nil {
+		return err
+	}
+	if exists {
+		return errNameConflict
+	}
+	return nil
+}
+
+// resolveUniqueTemplateName picks a name guaranteed not to collide with an
+// existing active template in `orgID`. When `name` is free we return it as
+// given; otherwise we append " (2)" / " (3)" / ... before the extension
+// until we find a free slot. Extension handling keeps `.pdf` / `.docast`
+// on the end so file listings stay tidy.
+//
+// Used by create flows (explicit + auto-detect) where auto-suffixing is a
+// better UX than rejecting — the user already committed to creating the
+// file by the time we land here.
+func (h *Handler) resolveUniqueTemplateName(ctx context.Context, orgID, name string) (string, error) {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return "", fmt.Errorf("template name cannot be empty")
+	}
+	// Split base/extension so we can insert the counter before the dot.
+	ext := filepath.Ext(trimmed)
+	base := strings.TrimSuffix(trimmed, ext)
+	candidate := trimmed
+	for i := 2; i < 1000; i++ {
+		err := h.ensureUniqueTemplateName(ctx, orgID, candidate, "")
+		if err == nil {
+			return candidate, nil
+		}
+		if !errors.Is(err, errNameConflict) {
+			return "", err
+		}
+		candidate = fmt.Sprintf("%s (%d)%s", base, i, ext)
+	}
+	return "", fmt.Errorf("could not find a unique template name after 1000 tries")
+}
+
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -1353,4 +1738,220 @@ func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 
 func writeErr(w http.ResponseWriter, code int, slug, msg string) {
 	writeJSON(w, code, map[string]any{"error": map[string]string{"code": slug, "message": msg}})
+}
+
+// writeValidationErr emits a 422 with the per-field error list kept
+// structured so clients can render inline messages. Shape:
+//
+//	{
+//	  "error": {
+//	    "code":    "validation_failed",
+//	    "message": "validation failed (N fields)",
+//	    "fields":  [{ "field","dataKey","message" }, ...]
+//	  }
+//	}
+//
+// Message is a short human summary; `fields` is the source of truth.
+func writeValidationErr(w http.ResponseWriter, errs []acroform.ValidationError) {
+	writeJSON(w, 422, map[string]any{
+		"error": map[string]any{
+			"code":    "validation_failed",
+			"message": fmt.Sprintf("validation failed (%d field%s)", len(errs), plural(len(errs))),
+			"fields":  errs,
+		},
+	})
+}
+
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
+// reextractAcroformFields pulls the current PDF blob for a template and runs a
+// fresh acroform.Extract, returning DTO-shaped rich fields (rect, flags, …).
+func reextractAcroformFields(ctx context.Context, h *Handler, tplID, orgID string) ([]fieldDTO, error) {
+	var storageKey string
+	err := h.DB.QueryRow(ctx,
+		`SELECT f.storage_key FROM templates t
+		 JOIN files f ON f.id=t.file_id
+		 WHERE t.id=$1 AND t.org_id=$2`, tplID, orgID,
+	).Scan(&storageKey)
+	if err != nil {
+		return nil, err
+	}
+	data, err := h.Storage.GetBytes(ctx, storageKey)
+	if err != nil {
+		return nil, err
+	}
+	fields, err := acroform.Extract(data)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]fieldDTO, 0, len(fields))
+	for _, f := range fields {
+		out = append(out, fieldDTO{
+			Name:        f.Name,
+			Type:        f.Type,
+			Page:        f.Page,
+			Options:     f.Options,
+			Rect:        f.Rect,
+			PageSize:    f.PageSize,
+			Flags:       f.Flags,
+			MaxLen:      f.MaxLen,
+			Tooltip:     f.Tooltip,
+			ReadOnly:    f.ReadOnly,
+			Required:    f.Required,
+			Multiline:   f.Multiline,
+			Password:    f.Password,
+			Combo:       f.Combo,
+			MultiSelect: f.MultiSelect,
+		})
+	}
+	return out, nil
+}
+
+type acroStructureReq struct {
+	Patches         []acroform.StructurePatch `json:"patches"`
+	ExpectedVersion *int                      `json:"expectedVersion,omitempty"`
+}
+
+// UpdateAcroformStructure applies a batch of structure patches to the PDF
+// blob backing a template, writes the modified PDF back to storage, updates
+// the `template_fields` mirror, bumps the template version, and returns the
+// refreshed rich fields + a new preview URL.
+func (h *Handler) UpdateAcroformStructure(w http.ResponseWriter, r *http.Request) {
+	c := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
+	id := chi.URLParam(r, "id")
+
+	var req acroStructureReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, "invalid_body", err.Error())
+		return
+	}
+	if len(req.Patches) == 0 {
+		writeErr(w, 400, "no_patches", "at least one patch is required")
+		return
+	}
+
+	ctx := r.Context()
+
+	var mode, fileID, storageKey string
+	var currentVersion int
+	err := h.DB.QueryRow(ctx,
+		`SELECT t.mode, t.file_id, t.version, f.storage_key
+		 FROM templates t JOIN files f ON f.id=t.file_id
+		 WHERE t.id=$1 AND t.org_id=$2`, id, c.OrgID,
+	).Scan(&mode, &fileID, &currentVersion, &storageKey)
+	if err != nil {
+		writeErr(w, 404, "not_found", "template not found")
+		return
+	}
+	if mode != "acroform" {
+		writeErr(w, 400, "wrong_mode", "template is not an acroform")
+		return
+	}
+	if req.ExpectedVersion != nil && *req.ExpectedVersion != currentVersion {
+		writeJSON(w, 409, map[string]any{
+			"error": map[string]any{
+				"code":            "version_conflict",
+				"message":         "another collaborator saved this template while you were editing",
+				"currentVersion":  currentVersion,
+				"expectedVersion": *req.ExpectedVersion,
+			},
+		})
+		return
+	}
+
+	pdfBytes, err := h.Storage.GetBytes(ctx, storageKey)
+	if err != nil {
+		writeErr(w, 500, "storage", err.Error())
+		return
+	}
+
+	modified, err := acroform.ApplyStructurePatches(pdfBytes, req.Patches)
+	if err != nil {
+		writeErr(w, 400, "patch_failed", err.Error())
+		return
+	}
+
+	// Persist the modified PDF back to the SAME storage key so the preview URL
+	// and downstream fill operations always see the latest structure.
+	if err := h.Storage.PutBytes(ctx, storageKey, "application/pdf", modified); err != nil {
+		writeErr(w, 500, "storage", err.Error())
+		return
+	}
+
+	// Re-extract fields from the modified PDF and refresh the mirror table.
+	fresh, err := acroform.Extract(modified)
+	if err != nil {
+		writeErr(w, 500, "reextract", err.Error())
+		return
+	}
+
+	tx, err := h.DB.Begin(ctx)
+	if err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, `DELETE FROM template_fields WHERE template_id=$1`, id); err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+	for _, f := range fresh {
+		opts, _ := json.Marshal(f.Options)
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO template_fields (template_id, name, type, page, options)
+			 VALUES ($1,$2,$3,$4,$5)`, id, f.Name, f.Type, f.Page, opts,
+		); err != nil {
+			writeErr(w, 500, "db_error", err.Error())
+			return
+		}
+	}
+
+	var newVersion int
+	if err := tx.QueryRow(ctx,
+		`UPDATE templates SET version=version+1, updated_at=now()
+		 WHERE id=$1 AND org_id=$2 RETURNING version`, id, c.OrgID,
+	).Scan(&newVersion); err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+
+	previewURL, _ := h.Storage.PresignGet(ctx, storageKey, "", 10*time.Minute)
+
+	// Build DTO fields for response.
+	dtos := make([]fieldDTO, 0, len(fresh))
+	for _, f := range fresh {
+		dtos = append(dtos, fieldDTO{
+			Name:        f.Name,
+			Type:        f.Type,
+			Page:        f.Page,
+			Options:     f.Options,
+			Rect:        f.Rect,
+			PageSize:    f.PageSize,
+			Flags:       f.Flags,
+			MaxLen:      f.MaxLen,
+			Tooltip:     f.Tooltip,
+			ReadOnly:    f.ReadOnly,
+			Required:    f.Required,
+			Multiline:   f.Multiline,
+			Password:    f.Password,
+			Combo:       f.Combo,
+			MultiSelect: f.MultiSelect,
+		})
+	}
+
+	writeJSON(w, 200, map[string]any{
+		"version":    newVersion,
+		"fields":     dtos,
+		"previewUrl": previewURL,
+	})
 }

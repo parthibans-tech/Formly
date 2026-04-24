@@ -11,6 +11,7 @@ import {
   ChevronRight,
   Copy,
   Download,
+  Eye,
   BookTemplate,
   ClipboardList,
   FileCode2,
@@ -21,7 +22,6 @@ import {
   Folder as FolderIcon,
   Grid3x3,
   Home,
-  Info,
   KeyRound,
   LayoutList,
   Link2,
@@ -36,6 +36,7 @@ import {
   Trash2,
   Upload,
   UploadCloud,
+  Users,
   X,
 } from "lucide-react";
 import { api, clearSession, getToken, getUser } from "@/lib/api";
@@ -85,15 +86,10 @@ import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { useConfirm } from "@/components/ui/confirm";
 import { usePrompt } from "@/components/ui/prompt";
 import { createHtmlTemplate } from "@/lib/create-html";
+import { createDocTemplate } from "@/lib/create-doc";
 import { createMarkdownTemplate } from "@/lib/create-markdown";
 import { createBlankPdfTemplate, type BlankPdfOpts } from "@/lib/create-pdf";
 import { AppShell } from "@/components/app-shell";
-import {
-  Sheet,
-  SheetContent,
-  SheetHeader,
-  SheetTitle,
-} from "@/components/ui/sheet";
 import { StarterBrowser } from "@/components/starter-browser";
 import { BlankPdfDialog } from "@/components/blank-pdf-dialog";
 import { FormBuilderDialog } from "@/components/form-builder-dialog";
@@ -102,9 +98,13 @@ import {
   type CreateFormOpts,
 } from "@/lib/create-form";
 import type { Starter } from "@/lib/starters";
-import { iconForMime, colorForMime } from "@/lib/file-icons";
-import { FileGridCard } from "@/components/file-grid-card";
+import { getStarterDoc } from "@/lib/starters";
+import { iconForMime } from "@/lib/file-icons";
+import { FileGridCard, type GridCardMenuItem } from "@/components/file-grid-card";
 import { FolderGridCard } from "@/components/folder-grid-card";
+import { ShareModal } from "@/components/share-modal";
+import { SharePeopleModal } from "@/components/share-people-modal";
+import { FilePreviewDialog } from "@/components/file-preview-dialog";
 import { ViewToggle } from "@/components/view-toggle";
 import { useViewMode } from "@/hooks/use-view-mode";
 import { cn } from "@/lib/utils";
@@ -157,6 +157,19 @@ export default function DrivePage() {
   );
   const [err, setErr] = useState<string | null>(null);
   const [shareFor, setShareFor] = useState<FileItem | null>(null);
+  const [previewFor, setPreviewFor] = useState<FileItem | null>(null);
+  // People/group ACL dialog target. Files and folders both flow through
+  // this state — the resource type disambiguates which endpoints the
+  // modal talks to. `null` = closed.
+  const [sharePeopleFor, setSharePeopleFor] = useState<
+    { id: string; name: string; type: "file" | "folder" } | null
+  >(null);
+  // "My drive" vs "Shared with me". Sidebar pivot; drives which list
+  // endpoint we hit and whether folders render at all.
+  const [scope, setScope] = useState<"mine" | "shared">("mine");
+  const [sharedFiles, setSharedFiles] = useState<
+    (FileItem & { ownerEmail?: string; role?: string; sharedVia?: string })[]
+  >([]);
   const [search, setSearch] = useState("");
   const [dragActive, setDragActive] = useState(false);
   const [creating, setCreating] = useState(false);
@@ -175,7 +188,6 @@ export default function DrivePage() {
     "all" | "templates" | "pdf" | "html" | "markdown" | "image" | "other"
   >("all");
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [detailsFor, setDetailsFor] = useState<FileItem | null>(null);
   const [dropTargetFolder, setDropTargetFolder] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
@@ -188,11 +200,25 @@ export default function DrivePage() {
     setUser(getUser());
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [router, currentFolderId]);
+  }, [router, currentFolderId, scope]);
 
   async function load() {
     setLoading(true);
     try {
+      if (scope === "shared") {
+        // Shared-with-me is a flat list keyed to the user — no folder
+        // hierarchy from the viewer's perspective. We keep `files` /
+        // `folders` in sync so the rest of the page can still share
+        // filters + counts without branching everywhere.
+        const s = await api<{ files: typeof sharedFiles }>(
+          `/v1/shared-with-me`
+        );
+        setSharedFiles(s.files || []);
+        setFiles(s.files || []);
+        setFolders([]);
+        setBreadcrumbs([]);
+        return;
+      }
       const [f, d] = await Promise.all([
         api<{ files: FileItem[] }>(
           `/v1/files?folder=${encodeURIComponent(currentFolderId)}`
@@ -203,6 +229,7 @@ export default function DrivePage() {
       ]);
       setFiles(f.files);
       setFolders(d.folders);
+      setSharedFiles([]);
       if (currentFolderId) {
         const b = await api<{ breadcrumbs: Folder[] }>(
           `/v1/folders/${currentFolderId}/breadcrumbs`
@@ -244,13 +271,17 @@ export default function DrivePage() {
       }
       setUploading(null);
       await load();
+      // Upload no longer auto-jumps into the designer. The file lands
+      // in Drive first; if a template was detected, the user can open
+      // the designer from the file's row menu (or by clicking the
+      // file). This matches the "I just want to keep the file" flow
+      // and removes the surprise redirect for users who are mid-upload.
       if (complete.templateId) {
-        toast.show("success", "AcroForm detected", {
-          description: "Opening the designer…",
+        toast.show("success", `Uploaded ${file.name}`, {
+          description: "Saved to Drive — click the file to open designer.",
         });
-        router.push(`/templates/${complete.templateId}/designer`);
       } else {
-        toast.show("success", `Uploaded ${file.name}`);
+        toast.show("success", `Uploaded ${file.name} to Drive`);
       }
     } catch (e: any) {
       setErr(e.message);
@@ -475,16 +506,28 @@ export default function DrivePage() {
     try {
       const suggestedName =
         s.id === "blank" ? "Untitled template" : `${s.name} — ${new Date().toLocaleDateString()}`;
-      const { templateId } = await createHtmlTemplate({
+
+      // Convert the starter's HTML+Go-template source into the doc AST
+      // and seed a doc-mode template.  getStarterDoc uses the browser's
+      // native DOMParser here.  Any info-level diagnostics (e.g. a <dl>
+      // with embedded control flow that downgraded to a Raw block) are
+      // surfaced as a secondary toast so users know something was
+      // preserved rather than lost.
+      const { stored, diagnostics } = getStarterDoc(s);
+      const { templateId } = await createDocTemplate({
         name: suggestedName,
-        content: s.html,
+        seedDoc: stored.doc,
+        themeCss: stored.themeCss,
         folderId: currentFolderId || undefined,
       });
       toast.show("success", `Created ${s.name}`, {
-        description: "Opening the editor…",
+        description:
+          diagnostics.length > 0
+            ? `${diagnostics.length} block${diagnostics.length === 1 ? "" : "s"} kept as raw HTML — open the doc to clean up. Opening the editor…`
+            : "Opening the editor…",
       });
       setBrowserOpen(false);
-      router.push(`/templates/${templateId}/designer`);
+      router.push(`/templates/${templateId}/designer-v2`);
     } catch (e: any) {
       toast.show("error", "Couldn't create template", {
         description: e.message,
@@ -668,8 +711,7 @@ export default function DrivePage() {
         e.preventDefault();
         searchRef.current?.focus();
       } else if (e.key === "Escape") {
-        if (detailsFor) setDetailsFor(null);
-        else if (selected.size > 0) clearSelection();
+        if (selected.size > 0) clearSelection();
       } else if ((e.key === "Delete" || e.key === "Backspace") && !isEditable) {
         if (selected.size > 0) {
           e.preventDefault();
@@ -680,7 +722,7 @@ export default function DrivePage() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selected, detailsFor]);
+  }, [selected]);
 
   if (!user) return null;
 
@@ -966,6 +1008,36 @@ export default function DrivePage() {
                   </TooltipContent>
                 </Tooltip>
               </div>
+            </div>
+
+            <Separator orientation="vertical" className="hidden h-6 md:block" />
+
+            {/* My drive vs Shared with me — scope pivot. Sits at the
+                front of the filter row so it's the first thing the eye
+                lands on after the breadcrumb. */}
+            <div className="flex items-center gap-1 rounded-md border p-0.5">
+              {(
+                [
+                  { v: "mine", label: "My drive" },
+                  { v: "shared", label: "Shared with me" },
+                ] as const
+              ).map((t) => (
+                <button
+                  key={t.v}
+                  onClick={() => {
+                    setScope(t.v);
+                    setTypeFilter("all");
+                  }}
+                  className={cn(
+                    "rounded px-2 py-1 text-[11px] font-medium transition-colors",
+                    scope === t.v
+                      ? "bg-primary/10 text-primary"
+                      : "text-muted-foreground hover:text-foreground"
+                  )}
+                >
+                  {t.label}
+                </button>
+              ))}
             </div>
 
             <Separator orientation="vertical" className="hidden h-6 md:block" />
@@ -1293,6 +1365,18 @@ export default function DrivePage() {
                             <PencilLine className="h-4 w-4" />
                             Rename
                           </DropdownMenuItem>
+                          <DropdownMenuItem
+                            onClick={() =>
+                              setSharePeopleFor({
+                                id: f.id,
+                                name: f.name,
+                                type: "folder",
+                              })
+                            }
+                          >
+                            <Users className="h-4 w-4" />
+                            Share with people
+                          </DropdownMenuItem>
                           <DropdownMenuSeparator />
                           <DropdownMenuItem
                             onClick={() => deleteFolder(f)}
@@ -1322,12 +1406,20 @@ export default function DrivePage() {
                       }}
                       onClick={(e) => {
                         if ((e.target as HTMLElement).closest("button,a")) return;
-                        setDetailsFor(file);
+                        if (file.templateId) {
+                          router.push(`/templates/${file.templateId}/designer`);
+                        } else if (file.mime === "application/pdf") {
+                          // Plain PDFs now open an in-app preview instead
+                          // of a silent download. Users can still hit
+                          // Download from the preview or the row menu.
+                          setPreviewFor(file);
+                        } else {
+                          download(file.id);
+                        }
                       }}
                       className={cn(
                         "group cursor-pointer border-b last:border-0 transition-colors hover:bg-muted/40",
-                        isSelected && "bg-primary/5",
-                        detailsFor?.id === file.id && "bg-primary/5"
+                        isSelected && "bg-primary/5"
                       )}
                     >
                       <td className="px-3 py-2">
@@ -1426,12 +1518,15 @@ export default function DrivePage() {
                                 </Link>
                               </DropdownMenuItem>
                             )}
-                            <DropdownMenuItem
-                              onClick={() => setDetailsFor(file)}
-                            >
-                              <Info className="h-4 w-4" />
-                              View details
-                            </DropdownMenuItem>
+                            {!file.templateId &&
+                              file.mime === "application/pdf" && (
+                                <DropdownMenuItem
+                                  onClick={() => setPreviewFor(file)}
+                                >
+                                  <Eye className="h-4 w-4" />
+                                  Preview
+                                </DropdownMenuItem>
+                              )}
                             <DropdownMenuItem
                               onClick={() => download(file.id)}
                             >
@@ -1439,10 +1534,22 @@ export default function DrivePage() {
                               Download
                             </DropdownMenuItem>
                             <DropdownMenuItem
+                              onClick={() =>
+                                setSharePeopleFor({
+                                  id: file.id,
+                                  name: file.name,
+                                  type: "file",
+                                })
+                              }
+                            >
+                              <Users className="h-4 w-4" />
+                              Share with people
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
                               onClick={() => setShareFor(file)}
                             >
                               <Share2 className="h-4 w-4" />
-                              Share
+                              Get link…
                             </DropdownMenuItem>
                             <DropdownMenuItem
                               onClick={() => moveFile(file)}
@@ -1484,6 +1591,13 @@ export default function DrivePage() {
                         onDrop={(fileId) => moveFileToFolder(fileId, f.id)}
                         onRename={() => renameFolder(f)}
                         onDelete={() => deleteFolder(f)}
+                        onShare={() =>
+                          setSharePeopleFor({
+                            id: f.id,
+                            name: f.name,
+                            type: "folder",
+                          })
+                        }
                       />
                     ))}
                   </div>
@@ -1502,13 +1616,42 @@ export default function DrivePage() {
                         file={file}
                         actorInitials={initials}
                         selected={selected.has(file.id)}
-                        highlighted={detailsFor?.id === file.id}
+                        bulkSelectActive={selected.size > 0}
                         onToggleSelect={() => toggleSelect(file.id)}
-                        onOpenDetails={() => setDetailsFor(file)}
+                        // Clicking a template card opens the designer;
+                        // clicking a regular file card used to trigger a
+                        // silent download, which was surprising and
+                        // hard to undo. Regular files are now inert on
+                        // single-click — use the Download menu option
+                        // (or double-click) to explicitly fetch. This
+                        // keeps primary actions discoverable and stops
+                        // the "menu click also downloaded the file"
+                        // confusion.
+                        onOpenDetails={
+                          file.templateId
+                            ? () => router.push(`/templates/${file.templateId}/designer`)
+                            : file.mime === "application/pdf"
+                              ? () => setPreviewFor(file)
+                              : undefined
+                        }
                         onDownload={() => download(file.id)}
-                        onShare={() => setShareFor(file)}
-                        onMove={() => moveFile(file)}
-                        onRemove={() => remove(file)}
+                        menuItems={[
+                          file.templateId ? {
+                            label: "Open designer",
+                            icon: <PencilLine className="h-4 w-4" />,
+                            href: `/templates/${file.templateId}/designer`,
+                          } : null,
+                          !file.templateId && file.mime === "application/pdf" ? {
+                            label: "Preview",
+                            icon: <Eye className="h-4 w-4" />,
+                            onClick: () => setPreviewFor(file),
+                          } : null,
+                          { label: "Download", icon: <Download className="h-4 w-4" />, onClick: () => download(file.id) },
+                          { label: "Share with people", icon: <Users className="h-4 w-4" />, onClick: () => setSharePeopleFor({ id: file.id, name: file.name, type: "file" }) },
+                          { label: "Get link…", icon: <Share2 className="h-4 w-4" />, onClick: () => setShareFor(file) },
+                          { label: "Move…", icon: <Move className="h-4 w-4" />, onClick: () => moveFile(file) },
+                          { label: "Move to trash", icon: <Trash2 className="h-4 w-4" />, onClick: () => remove(file), destructive: true, separatorBefore: true },
+                        ].filter(Boolean) as GridCardMenuItem[]}
                       />
                     ))}
                   </div>
@@ -1544,28 +1687,35 @@ export default function DrivePage() {
 
       {shareFor && (
         <ShareModal
-          file={shareFor}
+          fileId={shareFor.id}
+          fileName={shareFor.name}
           open={!!shareFor}
           onOpenChange={(o) => !o && setShareFor(null)}
         />
       )}
 
-      <DetailsPanel
-        file={detailsFor}
-        open={!!detailsFor}
-        onOpenChange={(o) => !o && setDetailsFor(null)}
-        onOpenShare={() => {
-          if (detailsFor) setShareFor(detailsFor);
-        }}
-        onDownload={() => detailsFor && download(detailsFor.id)}
-        onMove={() => detailsFor && moveFile(detailsFor)}
-        onRemove={() => {
-          if (detailsFor) {
-            remove(detailsFor);
-            setDetailsFor(null);
-          }
-        }}
-      />
+      {sharePeopleFor && (
+        <SharePeopleModal
+          resourceId={sharePeopleFor.id}
+          resourceType={sharePeopleFor.type}
+          resourceName={sharePeopleFor.name}
+          open={!!sharePeopleFor}
+          onOpenChange={(o) => !o && setSharePeopleFor(null)}
+        />
+      )}
+
+      {previewFor && (
+        <FilePreviewDialog
+          fileId={previewFor.id}
+          fileName={previewFor.name}
+          open={!!previewFor}
+          onOpenChange={(o) => !o && setPreviewFor(null)}
+          onShare={() => {
+            setShareFor(previewFor);
+            setPreviewFor(null);
+          }}
+        />
+      )}
 
       <StarterBrowser
         open={browserOpen}
@@ -1591,311 +1741,6 @@ export default function DrivePage() {
   );
 }
 
-function ShareModal({
-  file,
-  open,
-  onOpenChange,
-}: {
-  file: FileItem;
-  open: boolean;
-  onOpenChange: (o: boolean) => void;
-}) {
-  const toast = useToast();
-  const confirm = useConfirm();
-  const [shares, setShares] = useState<Share[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [role, setRole] = useState("viewer");
-  const [expiry, setExpiry] = useState("0");
-  const [creating, setCreating] = useState(false);
-  const [copiedId, setCopiedId] = useState<string | null>(null);
-  const [password, setPassword] = useState("");
-  const [oneTime, setOneTime] = useState(false);
-  const [downloadLimit, setDownloadLimit] = useState("");
-  const [showAdvanced, setShowAdvanced] = useState(false);
-
-  useEffect(() => {
-    (async () => {
-      setLoading(true);
-      try {
-        const r = await api<{ shares: Share[] }>(
-          `/v1/files/${file.id}/shares`
-        );
-        setShares(r.shares);
-      } finally {
-        setLoading(false);
-      }
-    })();
-  }, [file.id]);
-
-  async function create() {
-    setCreating(true);
-    try {
-      const r = await api<Share>(`/v1/files/${file.id}/share`, {
-        method: "POST",
-        body: JSON.stringify({
-          role,
-          expiresIn: parseInt(expiry, 10),
-          password: password || undefined,
-          oneTime,
-          downloadLimit: downloadLimit ? parseInt(downloadLimit, 10) : 0,
-        }),
-      });
-      setShares([r, ...shares]);
-      setPassword("");
-      setOneTime(false);
-      setDownloadLimit("");
-      toast.show("success", "Share link created");
-    } catch (e: any) {
-      toast.show("error", e.message);
-    } finally {
-      setCreating(false);
-    }
-  }
-
-  async function revoke(id: string) {
-    const ok = await confirm({
-      title: "Revoke share link?",
-      description: "Anyone with this link will no longer be able to access the file.",
-      confirmLabel: "Revoke",
-      destructive: true,
-    });
-    if (!ok) return;
-    try {
-      await api(`/v1/shares/${id}`, { method: "DELETE" });
-      setShares(shares.filter((s) => s.id !== id));
-      toast.show("success", "Link revoked");
-    } catch (e: any) {
-      toast.show("error", e.message);
-    }
-  }
-
-  async function copyLink(s: Share) {
-    const url = `${window.location.origin}/share/${s.token}`;
-    await navigator.clipboard.writeText(url);
-    setCopiedId(s.id);
-    toast.show("success", "Link copied");
-    setTimeout(() => setCopiedId((c) => (c === s.id ? null : c)), 2000);
-  }
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-xl">
-        <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
-            <Link2 className="h-4 w-4 text-primary" />
-            Share &quot;{file.name}&quot;
-          </DialogTitle>
-          <DialogDescription>
-            Create a public link with access and expiry controls.
-          </DialogDescription>
-        </DialogHeader>
-
-        <div className="space-y-4">
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-[1fr_1fr_auto] sm:items-end">
-            <div className="space-y-1.5">
-              <Label htmlFor="share-role">Role</Label>
-              <Select value={role} onValueChange={setRole}>
-                <SelectTrigger id="share-role">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="viewer">Viewer</SelectItem>
-                  <SelectItem value="downloader">Downloader</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="share-expiry">Expires</Label>
-              <Select value={expiry} onValueChange={setExpiry}>
-                <SelectTrigger id="share-expiry">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="0">Never</SelectItem>
-                  <SelectItem value="3600">1 hour</SelectItem>
-                  <SelectItem value="86400">1 day</SelectItem>
-                  <SelectItem value="604800">7 days</SelectItem>
-                  <SelectItem value="2592000">30 days</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            <Button onClick={create} loading={creating}>
-              <Link2 className="h-4 w-4" />
-              Create link
-            </Button>
-          </div>
-
-          <div>
-            <button
-              type="button"
-              onClick={() => setShowAdvanced((s) => !s)}
-              className="inline-flex items-center gap-1 text-xs font-medium text-muted-foreground hover:text-foreground"
-            >
-              {showAdvanced ? "Hide" : "Show"} advanced options
-            </button>
-            {showAdvanced && (
-              <div className="mt-2 space-y-3 rounded-md border bg-muted/20 p-3">
-                <div className="space-y-1.5">
-                  <Label htmlFor="share-password">
-                    Password (optional)
-                  </Label>
-                  <Input
-                    id="share-password"
-                    type="text"
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    placeholder="Recipients will be prompted for this"
-                  />
-                </div>
-                <div className="space-y-1.5">
-                  <Label htmlFor="share-dl-limit">
-                    Download limit (optional)
-                  </Label>
-                  <Input
-                    id="share-dl-limit"
-                    type="number"
-                    min={0}
-                    value={downloadLimit}
-                    onChange={(e) => setDownloadLimit(e.target.value)}
-                    placeholder="e.g. 3 — leave empty for unlimited"
-                  />
-                </div>
-                <label className="flex items-start gap-2 text-sm">
-                  <input
-                    type="checkbox"
-                    checked={oneTime}
-                    onChange={(e) => setOneTime(e.target.checked)}
-                    className="mt-0.5 h-4 w-4 rounded border accent-primary"
-                  />
-                  <span>
-                    <span className="font-medium">One-time link</span>
-                    <span className="block text-xs text-muted-foreground">
-                      Expires immediately after the first download.
-                    </span>
-                  </span>
-                </label>
-              </div>
-            )}
-          </div>
-
-          <Separator />
-
-          <div>
-            <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              Active links
-            </div>
-            {loading ? (
-              <div className="space-y-2">
-                <Skeleton className="h-10 w-full" />
-                <Skeleton className="h-10 w-full" />
-              </div>
-            ) : shares.length === 0 ? (
-              <p className="rounded-md border border-dashed bg-muted/20 px-4 py-6 text-center text-sm text-muted-foreground">
-                No share links yet. Create one above.
-              </p>
-            ) : (
-              <ul className="space-y-2">
-                {shares.map((s) => (
-                  <li
-                    key={s.id}
-                    className="flex items-center gap-2 rounded-md border bg-card px-3 py-2"
-                  >
-                    <code className="flex-1 truncate text-xs text-muted-foreground">
-                      /share/{s.token}
-                    </code>
-                    <Badge variant="secondary" className="capitalize">
-                      {s.role}
-                    </Badge>
-                    {s.passwordProtected && (
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <Badge
-                            variant="outline"
-                            className="gap-1 border-amber-500/40 text-amber-600"
-                          >
-                            <KeyRound className="h-3 w-3" />
-                          </Badge>
-                        </TooltipTrigger>
-                        <TooltipContent>Password protected</TooltipContent>
-                      </Tooltip>
-                    )}
-                    {s.oneTime && (
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <Badge
-                            variant="outline"
-                            className="border-sky-500/40 text-sky-600"
-                          >
-                            1×
-                          </Badge>
-                        </TooltipTrigger>
-                        <TooltipContent>One-time use</TooltipContent>
-                      </Tooltip>
-                    )}
-                    {s.downloadLimit != null && (
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <Badge
-                            variant="outline"
-                            className="font-mono text-[10px]"
-                          >
-                            {s.downloadCount ?? 0}/{s.downloadLimit}
-                          </Badge>
-                        </TooltipTrigger>
-                        <TooltipContent>
-                          Downloads used / limit
-                        </TooltipContent>
-                      </Tooltip>
-                    )}
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          onClick={() => copyLink(s)}
-                          aria-label="Copy link"
-                        >
-                          {copiedId === s.id ? (
-                            <Check className="h-4 w-4 text-success" />
-                          ) : (
-                            <Copy className="h-4 w-4" />
-                          )}
-                        </Button>
-                      </TooltipTrigger>
-                      <TooltipContent>
-                        {copiedId === s.id ? "Copied!" : "Copy link"}
-                      </TooltipContent>
-                    </Tooltip>
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          onClick={() => revoke(s.id)}
-                          aria-label="Revoke link"
-                          className="text-muted-foreground hover:text-destructive"
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
-                      </TooltipTrigger>
-                      <TooltipContent>Revoke</TooltipContent>
-                    </Tooltip>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-        </div>
-
-        <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
-            Done
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
 
 function StatCard({
   icon: Icon,
@@ -1937,126 +1782,6 @@ function StatCard({
         </div>
       </div>
     </div>
-  );
-}
-
-function DetailsPanel({
-  file,
-  open,
-  onOpenChange,
-  onOpenShare,
-  onDownload,
-  onMove,
-  onRemove,
-}: {
-  file: FileItem | null;
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  onOpenShare: () => void;
-  onDownload: () => void;
-  onMove: () => void;
-  onRemove: () => void;
-}) {
-  return (
-    <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent side="right" className="flex w-full max-w-sm flex-col p-0">
-        <SheetHeader className="pr-10">
-          <SheetTitle>Details</SheetTitle>
-        </SheetHeader>
-
-        {file && (
-          <>
-            <div className="flex-1 overflow-y-auto p-4">
-              {/* File icon + name */}
-              <div className="mb-4 flex flex-col items-center text-center">
-                <span
-                  className={cn(
-                    "grid h-16 w-16 place-items-center rounded-xl bg-muted",
-                    colorForMime(file.mime)
-                  )}
-                >
-                  {(() => {
-                    const Icon = iconForMime(file.mime);
-                    return <Icon className="h-8 w-8" />;
-                  })()}
-                </span>
-                <div className="mt-3 break-words text-sm font-medium">
-                  {file.name}
-                </div>
-                {file.templateId && (
-                  <Badge variant="secondary" className="mt-1 text-[10px]">
-                    Template
-                  </Badge>
-                )}
-              </div>
-
-              {/* Metadata */}
-              <dl className="space-y-3 text-xs">
-                <div className="flex items-start justify-between gap-4 border-t pt-3">
-                  <dt className="font-medium text-muted-foreground">Type</dt>
-                  <dd className="text-right">{prettyMime(file.mime)}</dd>
-                </div>
-                <div className="flex items-start justify-between gap-4 border-t pt-3">
-                  <dt className="font-medium text-muted-foreground">Size</dt>
-                  <dd className="text-right">{fmtSize(file.size)}</dd>
-                </div>
-                <div className="flex items-start justify-between gap-4 border-t pt-3">
-                  <dt className="font-medium text-muted-foreground">Status</dt>
-                  <dd className="text-right capitalize">{file.status}</dd>
-                </div>
-                <div className="flex items-start justify-between gap-4 border-t pt-3">
-                  <dt className="font-medium text-muted-foreground">
-                    Modified
-                  </dt>
-                  <dd className="text-right">
-                    {new Date(file.createdAt).toLocaleString()}
-                  </dd>
-                </div>
-                <div className="flex items-start justify-between gap-4 border-t pt-3">
-                  <dt className="font-medium text-muted-foreground">ID</dt>
-                  <dd className="truncate font-mono text-[10px] text-muted-foreground">
-                    {file.id}
-                  </dd>
-                </div>
-              </dl>
-            </div>
-
-            {/* Actions */}
-            <div className="flex flex-col gap-2 border-t p-4">
-              {file.templateId && (
-                <Button asChild variant="outline" size="sm">
-                  <Link href={`/templates/${file.templateId}/designer`}>
-                    <PencilLine className="h-4 w-4" />
-                    Open in designer
-                  </Link>
-                </Button>
-              )}
-              <Button variant="outline" size="sm" onClick={onDownload}>
-                <Download className="h-4 w-4" />
-                Download
-              </Button>
-              <Button variant="outline" size="sm" onClick={onOpenShare}>
-                <Share2 className="h-4 w-4" />
-                Share
-              </Button>
-              <Button variant="outline" size="sm" onClick={onMove}>
-                <Move className="h-4 w-4" />
-                Move…
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={onRemove}
-                className="text-destructive hover:text-destructive"
-              >
-                <Trash2 className="h-4 w-4" />
-                Move to trash
-              </Button>
-            </div>
-          </>
-        )}
-      </SheetContent>
-    </Sheet>
   );
 }
 

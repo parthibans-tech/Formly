@@ -57,16 +57,22 @@ func Preview(src string, data map[string]interface{}, l *layout.Layout) (string,
 }
 
 // PreviewWithLocale is the locale-aware form of Preview.
+//
+// Returns best-effort HTML alongside any template-execute error so the
+// designer can render a partial preview with a warning banner rather than
+// blanking the pane on every minor template issue. See the matching contract
+// in ghtml.SubstituteWithLocale for the error-policy rationale.
 func PreviewWithLocale(src string, data map[string]interface{}, l *layout.Layout, locale string, i18nCfg i18n.Config) (string, error) {
-	filled, err := ghtml.SubstituteWithLocale(src, data, locale, i18nCfg)
-	if err != nil {
-		return "", err
+	filled, substErr := ghtml.SubstituteWithLocale(src, data, locale, i18nCfg)
+	// `filled` carries a best-effort render even when substErr != nil.
+	html, mdErr := ToHTML(filled)
+	if mdErr != nil {
+		if substErr != nil {
+			return "", fmt.Errorf("%w; markdown: %v", substErr, mdErr)
+		}
+		return "", mdErr
 	}
-	html, err := ToHTML(filled)
-	if err != nil {
-		return "", err
-	}
-	return ghtml.ApplyLayoutForPreview(html, l), nil
+	return ghtml.ApplyLayoutForPreview(html, l), substErr
 }
 
 // Render runs the full Markdown → HTML → PDF pipeline.

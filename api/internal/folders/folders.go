@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/docforge/api/internal/auth"
+	"github.com/docforge/api/internal/sharing"
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -63,12 +64,20 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	c := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
-	parent := r.URL.Query().Get("parent") // empty = root
-	rows, err := h.DB.Query(r.Context(),
-		`SELECT id, parent_id, name, created_at FROM folders
-		 WHERE org_id=$1 AND (($2='' AND parent_id IS NULL) OR parent_id::text=$2)
-		 ORDER BY name`, c.OrgID, parent,
-	)
+	q := r.URL.Query()
+	parent := q.Get("parent") // empty = root
+	orgWide := c.IsAdmin() && q.Get("scope") == "org"
+
+	sql := `SELECT id, parent_id, name, created_at FROM folders
+		 WHERE org_id=$1 AND (($2='' AND parent_id IS NULL) OR parent_id::text=$2)`
+	args := []any{c.OrgID, parent}
+	if !orgWide {
+		clause, vargs := sharing.FolderVisibilityClause("folders", c.UserID, 3)
+		sql += " AND " + clause
+		args = append(args, vargs...)
+	}
+	sql += " ORDER BY name"
+	rows, err := h.DB.Query(r.Context(), sql, args...)
 	if err != nil {
 		writeErr(w, 500, "db_error", err.Error())
 		return
@@ -123,6 +132,20 @@ type patchReq struct {
 func (h *Handler) Patch(w http.ResponseWriter, r *http.Request) {
 	c := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
 	id := chi.URLParam(r, "id")
+	// Only the owner (or an admin) can rename / move a folder.
+	if !c.IsAdmin() {
+		var owns bool
+		if err := h.DB.QueryRow(r.Context(),
+			`SELECT EXISTS(SELECT 1 FROM folders WHERE id=$1 AND org_id=$2 AND owner_id=$3)`,
+			id, c.OrgID, c.UserID).Scan(&owns); err != nil {
+			writeErr(w, 500, "db_error", err.Error())
+			return
+		}
+		if !owns {
+			writeErr(w, 403, "forbidden", "only the owner can modify this folder")
+			return
+		}
+	}
 	var req patchReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, "invalid_body", err.Error())
@@ -167,6 +190,13 @@ func (h *Handler) Patch(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	c := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
 	id := chi.URLParam(r, "id")
+	// Only the owner (or an admin) can delete.
+	ownerFilter := "AND owner_id=$3"
+	delArgs := []any{id, c.OrgID, c.UserID}
+	if c.IsAdmin() {
+		ownerFilter = ""
+		delArgs = delArgs[:2]
+	}
 	var childCount, fileCount int
 	_ = h.DB.QueryRow(r.Context(), `SELECT COUNT(*) FROM folders WHERE parent_id=$1`, id).Scan(&childCount)
 	_ = h.DB.QueryRow(r.Context(),
@@ -177,7 +207,7 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tag, err := h.DB.Exec(r.Context(),
-		`DELETE FROM folders WHERE id=$1 AND org_id=$2`, id, c.OrgID)
+		`DELETE FROM folders WHERE id=$1 AND org_id=$2 `+ownerFilter, delArgs...)
 	if err != nil {
 		writeErr(w, 500, "db_error", err.Error())
 		return

@@ -26,3 +26,5 @@ export const STARTER_CATEGORIES: StarterCategory[] = [
 ];
 
 export type { Starter, StarterCategory };
+export { getStarterDoc } from "./to-doc";
+export type { StarterDocResult } from "./to-doc";

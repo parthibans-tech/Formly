@@ -21,6 +21,7 @@ type Transform struct {
 //   - absent/null → {Op: "none"}
 //   - a JSON string (legacy) → {Op: <string>}
 //   - a JSON object → unmarshaled directly
+//   - a JSON array → first element (use parseTransformPipeline for the chain)
 func parseTransform(raw json.RawMessage) Transform {
 	if len(raw) == 0 {
 		return Transform{Op: "none"}
@@ -28,6 +29,13 @@ func parseTransform(raw json.RawMessage) Transform {
 	trimmed := strings.TrimSpace(string(raw))
 	if trimmed == "null" || trimmed == "" {
 		return Transform{Op: "none"}
+	}
+	if trimmed[0] == '[' {
+		pipeline := parseTransformPipeline(raw)
+		if len(pipeline) == 0 {
+			return Transform{Op: "none"}
+		}
+		return pipeline[0]
 	}
 	if trimmed[0] == '"' {
 		var s string
@@ -40,6 +48,51 @@ func parseTransform(raw json.RawMessage) Transform {
 		return t
 	}
 	return Transform{Op: "none"}
+}
+
+// parseTransformPipeline decodes a Mapping.Transform raw message into a chain
+// of Transforms. Handles null, string (legacy), object, or array inputs.
+func parseTransformPipeline(raw json.RawMessage) []Transform {
+	if len(raw) == 0 {
+		return nil
+	}
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "null" || trimmed == "" {
+		return nil
+	}
+	if trimmed[0] == '[' {
+		var arr []json.RawMessage
+		if err := json.Unmarshal(raw, &arr); err != nil {
+			return nil
+		}
+		out := make([]Transform, 0, len(arr))
+		for _, step := range arr {
+			t := parseTransform(step)
+			if t.Op != "" && strings.ToLower(t.Op) != "none" {
+				out = append(out, t)
+			}
+		}
+		return out
+	}
+	t := parseTransform(raw)
+	if t.Op == "" || strings.ToLower(t.Op) == "none" {
+		return nil
+	}
+	return []Transform{t}
+}
+
+// applyTransformPipeline runs a chain of transforms left-to-right.
+// Each transform sees the output of the previous step as its `v` input.
+// row remains stable across steps (used by template/concat ops).
+func applyTransformPipeline(v interface{}, pipeline []Transform, row map[string]interface{}) interface{} {
+	if len(pipeline) == 0 {
+		return v
+	}
+	cur := v
+	for _, step := range pipeline {
+		cur = applyTransformV2(cur, step, row)
+	}
+	return cur
 }
 
 // applyTransformV2 applies the structured transform to a value. row is the

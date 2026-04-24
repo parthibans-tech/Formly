@@ -73,6 +73,11 @@ type Props = {
   // Enable the selection checkbox. Defaults to true when `onToggleSelect` is
   // provided.
   showSelectCheckbox?: boolean;
+  // True when any file in the parent list is already selected — i.e. the
+  // user is in "bulk selection" mode. Shows the checkbox on every card
+  // unconditionally so the UI is obviously in a multi-select state.
+  // When false, the checkbox only fades in on hover (Drive-style).
+  bulkSelectActive?: boolean;
   // Whether this card is draggable (drive page) or not (trash/recent/etc.).
   draggable?: boolean;
 };
@@ -92,6 +97,7 @@ export function FileGridCard({
   menuItems,
   clickOpensDetails,
   showSelectCheckbox,
+  bulkSelectActive = false,
   draggable = true,
 }: Props) {
   const kind = categorizeFile(file.mime, file.name);
@@ -149,11 +155,33 @@ export function FileGridCard({
       }}
       onClick={(e) => {
         if (!canOpenDetails) return;
-        if ((e.target as HTMLElement).closest("button,a")) return;
+        const target = e.target as HTMLElement;
+        // Skip if the click came from any interactive element OR from
+        // inside a popover/menu that renders into a Portal. Radix
+        // usually keeps portaled clicks out of the card's bubbling
+        // path, but tagging these selectors explicitly is cheap
+        // insurance against a menu-item click registering as a card
+        // click (which previously made every menu action also
+        // download/open the file — hence the "card acts like it was
+        // clicked after I picked a menu item" bug).
+        if (
+          target.closest(
+            "button,a,input,[role='menu'],[role='menuitem'],[data-radix-popper-content-wrapper]"
+          )
+        ) {
+          return;
+        }
         onOpenDetails?.();
       }}
       onDoubleClick={(e) => {
-        if ((e.target as HTMLElement).closest("button,a")) return;
+        const target = e.target as HTMLElement;
+        if (
+          target.closest(
+            "button,a,input,[role='menu'],[role='menuitem'],[data-radix-popper-content-wrapper]"
+          )
+        ) {
+          return;
+        }
         if (file.templateId) {
           window.location.href = `/templates/${file.templateId}/designer`;
         } else if (onDownload) {
@@ -175,23 +203,6 @@ export function FileGridCard({
             {file.name}
           </div>
         </div>
-        {canToggleSelect && (
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              onToggleSelect?.();
-            }}
-            aria-label={selected ? "Deselect" : "Select"}
-            className={cn(
-              "grid h-5 w-5 shrink-0 place-items-center rounded-md border bg-background transition-opacity",
-              selected
-                ? "border-primary opacity-100"
-                : "opacity-0 group-hover:opacity-100"
-            )}
-          >
-            {selected ? <Check className="h-3 w-3 text-primary" /> : null}
-          </button>
-        )}
         {resolvedMenu.length > 0 && (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
@@ -232,8 +243,38 @@ export function FileGridCard({
         )}
       </div>
 
-      {/* Preview / thumbnail */}
-      <FileThumbnail file={file} />
+      {/* Preview / thumbnail, with select checkbox overlaid top-left.
+          Previously the checkbox lived in the header next to the
+          three-dots menu and faded in on hover — so right after a
+          menu item was clicked, the dropdown closed, the mouse was
+          still hovering, and the checkbox appeared *exactly where
+          the menu just was*. Users read that as a confirmation
+          checkmark for whichever action they'd just picked. Moving
+          it to the top-left corner kills the spatial overlap; the
+          `bulkSelectActive` prop makes the checkbox always visible
+          whenever any file is selected (bulk-select mode). */}
+      <div className="relative">
+        <FileThumbnail file={file} />
+        {canToggleSelect && (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleSelect?.();
+            }}
+            aria-label={selected ? "Deselect" : "Select"}
+            aria-pressed={selected}
+            className={cn(
+              "absolute left-2 top-2 z-10 grid h-5 w-5 place-items-center rounded-md border bg-background/90 shadow-sm backdrop-blur transition-opacity",
+              selected || bulkSelectActive
+                ? "border-primary opacity-100"
+                : "opacity-0 group-hover:opacity-100",
+              selected && "border-primary bg-primary text-primary-foreground"
+            )}
+          >
+            {selected ? <Check className="h-3 w-3" /> : null}
+          </button>
+        )}
+      </div>
 
       {/* Footer: actor + activity */}
       <div className="flex items-center gap-2 border-t px-3 py-2">

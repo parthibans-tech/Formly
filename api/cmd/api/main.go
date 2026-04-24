@@ -149,7 +149,15 @@ func main() {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(30 * time.Second))
+	// Global request budget. 30s was too tight for any endpoint that
+	// invokes Chromium (generate, batch, html preview): cold-start alone
+	// can eat 5–10s on dev machines, leaving too little headroom before
+	// the parent context fires and surfaces as
+	// `chromium render: context deadline exceeded`. 90s gives the render
+	// pipeline room and still bounds runaway requests. Individual routes
+	// that should stay fast have their own guards (DB statement_timeout,
+	// rate limit buckets).
+	r.Use(middleware.Timeout(90 * time.Second))
 	r.Use(security.Headers())
 	// Observability: record per-request timing + capture 5xx responses.
 	// Mounted after RequestID so captured errors carry X-Request-Id.
@@ -235,12 +243,33 @@ func main() {
 		r.Patch("/v1/folders/{id}", fh.Patch)
 		r.Delete("/v1/folders/{id}", fh.Delete)
 
-		// Shares
+		// Shares (public token links).
 		r.Post("/v1/files/{id}/share", sh.Create)
 		r.Get("/v1/files/{id}/shares", sh.List)
 		r.Delete("/v1/shares/{shareId}", sh.Revoke)
 
+		// Per-user / per-group ACL — grant a teammate or group access
+		// to a specific file or folder. See internal/sharing/acl.go.
+		r.Post("/v1/files/{id}/access", sh.GrantFile)
+		r.Get("/v1/files/{id}/access", sh.ListFileShares)
+		r.Delete("/v1/files/{id}/access/{shareId}", sh.RevokeFile)
+		r.Post("/v1/folders/{id}/access", sh.GrantFolder)
+		r.Get("/v1/folders/{id}/access", sh.ListFolderShares)
+		r.Delete("/v1/folders/{id}/access/{shareId}", sh.RevokeFolder)
+		r.Get("/v1/shared-with-me", sh.SharedWithMe)
+
+		// Groups — named collections of users used as share principals.
+		r.Get("/v1/groups", sh.GroupsList)
+		r.Post("/v1/groups", sh.GroupsCreate)
+		r.Get("/v1/groups/{id}", sh.GroupsGet)
+		r.Patch("/v1/groups/{id}", sh.GroupsUpdate)
+		r.Delete("/v1/groups/{id}", sh.GroupsDelete)
+		r.Get("/v1/groups/{id}/members", sh.GroupMembersList)
+		r.Post("/v1/groups/{id}/members", sh.GroupMembersAdd)
+		r.Delete("/v1/groups/{id}/members/{userId}", sh.GroupMembersRemove)
+
 		r.Get("/v1/templates/{id}", t.Get)
+		r.Patch("/v1/templates/{id}", t.Rename)
 		r.Put("/v1/templates/{id}/config", t.UpdateConfig)
 		r.Get("/v1/templates/{id}/preview-url", t.PreviewURL)
 		r.Post("/v1/templates/{id}/generate", t.Generate)
@@ -248,6 +277,7 @@ func main() {
 		r.Post("/v1/templates/{id}/batch-sheet", t.BatchSheet)
 		r.Get("/v1/templates/{id}/widgets", t.ListWidgets)
 		r.Put("/v1/templates/{id}/widgets", t.ReplaceWidgets)
+		r.Put("/v1/templates/{id}/acroform/structure", t.UpdateAcroformStructure)
 
 		r.Get("/v1/templates/{id}/mock-data", md.List)
 		r.Post("/v1/templates/{id}/mock-data", md.Save)
@@ -265,6 +295,7 @@ func main() {
 		r.Post("/v1/templates/{id}/preview", t.Preview)
 		r.Post("/v1/templates/blank-pdf", t.CreateBlankPDF)
 		r.Post("/v1/templates/form-builder", t.CreateFormTemplate)
+		r.Post("/v1/templates/doc", t.CreateDocTemplate)
 
 		// API keys — programmatic access to the REST API.
 		r.Get("/v1/api-keys", ak.List)

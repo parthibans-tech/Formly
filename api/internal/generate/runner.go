@@ -13,6 +13,7 @@ import (
 	"github.com/docforge/api/internal/compute"
 	"github.com/docforge/api/internal/events"
 	"github.com/docforge/api/internal/generate/acroform"
+	gdoc "github.com/docforge/api/internal/generate/doc"
 	ghtml "github.com/docforge/api/internal/generate/html"
 	gmarkdown "github.com/docforge/api/internal/generate/markdown"
 	gstatic "github.com/docforge/api/internal/generate/static"
@@ -101,6 +102,12 @@ func (r *Runner) Run(ctx context.Context, orgID, userID, templateID string, data
 		output, err = gmarkdown.RenderWithLocale(ctx, string(pdfBytes), data, pageLayout, locale, i18nCfg)
 		if err != nil {
 			return nil, fmt.Errorf("markdown render: %w", err)
+		}
+	case "doc":
+		// Source file contains the JSON AST envelope.
+		output, err = gdoc.RenderWithLocale(ctx, string(pdfBytes), data, pageLayout, locale, i18nCfg)
+		if err != nil {
+			return nil, fmt.Errorf("doc render: %w", err)
 		}
 	default:
 		return nil, fmt.Errorf("unsupported mode %q", mode)

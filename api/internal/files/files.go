@@ -9,6 +9,7 @@ import (
 
 	"github.com/docforge/api/internal/auth"
 	"github.com/docforge/api/internal/events"
+	"github.com/docforge/api/internal/sharing"
 	"github.com/docforge/api/internal/storage"
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -134,38 +135,59 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	view := q.Get("view")
 
+	// Admins can opt into the old org-wide view with `?scope=org`;
+	// otherwise every list is filtered to files the caller owns or
+	// has been shared on (directly or via a folder share).
+	orgWide := c.IsAdmin() && q.Get("scope") == "org"
+
+	// Build the visibility AND-clause once. Non-admins always get it;
+	// admins get it unless they passed `?scope=org`. Placeholder
+	// numbering starts after the query's static args so each branch
+	// can compute its own base offset.
+	visClause := func(startIdx int) (string, []any) {
+		if orgWide {
+			return "", nil
+		}
+		clause, vargs := sharing.FileVisibilityClause("files", c.UserID, startIdx)
+		return " AND " + clause, vargs
+	}
+
 	var sql string
 	var args []any
 	switch view {
 	case "trashed":
+		vis, vargs := visClause(2)
 		sql = `SELECT id, name, mime, size, status, template_id, folder_id, created_at
 		       FROM files
-		       WHERE org_id=$1 AND trashed_at IS NOT NULL
+		       WHERE org_id=$1 AND trashed_at IS NOT NULL` + vis + `
 		       ORDER BY created_at DESC
 		       LIMIT 200`
-		args = []any{c.OrgID}
+		args = append([]any{c.OrgID}, vargs...)
 	case "templates":
+		vis, vargs := visClause(2)
 		sql = `SELECT id, name, mime, size, status, template_id, folder_id, created_at
 		       FROM files
-		       WHERE org_id=$1 AND trashed_at IS NULL AND template_id IS NOT NULL
+		       WHERE org_id=$1 AND trashed_at IS NULL AND template_id IS NOT NULL` + vis + `
 		       ORDER BY created_at DESC
 		       LIMIT 200`
-		args = []any{c.OrgID}
+		args = append([]any{c.OrgID}, vargs...)
 	case "recent":
+		vis, vargs := visClause(2)
 		sql = `SELECT id, name, mime, size, status, template_id, folder_id, created_at
 		       FROM files
-		       WHERE org_id=$1 AND trashed_at IS NULL
+		       WHERE org_id=$1 AND trashed_at IS NULL` + vis + `
 		       ORDER BY created_at DESC
 		       LIMIT 50`
-		args = []any{c.OrgID}
+		args = append([]any{c.OrgID}, vargs...)
 	default:
 		folder := q.Get("folder") // "" = root
+		vis, vargs := visClause(3)
 		sql = `SELECT id, name, mime, size, status, template_id, folder_id, created_at
 		       FROM files
 		       WHERE org_id=$1 AND trashed_at IS NULL
-		         AND (($2='' AND folder_id IS NULL) OR folder_id::text=$2)
+		         AND (($2='' AND folder_id IS NULL) OR folder_id::text=$2)` + vis + `
 		       ORDER BY created_at DESC`
-		args = []any{c.OrgID, folder}
+		args = append([]any{c.OrgID, folder}, vargs...)
 	}
 
 	rows, err := h.DB.Query(r.Context(), sql, args...)
@@ -209,6 +231,18 @@ func (h *Handler) Restore(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	c := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
 	id := chi.URLParam(r, "id")
+	// Access gate before reading the row so we don't leak metadata via
+	// a 200 vs 404 split — CanAccessFile already returns a consistent
+	// "is in org AND visible to me" signal.
+	ok, err := sharing.CanAccessFile(r.Context(), h.DB, c, id)
+	if err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+	if !ok {
+		writeErr(w, 404, "not_found", "file not found")
+		return
+	}
 	var f fileDTO
 	if err := h.DB.QueryRow(r.Context(),
 		`SELECT id, name, mime, size, status, template_id, folder_id, created_at FROM files
@@ -223,6 +257,15 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) Download(w http.ResponseWriter, r *http.Request) {
 	c := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
 	id := chi.URLParam(r, "id")
+	ok, err := sharing.CanAccessFile(r.Context(), h.DB, c, id)
+	if err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+	if !ok {
+		writeErr(w, 404, "not_found", "file not found")
+		return
+	}
 	var key, name string
 	if err := h.DB.QueryRow(r.Context(),
 		`SELECT storage_key, name FROM files WHERE id=$1 AND org_id=$2 AND trashed_at IS NULL`, id, c.OrgID,
@@ -246,6 +289,20 @@ type patchReq struct {
 func (h *Handler) Patch(w http.ResponseWriter, r *http.Request) {
 	c := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
 	id := chi.URLParam(r, "id")
+	// Only the owner (or an admin) can rename / move.
+	if !c.IsAdmin() {
+		var owns bool
+		if err := h.DB.QueryRow(r.Context(),
+			`SELECT EXISTS(SELECT 1 FROM files WHERE id=$1 AND org_id=$2 AND owner_id=$3 AND trashed_at IS NULL)`,
+			id, c.OrgID, c.UserID).Scan(&owns); err != nil {
+			writeErr(w, 500, "db_error", err.Error())
+			return
+		}
+		if !owns {
+			writeErr(w, 403, "forbidden", "only the owner can modify this file")
+			return
+		}
+	}
 	var req patchReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, "invalid_body", err.Error())
@@ -290,9 +347,17 @@ func (h *Handler) Patch(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	c := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
 	id := chi.URLParam(r, "id")
+	// Only the owner (or an admin) can trash. Shared-with viewers/editors
+	// can't delete resources they don't own.
+	ownerFilter := "AND owner_id=$3"
+	args := []any{id, c.OrgID, c.UserID}
+	if c.IsAdmin() {
+		ownerFilter = ""
+		args = args[:2]
+	}
 	tag, err := h.DB.Exec(r.Context(),
-		`UPDATE files SET trashed_at=now() WHERE id=$1 AND org_id=$2 AND trashed_at IS NULL`,
-		id, c.OrgID,
+		`UPDATE files SET trashed_at=now() WHERE id=$1 AND org_id=$2 `+ownerFilter+` AND trashed_at IS NULL`,
+		args...,
 	)
 	if err != nil {
 		writeErr(w, 500, "db_error", err.Error())

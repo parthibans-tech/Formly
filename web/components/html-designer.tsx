@@ -1,12 +1,11 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
-import dynamic from "next/dynamic";
 import Link from "next/link";
 import {
   ArrowLeft,
-  Blocks,
   Book,
   Calculator,
+  ChevronDown,
   Code2,
   Eye,
   Globe,
@@ -23,7 +22,9 @@ import {
   TriangleAlert,
   Wrench,
 } from "lucide-react";
-import { api, pollJob } from "@/lib/api";
+import { api } from "@/lib/api";
+import { runGenerate } from "@/lib/generate";
+import { GeneratedPreviewDialog } from "@/components/generated-preview-dialog";
 import { useToast } from "@/components/toast";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -38,7 +39,20 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { RichEditor } from "@/components/ui/rich-editor";
-import type { BlockEditorRef } from "@/components/ui/block-editor";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { PageLayoutDialog } from "@/components/page-layout-dialog";
 import {
   ComputedFieldsDialog,
@@ -59,14 +73,7 @@ import {
   type Command,
 } from "@/components/designer/command-palette";
 import { ShortcutHelp, modSymbol } from "@/components/designer/shortcut-help";
-
-// BlockNote can't SSR — ProseMirror accesses `window` on import.
-const BlockEditor = dynamic(
-  () => import("@/components/ui/block-editor").then((m) => m.BlockEditor),
-  { ssr: false, loading: () => <div className="p-4 text-xs text-muted-foreground">Loading blocks editor…</div> }
-) as unknown as React.ForwardRefExoticComponent<
-  { initialHTML?: string; onChange?: (html: string) => void } & React.RefAttributes<BlockEditorRef>
->;
+import { InlineRenameTitle } from "@/components/designer/inline-rename-title";
 
 type Template = {
   id: string;
@@ -84,7 +91,7 @@ type Template = {
 };
 
 type Props = { tpl: Template };
-type EditorTab = "blocks" | "design" | "code";
+type EditorTab = "design" | "code";
 
 export default function HtmlDesigner({ tpl: initialTpl }: Props) {
   const toast = useToast();
@@ -92,22 +99,26 @@ export default function HtmlDesigner({ tpl: initialTpl }: Props) {
   const [source, setSource] = useState("");
   const [sampleJSON, setSampleJSON] = useState("{}");
   const [saving, setSaving] = useState(false);
-  const [tab, setTab] = useState<EditorTab>("blocks");
-  const blockRef = useRef<BlockEditorRef | null>(null);
+  const [tab, setTab] = useState<EditorTab>("design");
   const [genOpen, setGenOpen] = useState(false);
   const [genAsync, setGenAsync] = useState(false);
   const [genBusy, setGenBusy] = useState(false);
   const [genProgress, setGenProgress] = useState<string | null>(null);
   const [genData, setGenData] = useState("{}");
+  // Post-generate preview — replaces the old `window.open(downloadUrl)`
+  // auto-download. The dialog shows the rendered PDF and gives the user
+  // explicit Download / Share / Open-in-Drive choices.
+  const [genResult, setGenResult] = useState<{
+    downloadUrl: string;
+    outputFileId?: string;
+    fileName: string;
+  } | null>(null);
   const [previewHTML, setPreviewHTML] = useState<string>("");
   const [previewErr, setPreviewErr] = useState<string | null>(null);
   const [sourceLoaded, setSourceLoaded] = useState(false);
-  const [blocksEntry, setBlocksEntry] = useState(0);
-
-  useEffect(() => {
-    if (tab === "blocks") setBlocksEntry((n) => n + 1);
-  }, [tab]);
-  const [cheatOpen, setCheatOpen] = useState(true);
+  // Default the syntax cheatsheet closed — it's intimidating code for
+  // non-technical users. Advanced users can still expand it with one click.
+  const [cheatOpen, setCheatOpen] = useState(false);
   const [layoutOpen, setLayoutOpen] = useState(false);
   const [savingLayout, setSavingLayout] = useState(false);
   const [computedOpen, setComputedOpen] = useState(false);
@@ -276,16 +287,21 @@ export default function HtmlDesigner({ tpl: initialTpl }: Props) {
     }
   }
 
-  // Insert a placeholder at the cursor position in the code-mode textarea.
-  // Falls back to appending if no textarea is focused (e.g. Blocks mode).
+  // Insert a placeholder / snippet into whichever editor the user is in.
+  // Previously this always forced a switch to the HTML tab, which was
+  // jarring for non-technical users who live in the Design view.  Now:
+  //   • Design tab → append to source so TinyMCE reconciles via its
+  //     controlled `value` prop
+  //   • HTML tab   → splice into the textarea at the caret
   function insertAtCursor(text: string) {
-    if (tab !== "code") {
-      setTab("code");
-      // Wait for the textarea to mount.
-      setTimeout(() => doInsert(text), 50);
+    if (tab === "code") {
+      doInsert(text);
       return;
     }
-    doInsert(text);
+    // Design tab (TinyMCE): no imperative handle currently wired, so
+    // append to source. The rich editor reads `value` via controlled
+    // prop and will reconcile.
+    setSource((s) => s + text);
   }
   function doInsert(text: string) {
     const ta = codeTextareaRef.current;
@@ -301,6 +317,20 @@ export default function HtmlDesigner({ tpl: initialTpl }: Props) {
       ta.focus();
       ta.selectionStart = ta.selectionEnd = start + text.length;
     });
+  }
+
+  // Human-friendly label for a dotted placeholder path. Shared with the
+  // Data fields sidebar so non-technical users see "Merchant › Name"
+  // instead of "merchant.name".
+  function friendlyFieldLabel(path: string): string {
+    return path
+      .split(".")
+      .map((s) =>
+        s
+          .replace(/([a-z])([A-Z])/g, "$1 $2")
+          .replace(/^./, (c) => c.toUpperCase())
+      )
+      .join(" › ");
   }
 
   // Autosave — debounced 2s after the last edit. Skips the first render
@@ -358,35 +388,24 @@ export default function HtmlDesigner({ tpl: initialTpl }: Props) {
     setGenOpen(true);
   }
 
-  async function runGenerate() {
+  async function runGenerateFlow() {
     setGenBusy(true);
     setGenProgress(null);
     try {
       const data = JSON.parse(genData);
-      const res = await api<{
-        downloadUrl?: string;
-        jobId?: string;
-        outputFileId?: string;
-      }>(`/v1/templates/${tpl.id}/generate`, {
-        method: "POST",
-        body: JSON.stringify({ data, async: genAsync }),
+      const result = await runGenerate(tpl.id, {
+        data,
+        async: genAsync,
+        onProgress: setGenProgress,
       });
-      if (res.jobId) {
-        setGenProgress("queued…");
-        const done = await pollJob(res.jobId, (j) =>
-          setGenProgress(`${j.status}…`)
-        );
-        if (done.status === "failed")
-          throw new Error(done.error || "job failed");
-        if (done.outputFileId) {
-          const dl = await api<{ downloadUrl: string }>(
-            `/v1/files/${done.outputFileId}/download`
-          );
-          window.open(dl.downloadUrl, "_blank");
-        }
-      } else if (res.downloadUrl) {
-        window.open(res.downloadUrl, "_blank");
-      }
+      // Replace the old auto-download with an in-app preview. The file
+      // is already persisted to Drive as `outputFileId`, so Share /
+      // Open-in-Drive work from the preview dialog.
+      setGenResult({
+        downloadUrl: result.downloadUrl,
+        outputFileId: result.outputFileId,
+        fileName: `${tpl.name}.pdf`,
+      });
       setGenOpen(false);
     } catch (e: any) {
       toast.show("error", e.message);
@@ -400,154 +419,257 @@ export default function HtmlDesigner({ tpl: initialTpl }: Props) {
 
   return (
     <div className="flex min-h-screen flex-col">
-      <header className="sticky top-0 z-40 border-b bg-background/80 px-4 md:px-6 py-3 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-        <div className="flex items-center justify-between gap-3">
-          <div className="flex min-w-0 items-center gap-3">
-            <Button variant="ghost" size="sm" asChild>
-              <Link href="/drive">
-                <ArrowLeft className="h-4 w-4" />
-                Drive
-              </Link>
-            </Button>
-            <Separator orientation="vertical" className="h-6" />
-            <div className="min-w-0">
-              <h1 className="truncate text-sm font-semibold">{tpl.name}</h1>
-              <div className="flex items-center gap-2">
-                <Badge variant="outline" className="uppercase text-[10px]">
-                  HTML
-                </Badge>
-                <span className="text-xs text-muted-foreground">
-                  v{tpl.version}
-                </span>
+      <TooltipProvider delayDuration={200}>
+        <header className="sticky top-0 z-40 border-b bg-background/80 px-3 md:px-5 py-2 backdrop-blur supports-[backdrop-filter]:bg-background/60">
+          <div className="flex items-center gap-3">
+            {/* Left: back + title --------------------------------------- */}
+            <div className="flex min-w-0 items-center gap-2">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-8 w-8 shrink-0"
+                    asChild
+                  >
+                    <Link href="/drive" aria-label="Back to Drive">
+                      <ArrowLeft className="h-4 w-4" />
+                    </Link>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Back to Drive</TooltipContent>
+              </Tooltip>
+              <Separator orientation="vertical" className="h-6" />
+              <div className="min-w-0">
+                <InlineRenameTitle
+                  templateId={tpl.id}
+                  name={tpl.name}
+                  onRenamed={(n) =>
+                    setTpl((prev) => ({ ...prev, name: n }))
+                  }
+                  className="text-sm font-semibold leading-tight"
+                />
+                <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                  <Badge
+                    variant="outline"
+                    className="h-4 px-1.5 uppercase text-[9px] font-semibold tracking-wide"
+                  >
+                    HTML
+                  </Badge>
+                  <span>v{tpl.version}</span>
+                  {autoSave && lastSavedAt ? (
+                    <>
+                      <span aria-hidden>·</span>
+                      <span className="text-emerald-600 dark:text-emerald-400">
+                        Saved
+                      </span>
+                    </>
+                  ) : null}
+                </div>
               </div>
             </div>
+
+            {/* Right: action groups ------------------------------------- */}
+            <div className="ml-auto flex items-center gap-1">
+              {/* Utility (icon-only; always visible, labels live in tooltips) */}
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-8 w-8"
+                    onClick={() => setPaletteOpen(true)}
+                  >
+                    <LayoutGrid className="h-4 w-4" />
+                    <span className="sr-only">Command palette</span>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  Command palette ({modSymbol()}K)
+                </TooltipContent>
+              </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-8 w-8"
+                    onClick={() => setHelpOpen(true)}
+                  >
+                    <Keyboard className="h-4 w-4" />
+                    <span className="sr-only">Keyboard shortcuts</span>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Keyboard shortcuts (?)</TooltipContent>
+              </Tooltip>
+
+              <Separator orientation="vertical" className="mx-1 h-6" />
+
+              {/* Configure dropdown — all template-level settings live here */}
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="ghost" size="sm" className="gap-1.5">
+                    <Settings2 className="h-4 w-4" />
+                    <span className="hidden sm:inline">Configure</span>
+                    {(tpl.config?.computed?.length ?? 0) +
+                      ((tpl.config?.locales?.length ?? 1) > 1
+                        ? tpl.config!.locales!.length
+                        : 0) >
+                    0 ? (
+                      <Badge
+                        variant="secondary"
+                        className="ml-0.5 h-4 px-1.5 text-[10px]"
+                      >
+                        {(tpl.config?.computed?.length ?? 0) +
+                          ((tpl.config?.locales?.length ?? 1) > 1
+                            ? tpl.config!.locales!.length
+                            : 0)}
+                      </Badge>
+                    ) : null}
+                    <ChevronDown className="h-3.5 w-3.5 opacity-60" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-56">
+                  <DropdownMenuLabel>Template</DropdownMenuLabel>
+                  <DropdownMenuItem onSelect={() => setLayoutOpen(true)}>
+                    <Settings2 className="mr-2 h-4 w-4" />
+                    Page layout
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onSelect={() => setComputedOpen(true)}>
+                    <Calculator className="mr-2 h-4 w-4" />
+                    Computed fields
+                    {tpl.config?.computed && tpl.config.computed.length > 0 ? (
+                      <Badge
+                        variant="secondary"
+                        className="ml-auto h-4 px-1.5 text-[10px]"
+                      >
+                        {tpl.config.computed.length}
+                      </Badge>
+                    ) : null}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onSelect={() => setI18nOpen(true)}>
+                    <Globe className="mr-2 h-4 w-4" />
+                    Translations
+                    {tpl.config?.locales && tpl.config.locales.length > 1 ? (
+                      <Badge
+                        variant="secondary"
+                        className="ml-auto h-4 px-1.5 text-[10px]"
+                      >
+                        {tpl.config.locales.length}
+                      </Badge>
+                    ) : null}
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuLabel>Distribution</DropdownMenuLabel>
+                  <DropdownMenuItem onSelect={() => setFormLinksOpen(true)}>
+                    <Globe2 className="mr-2 h-4 w-4" />
+                    Share form
+                  </DropdownMenuItem>
+                  <DropdownMenuItem asChild>
+                    <Link href={`/templates/${tpl.id}/versions`}>
+                      <History className="mr-2 h-4 w-4" />
+                      Version history
+                    </Link>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem asChild>
+                    <Link href={`/templates/${tpl.id}/playground`}>
+                      <Sparkles className="mr-2 h-4 w-4" />
+                      Playground
+                    </Link>
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+
+              {/* Collaborate — kept outside the menu because it's social/live */}
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="gap-1.5"
+                    onClick={() => setCollabOpen(true)}
+                  >
+                    <MessageSquare className="h-4 w-4" />
+                    <span className="hidden md:inline">Collaborate</span>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent className="md:hidden">
+                  Collaborate
+                </TooltipContent>
+              </Tooltip>
+
+              <Separator orientation="vertical" className="mx-1 h-6" />
+
+              {/* Primary actions: Save → Send → Generate (visual weight ↑) */}
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1.5"
+                onClick={() => save(false)}
+                loading={saving}
+              >
+                <Save className="h-4 w-4" />
+                <span className="hidden sm:inline">
+                  {autoSave && lastSavedAt ? "Saved" : "Save"}
+                </span>
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1.5"
+                onClick={() => setSendOpen(true)}
+              >
+                <Mail className="h-4 w-4" />
+                <span className="hidden sm:inline">Send</span>
+              </Button>
+              <Button size="sm" className="gap-1.5" onClick={openGenerate}>
+                <PlayCircle className="h-4 w-4" />
+                Generate
+              </Button>
+            </div>
           </div>
-          <div className="flex items-center gap-1.5">
-            <Button variant="ghost" size="sm" asChild>
-              <Link href={`/templates/${tpl.id}/versions`}>
-                <History className="h-4 w-4" />
-                Versions
-              </Link>
-            </Button>
-            <Button variant="ghost" size="sm" asChild>
-              <Link href={`/templates/${tpl.id}/playground`}>
-                <Sparkles className="h-4 w-4" />
-                Playground
-              </Link>
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setFormLinksOpen(true)}
-            >
-              <Globe2 className="h-4 w-4" />
-              Share form
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setI18nOpen(true)}
-            >
-              <Globe className="h-4 w-4" />
-              i18n
-              {tpl.config?.locales && tpl.config.locales.length > 1 ? (
-                <Badge variant="secondary" className="text-[10px]">
-                  {tpl.config.locales.length}
-                </Badge>
-              ) : null}
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setComputedOpen(true)}
-            >
-              <Calculator className="h-4 w-4" />
-              Computed
-              {tpl.config?.computed && tpl.config.computed.length > 0 ? (
-                <Badge variant="secondary" className="text-[10px]">
-                  {tpl.config.computed.length}
-                </Badge>
-              ) : null}
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setLayoutOpen(true)}
-            >
-              <Settings2 className="h-4 w-4" />
-              Layout
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setPaletteOpen(true)}
-              title={`Command palette (${modSymbol()}K)`}
-            >
-              <LayoutGrid className="h-4 w-4" />
-              Commands
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setHelpOpen(true)}
-              title="Keyboard shortcuts (?)"
-            >
-              <Keyboard className="h-4 w-4" />
-            </Button>
-            <Button variant="outline" size="sm" onClick={() => save(false)} loading={saving}>
-              <Save className="h-4 w-4" />
-              {autoSave ? (lastSavedAt ? "Saved" : "Save") : "Save"}
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setCollabOpen(true)}
-            >
-              <MessageSquare className="h-4 w-4" />
-              Collaborate
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setSendOpen(true)}
-            >
-              <Mail className="h-4 w-4" />
-              Send
-            </Button>
-            <Button size="sm" onClick={openGenerate}>
-              <PlayCircle className="h-4 w-4" />
-              Generate
-            </Button>
-          </div>
-        </div>
-      </header>
+        </header>
+      </TooltipProvider>
 
       <div className="flex flex-1 min-h-0">
         {/* Left rail: placeholders + cheatsheet + helpers + sample data */}
         <aside className="hidden w-72 shrink-0 overflow-y-auto border-r bg-background p-4 lg:block">
-          {/* Placeholders */}
-          <div className="mb-3 flex items-center justify-between">
+          {/* Data fields — clickable inserts for non-technical users.
+              Click to drop {{ .field }} at the cursor in the current tab. */}
+          <div className="mb-2 flex items-center justify-between">
             <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
               <Tag className="mr-1 inline h-3 w-3" />
-              Placeholders
+              Data fields
             </div>
             <Badge variant="secondary" className="text-[10px]">
               {placeholders.length}
             </Badge>
           </div>
+          <p className="mb-3 text-[11px] leading-snug text-muted-foreground">
+            Click a field to insert it where you're typing.
+          </p>
           {placeholders.length === 0 ? (
             <p className="rounded-md border border-dashed bg-muted/30 p-3 text-xs text-muted-foreground">
-              Insert <code className="font-mono text-xs">{"{{ .name }}"}</code>{" "}
-              from the toolbar, then save to detect them.
+              No fields yet. Add sample data below, then save — fields show up
+              here automatically.
             </p>
           ) : (
-            <ul className="space-y-1.5">
+            <ul className="space-y-1">
               {placeholders.map((p) => (
-                <li
-                  key={p}
-                  className="cursor-default rounded-md border bg-card px-2 py-1 font-mono text-xs"
-                >
-                  {"{{ ." + p + " }}"}
+                <li key={p}>
+                  <button
+                    type="button"
+                    onClick={() => insertAtCursor("{{ ." + p + " }}")}
+                    title={`Insert {{ .${p} }}`}
+                    className="group flex w-full items-center justify-between gap-2 rounded-md border bg-card px-2 py-1.5 text-left text-xs transition hover:border-primary/50 hover:bg-accent hover:text-accent-foreground"
+                  >
+                    <span className="truncate font-medium">
+                      {friendlyFieldLabel(p)}
+                    </span>
+                    <span className="shrink-0 font-mono text-[10px] text-muted-foreground group-hover:text-foreground">
+                      {"{{ ." + p + " }}"}
+                    </span>
+                  </button>
                 </li>
               ))}
             </ul>
@@ -620,13 +742,9 @@ export default function HtmlDesigner({ tpl: initialTpl }: Props) {
         <div className="flex flex-1 min-h-0">
           <section className="flex w-1/2 flex-col border-r bg-background min-h-0">
             <div className="flex items-center gap-1 border-b bg-background px-3 py-1.5">
-              <TabButton
-                active={tab === "blocks"}
-                icon={<Blocks className="h-3.5 w-3.5" />}
-                onClick={() => setTab("blocks")}
-              >
-                Blocks
-              </TabButton>
+              <span className="mr-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                Editor
+              </span>
               <TabButton
                 active={tab === "design"}
                 icon={<Sparkles className="h-3.5 w-3.5" />}
@@ -646,25 +764,18 @@ export default function HtmlDesigner({ tpl: initialTpl }: Props) {
               </span>
             </div>
             <div className="flex-1 min-h-0 overflow-hidden">
-              {tab === "blocks" ? (
+              {tab === "design" ? (
                 sourceLoaded ? (
-                  <BlockEditor
-                    key={blocksEntry}
-                    initialHTML={source}
+                  <RichEditor
+                    value={source}
                     onChange={setSource}
-                    ref={blockRef}
+                    placeholders={placeholders}
                   />
                 ) : (
                   <div className="p-4 text-xs text-muted-foreground">
                     Loading template…
                   </div>
                 )
-              ) : tab === "design" ? (
-                <RichEditor
-                  value={source}
-                  onChange={setSource}
-                  placeholders={placeholders}
-                />
               ) : (
                 <textarea
                   ref={codeTextareaRef}
@@ -678,24 +789,44 @@ export default function HtmlDesigner({ tpl: initialTpl }: Props) {
             </div>
           </section>
 
+          {/* Live preview — deliberately styled to look DIFFERENT from
+              the Design tab so users know which pane is editable vs
+              read-only. Design tab = raw document surface with {{ }}
+              visible; preview = a paper-mockup with the sample data
+              already filled in. The gray gutter + drop shadow + "PDF
+              preview" banner signal "this is what the output will look
+              like", not "this is where I type". */}
           <section className="flex w-1/2 flex-col bg-muted/40 min-h-0">
-            <div className="flex items-center gap-1.5 border-b bg-background px-3 py-2 text-xs font-medium text-muted-foreground">
-              <Eye className="h-3.5 w-3.5" />
-              Live preview
+            <div className="flex items-center gap-1.5 border-b bg-background px-3 py-2 text-xs font-medium">
+              <Eye className="h-3.5 w-3.5 text-primary" />
+              <span className="text-foreground">PDF preview</span>
+              <Badge variant="secondary" className="ml-1 h-5 text-[10px]">
+                with sample data
+              </Badge>
               {previewErr && (
                 <span className="ml-2 inline-flex items-center gap-1 text-[10px] text-warning-foreground">
                   <TriangleAlert className="h-3 w-3" />
                   {previewErr}
                 </span>
               )}
-              <span className="ml-auto text-[10px]">server rendered</span>
+              <span className="ml-auto text-[10px] text-muted-foreground">
+                Read-only · updates as you edit
+              </span>
             </div>
-            <iframe
-              srcDoc={previewHTML}
-              className="flex-1 w-full bg-background"
-              sandbox="allow-same-origin"
-              title="Preview"
-            />
+            <div className="relative flex-1 min-h-0 overflow-auto bg-[repeating-linear-gradient(45deg,theme(colors.muted.DEFAULT)_0_12px,theme(colors.muted.DEFAULT/.6)_12px_24px)] p-6">
+              <div className="mx-auto max-w-[850px] overflow-hidden rounded-md border bg-white shadow-[0_8px_24px_rgba(0,0,0,0.08),0_2px_4px_rgba(0,0,0,0.04)] dark:bg-zinc-50">
+                <iframe
+                  srcDoc={previewHTML}
+                  className="block h-[1100px] w-full bg-white"
+                  sandbox="allow-same-origin"
+                  title="PDF preview"
+                />
+              </div>
+              <p className="mx-auto mt-4 max-w-[850px] text-center text-[11px] text-muted-foreground">
+                This is how your PDF will look when generated.
+                Edit the left panel to make changes.
+              </p>
+            </div>
           </section>
         </div>
       </div>
@@ -738,7 +869,7 @@ export default function HtmlDesigner({ tpl: initialTpl }: Props) {
             >
               Cancel
             </Button>
-            <Button onClick={runGenerate} loading={genBusy}>
+            <Button onClick={runGenerateFlow} loading={genBusy}>
               <PlayCircle className="h-4 w-4" />
               Generate &amp; download
             </Button>
@@ -825,6 +956,16 @@ export default function HtmlDesigner({ tpl: initialTpl }: Props) {
           { keys: "?", label: "Show shortcuts", group: "General" },
         ]}
       />
+      {/* Post-generate preview — renders the freshly-generated PDF in
+          an in-app dialog so the user can review, download, share, or
+          jump to Drive without a surprise browser download. */}
+      <GeneratedPreviewDialog
+        open={!!genResult}
+        onOpenChange={(o) => !o && setGenResult(null)}
+        downloadUrl={genResult?.downloadUrl ?? null}
+        outputFileId={genResult?.outputFileId}
+        fileName={genResult?.fileName ?? `${tpl.name}.pdf`}
+      />
     </div>
   );
 }
@@ -855,7 +996,6 @@ function buildHtmlCommands(p: {
     { label: "Insert comment", text: "{{/* comment */}}" },
   ];
   return [
-    { id: "tab:blocks", label: "Switch to Blocks editor", group: "View", run: () => p.setTab("blocks") },
     { id: "tab:design", label: "Switch to Design editor", group: "View", run: () => p.setTab("design") },
     { id: "tab:code", label: "Switch to HTML editor", group: "View", run: () => p.setTab("code") },
     { id: "file:save", label: "Save now", hint: `${M}S`, group: "File", run: () => p.save(false) },
@@ -948,10 +1088,112 @@ const HELPERS: Array<{ name: string; hint: string }> = [
   { name: "chart", hint: '{{ chart .series "line" 480 280 }} — line / bar / pie / doughnut' },
 ];
 
+// skeleton — build a realistic sample-data JSON so the live preview
+// actually shows rendered output on first open instead of a stream of
+// raw `{{ .merchant.name }}` placeholders. The old version seeded every
+// placeholder with an empty string ("") which made the preview look
+// broken to non-technical users: scalars rendered as blank, loops over
+// unset arrays rendered as nothing, and because BlockNote sometimes
+// round-trips `{{` as HTML entities the raw template text survived all
+// the way to the iframe. Giving every known field a non-empty,
+// type-appropriate default makes the preview legible out of the box
+// and — crucially — demonstrates to the user what each placeholder
+// *does*, so they don't have to read Go template syntax to understand
+// their own template.
+//
+// The value heuristic is name-based (last path segment, lowercased).
+// This is deliberately shallow — guessing from the path is better than
+// empty strings and cheap enough that template authors just tweak the
+// JSON if they want different samples. Anything not matched falls
+// through to a generic "Sample …" string.
 function skeleton(placeholders: string[]): Record<string, any> {
   const out: Record<string, any> = {};
-  for (const p of placeholders) setDeep(out, p, "");
+  for (const p of placeholders) setDeep(out, p, sampleFor(p));
   return out;
+}
+
+// Plural heuristic → array. We don't have loop info from the extractor
+// on this path (see ExtractSchema) so we guess from the final segment.
+const PLURAL_HINTS = new Set([
+  "items",
+  "lines",
+  "rows",
+  "records",
+  "entries",
+  "products",
+  "orders",
+  "invoices",
+  "customers",
+  "users",
+  "tags",
+  "attachments",
+  "photos",
+  "files",
+  "shipments",
+  "payments",
+  "transactions",
+  "notes",
+  "comments",
+]);
+
+function sampleFor(path: string): any {
+  const leaf = (path.split(".").pop() || "").toLowerCase();
+
+  // Array-like field names — seed with two sample rows so `range` blocks
+  // produce visible output. The per-row shape is intentionally broad:
+  // common names (.name, .qty, .amount) cover most receipt/invoice
+  // layouts without hand-tuning.
+  //
+  // IMPORTANT: only the explicit PLURAL_HINTS set qualifies as an array.
+  // The previous `/s$/` heuristic misfired on common singulars ("address",
+  // "status", "business", "process", "success") → they got seeded as
+  // arrays, and Go's template then dumped `[map[amount:19.99 …]]` into
+  // the preview. A small whitelist is safer than a clever regex.
+  if (PLURAL_HINTS.has(leaf)) {
+    return [
+      { name: "Sample item A", qty: 2, amount: 19.99, sku: "SKU-001" },
+      { name: "Sample item B", qty: 1, amount: 29.99, sku: "SKU-002" },
+    ];
+  }
+
+  // Date-ish
+  if (/(at|date|on|time|expires|due|issued|paid|created|updated)$/.test(leaf)) {
+    return new Date().toISOString();
+  }
+
+  // Money-ish
+  if (/(amount|total|subtotal|price|cost|fee|tax|balance|due|paid)$/.test(leaf)) {
+    return 49.99;
+  }
+
+  // Count-ish
+  if (/(qty|quantity|count|number|num)$/.test(leaf)) return 1;
+
+  // Known scalar patterns
+  if (leaf === "email" || leaf.endsWith("email")) return "jane@example.com";
+  if (leaf === "phone" || leaf.includes("phone")) return "+1 555 0100";
+  if (leaf === "url" || leaf.endsWith("url") || leaf === "link") {
+    return "https://example.com";
+  }
+  if (leaf === "id" || leaf.endsWith("id")) return "ORD-12345";
+  if (leaf === "sku") return "SKU-001";
+  if (leaf === "status") return "paid";
+  if (leaf === "currency") return "USD";
+  if (leaf === "method") return "Credit card";
+  if (leaf === "cardlast4" || leaf === "last4") return "4242";
+  if (leaf === "auth" || leaf === "authcode") return "AUTH-0001";
+  if (leaf === "address") return "123 Main St, Springfield";
+  if (leaf === "name" || leaf.endsWith("name")) return "Jane Doe";
+  if (leaf === "description" || leaf === "notes" || leaf === "message") {
+    return "Sample description text.";
+  }
+  if (leaf === "image" || leaf === "photo" || leaf === "logo") {
+    return "https://via.placeholder.com/200";
+  }
+
+  // Generic fallback — a visible, readable label so nothing in the
+  // preview ever looks like an unfilled slot.
+  return `Sample ${leaf || "value"}`;
 }
 
 function setDeep(obj: Record<string, any>, path: string, value: any) {

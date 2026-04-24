@@ -11,6 +11,8 @@ import (
 	"context"
 	"fmt"
 	htmltemplate "html/template"
+	"log/slog"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -23,6 +25,25 @@ import (
 	"github.com/docforge/api/internal/i18n"
 	"github.com/docforge/api/internal/layout"
 )
+
+// defaultRenderTimeout is the wall-clock budget for a single Chromium
+// render (launch + navigation + print-to-pdf). 60s is generous for the
+// typical single-page document and still well under the 90s HTTP
+// request ceiling. Override via CHROMIUM_RENDER_TIMEOUT=<seconds> when
+// running on a slow host or rendering very heavy templates.
+const defaultRenderTimeout = 60 * time.Second
+
+// renderTimeout resolves the effective render budget. Parses the env
+// override as an integer number of seconds; falls back to the default
+// on parse failure or missing value so a typo can't break production.
+func renderTimeout() time.Duration {
+	if s := os.Getenv("CHROMIUM_RENDER_TIMEOUT"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return defaultRenderTimeout
+}
 
 // ExtractPlaceholders returns the unique top-level field names referenced by
 // the template source. Dotted paths at the root (e.g. `customer.email`) are
@@ -213,18 +234,36 @@ func Substitute(src string, data map[string]interface{}) (string, error) {
 // SubstituteWithLocale is the locale-aware form of Substitute. The `locale` is
 // a BCP-47 tag (e.g. "en-US", "es-ES"). `i18nCfg` supplies the template's
 // translation dictionaries so the `t` helper can look them up.
+//
+// Error policy:
+//   - Parse error (syntax) → fall back to the bare-placeholder regex so an
+//     author mid-typing still sees a best-effort preview. This is safe because
+//     a parse failure means the template never ran, and the raw regex is the
+//     most conservative substitution possible.
+//   - Execute error (semantics — type mismatch, missing function, bad pipe)
+//     → return the error. The previous behavior silently regex-fell-back,
+//     which erased every control-flow (`{{ range }}`, `{{ if }}`) and piped
+//     expression (`{{ .x | formatCurrency }}`) from the output, leaving a
+//     half-rendered page that looked broken to authors with no indication
+//     why. Surfacing the error lets the UI banner tell them exactly which
+//     expression failed.
 func SubstituteWithLocale(src string, data map[string]interface{}, locale string, i18nCfg i18n.Config) (string, error) {
 	funcs := defaultFuncs()
 	if locale != "" {
 		// Override the generic formatters with locale-aware versions.
-		funcs["formatCurrency"] = func(v interface{}, code string) string {
-			return i18n.FormatCurrency(locale, v, code)
+		// Both arg-orders supported — see formatCurrency/formatDate in
+		// defaultFuncs() for the rationale.
+		funcs["formatCurrency"] = func(a, b interface{}) string {
+			value, code := splitValueAndCode(a, b)
+			return i18n.FormatCurrency(locale, value, code)
 		}
-		funcs["formatNumber"] = func(v interface{}, decimals int) string {
-			return i18n.FormatNumber(locale, v, decimals)
+		funcs["formatNumber"] = func(a, b interface{}) string {
+			value, decimals := splitValueAndDecimals(a, b)
+			return i18n.FormatNumber(locale, value, decimals)
 		}
-		funcs["formatDate"] = func(v interface{}, layout string) string {
-			return i18n.FormatDate(locale, v, layout)
+		funcs["formatDate"] = func(a, b interface{}) string {
+			value, layout := splitValueAndTimeLayout(a, b)
+			return i18n.FormatDate(locale, value, layout)
 		}
 	}
 	// Translation helper (always available; no-op if no translations configured).
@@ -234,11 +273,23 @@ func SubstituteWithLocale(src string, data map[string]interface{}, locale string
 
 	t, err := htmltemplate.New("doc").Funcs(funcs).Parse(src)
 	if err != nil {
+		// Author is mid-edit; best-effort render with the dumb regex.
 		return regexSubstitute(src, data), nil
 	}
+	// `missingkey=zero` makes missing map keys render as the zero value
+	// (empty string for scalars) instead of erroring. Combined with our
+	// coercing comparators in defaultFuncs, this lets a partial-sample-
+	// data preview render without Execute failures blanking the page.
+	t = t.Option("missingkey=zero")
 	var buf bytes.Buffer
 	if err := t.Execute(&buf, data); err != nil {
-		return regexSubstitute(src, data), nil
+		// Execute-time error (e.g. comparing incompatible types, missing
+		// custom function). Return a best-effort render of bare
+		// placeholders AND surface the error — blanking the preview on
+		// every minor issue makes authoring feel broken. The handler
+		// layer pairs this with a UI banner so the author sees which
+		// expression failed.
+		return regexSubstitute(src, data), fmt.Errorf("template execute: %w", err)
 	}
 	return buf.String(), nil
 }
@@ -246,21 +297,19 @@ func SubstituteWithLocale(src string, data map[string]interface{}, locale string
 // Preview runs substitution and applies the layout's visual hints (watermark
 // CSS, optional header/footer bars) so the iframe shows what the final PDF
 // will look like.
+//
+// Returns best-effort HTML even when err != nil (an Execute-time error) so the
+// designer UI can show the partial render alongside a clear error banner,
+// rather than going blank on every minor template issue.
 func Preview(src string, data map[string]interface{}, l *layout.Layout) (string, error) {
 	filled, err := Substitute(src, data)
-	if err != nil {
-		return "", err
-	}
-	return ApplyLayoutForPreview(filled, l), nil
+	return ApplyLayoutForPreview(filled, l), err
 }
 
 // PreviewWithLocale is the locale-aware form of Preview.
 func PreviewWithLocale(src string, data map[string]interface{}, l *layout.Layout, locale string, i18nCfg i18n.Config) (string, error) {
 	filled, err := SubstituteWithLocale(src, data, locale, i18nCfg)
-	if err != nil {
-		return "", err
-	}
-	return ApplyLayoutForPreview(filled, l), nil
+	return ApplyLayoutForPreview(filled, l), err
 }
 
 // ApplyLayoutForPreview wraps the rendered HTML with layout approximations for
@@ -417,8 +466,22 @@ func defaultFuncs() htmltemplate.FuncMap {
 		"upper": strings.ToUpper,
 		"lower": strings.ToLower,
 
-		"formatDate": func(v interface{}, layout string) string {
-			s := fmt.Sprint(v)
+		// formatDate accepts BOTH call styles, matching formatCurrency:
+		//   {{ formatDate .paidAt "Jan 2, 2006" }}     — direct
+		//   {{ .paidAt | formatDate "Jan 2, 2006" }}   — pipe (value last)
+		// A Go time layout references the canonical moment
+		// "Mon Jan 2 15:04:05 MST 2006", so we detect it by looking for
+		// that signature (year 2006, month names, or "15:04"). Anything
+		// else is treated as the value to format.
+		"formatDate": func(a, b interface{}) string {
+			value, layout := splitValueAndTimeLayout(a, b)
+			s := fmt.Sprint(value)
+			if s == "" {
+				return ""
+			}
+			if tv, ok := value.(time.Time); ok {
+				return tv.Format(layout)
+			}
 			t, err := time.Parse(time.RFC3339, s)
 			if err != nil {
 				t, err = time.Parse("2006-01-02", s)
@@ -475,6 +538,22 @@ func defaultFuncs() htmltemplate.FuncMap {
 		"mul":      func(a, b interface{}) float64 { af, _ := asFloat(a); bf, _ := asFloat(b); return af * bf },
 		"div":      func(a, b interface{}) float64 { af, _ := asFloat(a); bf, _ := asFloat(b); if bf == 0 { return 0 }; return af / bf },
 
+		// Numeric comparators that override Go's strict built-ins. Go's
+		// html/template built-in gt/lt/eq/ne requires matching Kind — so
+		// `gt .qty 1` fails when .qty is float64 (JSON default) and 1 is
+		// int, or when .qty is a string like "2". Previously, a single
+		// failure here cascaded: Execute errored, we silently regex-
+		// fellback, and every pipe / range / if in the entire template
+		// disappeared from the output. Coercing through asFloat keeps
+		// these forgiving for common JSON-typed data; falls through to
+		// string comparison when either side isn't numeric.
+		"gt": compareCoerced(func(a, b float64) bool { return a > b }, func(a, b string) bool { return a > b }),
+		"ge": compareCoerced(func(a, b float64) bool { return a >= b }, func(a, b string) bool { return a >= b }),
+		"lt": compareCoerced(func(a, b float64) bool { return a < b }, func(a, b string) bool { return a < b }),
+		"le": compareCoerced(func(a, b float64) bool { return a <= b }, func(a, b string) bool { return a <= b }),
+		"eq": compareCoerced(func(a, b float64) bool { return a == b }, func(a, b string) bool { return a == b }),
+		"ne": compareCoerced(func(a, b float64) bool { return a != b }, func(a, b string) bool { return a != b }),
+
 		// String / text.
 		"ordinal":    ordinalFunc,
 		"pluralize":  pluralizeFunc,
@@ -528,6 +607,22 @@ func isZero(v interface{}) bool {
 		return len(x) == 0
 	}
 	return false
+}
+
+// compareCoerced builds a 2-arg template func that first tries to compare both
+// values as float64 (coercing int/float/string-numeric), falling back to
+// comparing their string representations. Used to replace Go's strict
+// built-in comparators (gt/lt/eq/...) which require identical reflect.Kind
+// and fail loudly on the JSON-typed data most authors work with.
+func compareCoerced(nums func(a, b float64) bool, strs func(a, b string) bool) func(a, b interface{}) bool {
+	return func(a, b interface{}) bool {
+		if af, aok := asFloat(a); aok {
+			if bf, bok := asFloat(b); bok {
+				return nums(af, bf)
+			}
+		}
+		return strs(fmt.Sprint(a), fmt.Sprint(b))
+	}
 }
 
 // asFloat converts common JSON-decoded number types to float64.
@@ -618,15 +713,30 @@ func asStringSlice(v interface{}) []string {
 
 // formatCurrency formats a value as a currency string. Uses a minimal
 // built-in formatter (no CLDR dep) — good enough for USD/EUR/GBP/INR/JPY.
-// Call: {{ .amount | formatCurrency "USD" }}
-func formatCurrency(v interface{}, code string) string {
-	f, ok := asFloat(v)
+//
+// Accepts BOTH Go-template call conventions:
+//
+//	{{ formatCurrency .amount "USD" }}   — direct call, value first
+//	{{ .amount | formatCurrency "USD" }} — pipe, value is last arg
+//
+// Pipe semantics in Go templates put the piped value as the FINAL argument,
+// so the second form resolves to `formatCurrency("USD", .amount)` — the
+// reverse of the static signature. We previously declared
+// `formatCurrency(v, code string)`, so pipe calls crashed inside
+// html/template's reflect dispatch with `expected string; got float64`,
+// which bubbled up to Execute and (silently) erased the entire pipe/range
+// portion of the rendered template via the regex fallback. Accepting two
+// `interface{}` args and auto-detecting which one is the currency code
+// makes both styles work transparently. Currency codes are short
+// all-uppercase ASCII, so the detection is unambiguous.
+func formatCurrency(a, b interface{}) string {
+	value, code := splitValueAndCode(a, b)
+	f, ok := asFloat(value)
 	if !ok {
-		return fmt.Sprint(v)
+		return fmt.Sprint(value)
 	}
 	code = strings.ToUpper(code)
 	sym := currencySymbol(code)
-	// Yen/Won: no decimals; others: 2 decimals.
 	decimals := 2
 	if code == "JPY" || code == "KRW" {
 		decimals = 0
@@ -634,17 +744,114 @@ func formatCurrency(v interface{}, code string) string {
 	return sym + formatWithCommas(f, decimals)
 }
 
-// formatNumber formats a number with thousands separators and the given decimals.
-// Call: {{ formatNumber .value 2 }}
-func formatNumber(v interface{}, decimals int) string {
-	f, ok := asFloat(v)
+// splitValueAndCode disambiguates (value, code) vs (code, value) by
+// recognising a currency code (2–4 all-uppercase ASCII letters). Falls
+// back to (a, b) when nothing looks like a code.
+func splitValueAndCode(a, b interface{}) (value interface{}, code string) {
+	if s, ok := b.(string); ok && looksLikeCurrencyCode(s) {
+		return a, s
+	}
+	if s, ok := a.(string); ok && looksLikeCurrencyCode(s) {
+		return b, s
+	}
+	// Nothing looks like a code — legacy (value, codeStr) order.
+	if s, ok := b.(string); ok {
+		return a, s
+	}
+	return a, fmt.Sprint(b)
+}
+
+// looksLikeTimeLayout reports whether the string is a Go time format layout.
+// Go's reference date is "Mon Jan 2 15:04:05 MST 2006" — any real layout
+// includes at least one of those tokens, while a user's actual date value
+// (e.g. "2026-04-24T10:00:00Z") does not.
+func looksLikeTimeLayout(s string) bool {
+	if s == "" {
+		return false
+	}
+	// Cheap substring checks for the most common reference tokens.
+	for _, tok := range []string{
+		"2006", "Jan", "January", "Mon", "Monday",
+		"15:04", "3:04", "PM", "MST",
+	} {
+		if strings.Contains(s, tok) {
+			return true
+		}
+	}
+	return false
+}
+
+func splitValueAndTimeLayout(a, b interface{}) (value interface{}, layout string) {
+	if s, ok := b.(string); ok && looksLikeTimeLayout(s) {
+		return a, s
+	}
+	if s, ok := a.(string); ok && looksLikeTimeLayout(s) {
+		return b, s
+	}
+	// Neither looks like a layout — assume legacy (value, layoutStr) order.
+	if s, ok := b.(string); ok {
+		return a, s
+	}
+	return a, fmt.Sprint(b)
+}
+
+func looksLikeCurrencyCode(s string) bool {
+	if len(s) < 2 || len(s) > 4 {
+		return false
+	}
+	for _, r := range s {
+		if r < 'A' || r > 'Z' {
+			return false
+		}
+	}
+	return true
+}
+
+// formatNumber formats a number with thousands separators and the given
+// decimals. Accepts both direct-call and pipe forms:
+//
+//	{{ formatNumber .value 2 }}
+//	{{ .value | formatNumber 2 }}
+//
+// When called with the pipe form the signature is effectively
+// `(decimals, value)`, so we auto-detect which arg is numeric-as-count
+// (int, small non-negative) vs the value to format.
+func formatNumber(a, b interface{}) string {
+	value, decimals := splitValueAndDecimals(a, b)
+	f, ok := asFloat(value)
 	if !ok {
-		return fmt.Sprint(v)
+		return fmt.Sprint(value)
 	}
 	if decimals < 0 {
 		decimals = 0
 	}
 	return formatWithCommas(f, decimals)
+}
+
+// splitValueAndDecimals disambiguates (value, decimals) vs (decimals, value).
+// A decimals arg is a small non-negative integer (0–8); when both args look
+// numeric we prefer the LAST as the value (matches pipe semantics).
+func splitValueAndDecimals(a, b interface{}) (value interface{}, decimals int) {
+	af, aIsNum := asFloat(a)
+	bf, bIsNum := asFloat(b)
+	aIsDec := aIsNum && af == float64(int(af)) && af >= 0 && af <= 8
+	bIsDec := bIsNum && bf == float64(int(bf)) && bf >= 0 && bf <= 8
+	// Prefer legacy direct-call (value, decimals) when b looks like decimals.
+	if bIsDec && !aIsDec {
+		return a, int(bf)
+	}
+	if aIsDec && !bIsDec {
+		return b, int(af)
+	}
+	// Both or neither look like decimals — fall back to pipe convention
+	// where the value is the last arg.
+	if aIsDec {
+		return b, int(af)
+	}
+	if bIsDec {
+		return a, int(bf)
+	}
+	return a, 2
 }
 
 func currencySymbol(code string) string {
@@ -711,6 +918,20 @@ func RenderWithLocale(ctx context.Context, src string, data map[string]interface
 // RenderHTML is the Chromium half of Render — takes already-substituted HTML
 // and prints it to PDF. Split out so other modes (e.g. markdown) can reuse the
 // pipeline after their own substitution.
+//
+// Staging note
+// ------------
+// chromedp.NewContext is lazy: the browser target (tab) isn't created
+// until the first chromedp.Run call, and even then Page.enable hasn't
+// fired and the frame tree is empty. Calling page.GetFrameTree() +
+// page.SetDocumentContent before a real navigation is the cause of the
+// `DOM.documentUpdated when there's no top-level frame` warning and
+// the subsequent hang — Chromium drops the document event because no
+// frame owns it, so WaitReady("body") waits forever. The reliable
+// pattern is to navigate to about:blank first (which materializes a
+// frame + document), then swap the content in. We also split the
+// render into its own chromedp.Run so per-phase timing is visible in
+// the logs, which is how we'd have caught this sooner.
 func RenderHTML(ctx context.Context, finalHTML string, l *layout.Layout) ([]byte, error) {
 	// Inject watermark CSS into the document if configured.
 	if css := l.WatermarkCSS(); css != "" {
@@ -732,7 +953,7 @@ func RenderHTML(ctx context.Context, finalHTML string, l *layout.Layout) ([]byte
 	browserCtx, cancel2 := chromedp.NewContext(allocCtx)
 	defer cancel2()
 
-	tctx, cancelT := context.WithTimeout(browserCtx, 30*time.Second)
+	tctx, cancelT := context.WithTimeout(browserCtx, renderTimeout())
 	defer cancelT()
 
 	paperW, paperH := l.PaperInches()
@@ -741,16 +962,42 @@ func RenderHTML(ctx context.Context, finalHTML string, l *layout.Layout) ([]byte
 	headerTpl := l.HeaderHTML()
 	footerTpl := l.FooterHTML()
 
-	var pdf []byte
+	// Phase 1 — force the target to fully materialize with an
+	// about:blank navigation. Everything after this can assume a real
+	// top-level frame exists.
+	t0 := time.Now()
+	if err := chromedp.Run(tctx, chromedp.Navigate("about:blank")); err != nil {
+		return nil, fmt.Errorf("chromium launch: %w", err)
+	}
+	tLaunch := time.Since(t0)
+
+	// Phase 2 — swap the document content into the now-real frame and
+	// wait for body to be attached. SetOuterHTML on the document can be
+	// flaky for <!DOCTYPE>-bearing strings, but SetDocumentContent on
+	// the top-level frame ID handles that cleanly.
+	t1 := time.Now()
 	err := chromedp.Run(tctx,
 		chromedp.ActionFunc(func(ctx context.Context) error {
 			frameTree, err := page.GetFrameTree().Do(ctx)
 			if err != nil {
-				return err
+				return fmt.Errorf("get frame tree: %w", err)
+			}
+			if frameTree == nil || frameTree.Frame == nil {
+				return fmt.Errorf("no top-level frame after about:blank")
 			}
 			return page.SetDocumentContent(frameTree.Frame.ID, finalHTML).Do(ctx)
 		}),
 		chromedp.WaitReady("body", chromedp.ByQuery),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("chromium set content: %w", err)
+	}
+	tContent := time.Since(t1)
+
+	// Phase 3 — print to PDF.
+	t2 := time.Now()
+	var pdf []byte
+	err = chromedp.Run(tctx,
 		chromedp.ActionFunc(func(ctx context.Context) error {
 			p := page.PrintToPDF().
 				WithPrintBackground(true).
@@ -771,8 +1018,17 @@ func RenderHTML(ctx context.Context, finalHTML string, l *layout.Layout) ([]byte
 		}),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("chromium render: %w", err)
+		return nil, fmt.Errorf("chromium print: %w", err)
 	}
+	tPrint := time.Since(t2)
+
+	slog.Info("chromium render",
+		"launch_ms", tLaunch.Milliseconds(),
+		"content_ms", tContent.Milliseconds(),
+		"print_ms", tPrint.Milliseconds(),
+		"html_bytes", len(finalHTML),
+		"pdf_bytes", len(pdf),
+	)
 	return pdf, nil
 }
 

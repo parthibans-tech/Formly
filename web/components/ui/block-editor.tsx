@@ -10,12 +10,14 @@ import { FileCode2, FileSignature, Hash, QrCode, ScrollText } from "lucide-react
 import {
   BlockNoteSchema,
   defaultBlockSpecs,
+  defaultInlineContentSpecs,
   filterSuggestionItems,
 } from "@blocknote/core";
 import {
   SuggestionMenuController,
   useCreateBlockNote,
   createReactBlockSpec,
+  createReactInlineContentSpec,
   getDefaultReactSlashMenuItems,
 } from "@blocknote/react";
 import { BlockNoteView } from "@blocknote/mantine";
@@ -27,6 +29,10 @@ import "@blocknote/mantine/style.css";
 export type BlockEditorRef = {
   toHTML: () => Promise<string>;
   loadFromHTML: (html: string) => Promise<void>;
+  // Insert plain text at the cursor. Used by the Fields sidebar in the
+  // HTML designer to drop `{{ .field }}` placeholders without forcing
+  // the user into the HTML tab.
+  insertText: (text: string) => void;
 };
 
 type Props = {
@@ -200,6 +206,217 @@ const PageBreakBlock = makeSpec(
   }
 );
 
+// -- Placeholder chip (inline content) --------------------------------------
+//
+// This is THE change that makes the editor approachable for non-technical
+// users. Every Go-template expression — `{{ .merchant.name }}`,
+// `{{ range .lines }}`, `{{ .paidAt | formatDate "…" }}` — renders as a
+// coloured pill with a friendly label (e.g. "Merchant › Name") instead of
+// raw mustache syntax. The original expression text is preserved in a prop
+// and serialized back out verbatim, so the server template pipeline is
+// unchanged.
+
+type ExprKind = "field" | "helper" | "logic";
+
+function titleCase(s: string): string {
+  return s
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .replace(/^./, (c) => c.toUpperCase());
+}
+
+function friendlyPathLabel(path: string): string {
+  return path.split(".").map(titleCase).join(" › ");
+}
+
+function logicLabel(inner: string): string {
+  const [kw, ...rest] = inner.split(/\s+/);
+  const arg = rest.join(" ").trim();
+  const dot = arg.match(/^\.([\w.]+)/);
+  const pretty = dot ? friendlyPathLabel(dot[1]) : arg;
+  switch (kw) {
+    case "if":
+      return pretty ? `If ${pretty}` : "If";
+    case "else":
+      return "Otherwise";
+    case "end":
+      return "End";
+    case "range":
+      return pretty ? `Repeat for each ${pretty}` : "Repeat";
+    case "with":
+      return pretty ? `With ${pretty}` : "With";
+    default:
+      return inner;
+  }
+}
+
+// classifyExpr extracts kind/label/expr from a raw `{{ … }}` snippet.
+function classifyExpr(expr: string): {
+  kind: ExprKind;
+  label: string;
+  expr: string;
+} {
+  const trimmed = expr.trim();
+  const inner = trimmed
+    .replace(/^\{\{\s*-?\s*/, "")
+    .replace(/\s*-?\s*\}\}$/, "")
+    .trim();
+
+  // Control flow keywords → logic chip
+  if (/^(if|else|end|range|with|define|template|block|break|continue)\b/.test(inner)) {
+    return { kind: "logic", label: logicLabel(inner), expr: trimmed };
+  }
+
+  // Pure field reference (with optional pipe filters): .path, .a.b | fmt …
+  const fieldMatch = inner.match(/^\.([\w.]+)/);
+  if (fieldMatch) {
+    return {
+      kind: "field",
+      label: friendlyPathLabel(fieldMatch[1]),
+      expr: trimmed,
+    };
+  }
+
+  // Helper invocation: `helperName .arg1 "x" …`
+  const helperMatch = inner.match(/^(\w+)(?:\s|$)/);
+  if (helperMatch) {
+    return { kind: "helper", label: helperMatch[1], expr: trimmed };
+  }
+
+  return { kind: "logic", label: inner, expr: trimmed };
+}
+
+// preprocessTemplateHTML walks text nodes and wraps every `{{ … }}` run in
+// `<span data-formly-expr="…">…</span>` so BlockNote's parser can match them
+// against our Placeholder inline-content spec. Attribute values (e.g.
+// `href="{{ .url }}"`) are left untouched because we only rewrite text nodes.
+function preprocessTemplateHTML(html: string): string {
+  if (!html || !html.includes("{{")) return html;
+  if (typeof window === "undefined") return html;
+  const doc = new DOMParser().parseFromString(
+    `<div id="__formly_root__">${html}</div>`,
+    "text/html"
+  );
+  const root = doc.getElementById("__formly_root__");
+  if (!root) return html;
+  const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const nodes: Text[] = [];
+  let n: Node | null;
+  while ((n = walker.nextNode())) nodes.push(n as Text);
+  const re = /\{\{[^{}]*\}\}/g;
+  for (const text of nodes) {
+    const data = text.data;
+    if (!data.includes("{{")) continue;
+    const matches: { start: number; end: number; expr: string }[] = [];
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(data))) {
+      matches.push({ start: m.index, end: m.index + m[0].length, expr: m[0] });
+    }
+    re.lastIndex = 0;
+    if (!matches.length) continue;
+    const frag = doc.createDocumentFragment();
+    let cursor = 0;
+    for (const hit of matches) {
+      if (hit.start > cursor) {
+        frag.appendChild(doc.createTextNode(data.slice(cursor, hit.start)));
+      }
+      const { kind, label } = classifyExpr(hit.expr);
+      const span = doc.createElement("span");
+      span.setAttribute("data-formly-expr", hit.expr);
+      span.setAttribute("data-formly-kind", kind);
+      span.setAttribute("data-formly-label", label);
+      span.textContent = hit.expr;
+      frag.appendChild(span);
+      cursor = hit.end;
+    }
+    if (cursor < data.length) {
+      frag.appendChild(doc.createTextNode(data.slice(cursor)));
+    }
+    text.parentNode?.replaceChild(frag, text);
+  }
+  return root.innerHTML;
+}
+
+const CHIP_PALETTE: Record<ExprKind, React.CSSProperties> = {
+  field: {
+    background: "rgb(219 234 254)", // sky-100
+    color: "rgb(29 78 216)", // blue-700
+    borderColor: "rgb(147 197 253)", // blue-300
+  },
+  helper: {
+    background: "rgb(237 233 254)", // violet-100
+    color: "rgb(91 33 182)", // violet-800
+    borderColor: "rgb(196 181 253)", // violet-300
+  },
+  logic: {
+    background: "rgb(244 244 245)", // zinc-100
+    color: "rgb(63 63 70)", // zinc-700
+    borderColor: "rgb(212 212 216)", // zinc-300
+  },
+};
+
+const makeInline: any = createReactInlineContentSpec;
+
+const PlaceholderChip = makeInline(
+  {
+    type: "placeholder",
+    propSchema: {
+      expr: { default: "" },
+      label: { default: "" },
+      kind: { default: "field" },
+    },
+    content: "none",
+  },
+  {
+    render: ({ inlineContent }: any) => {
+      const kind = (inlineContent.props.kind as ExprKind) || "field";
+      const label =
+        String(inlineContent.props.label || "") ||
+        String(inlineContent.props.expr || "");
+      return (
+        <span
+          contentEditable={false}
+          title={String(inlineContent.props.expr || "")}
+          style={{
+            display: "inline-block",
+            padding: "0 6px",
+            margin: "0 1px",
+            borderRadius: 4,
+            border: "1px solid",
+            fontSize: "0.85em",
+            fontWeight: 500,
+            lineHeight: 1.5,
+            verticalAlign: "baseline",
+            whiteSpace: "nowrap",
+            userSelect: "none",
+            cursor: "default",
+            ...CHIP_PALETTE[kind],
+          }}
+          data-formly-chip={kind}
+        >
+          {label}
+        </span>
+      );
+    },
+    parse: (element: HTMLElement) => {
+      if (element.tagName.toLowerCase() !== "span") return undefined;
+      const expr = element.getAttribute("data-formly-expr");
+      if (!expr) return undefined;
+      return {
+        expr,
+        label: element.getAttribute("data-formly-label") || expr,
+        kind: (element.getAttribute("data-formly-kind") as ExprKind) || "field",
+      };
+    },
+    // On export, emit a span that carries the original expression as its text
+    // content. The span is invisible in the rendered PDF (no styling), and
+    // Go's html/template processes the `{{ … }}` inside it identically to
+    // bare text.
+    toExternalHTML: ({ inlineContent }: any) => (
+      <span>{String(inlineContent.props.expr || "")}</span>
+    ),
+  }
+);
+
 const schema = BlockNoteSchema.create({
   blockSpecs: {
     ...(defaultBlockSpecs as any),
@@ -207,6 +424,10 @@ const schema = BlockNoteSchema.create({
     barcode: BarcodeBlock(),
     signature: SignatureBlock(),
     pageBreak: PageBreakBlock(),
+  },
+  inlineContentSpecs: {
+    ...(defaultInlineContentSpecs as any),
+    placeholder: PlaceholderChip,
   },
 }) as any;
 
@@ -234,13 +455,24 @@ function BlockEditorInner(
     return () => observer.disconnect();
   }, []);
 
+  // Suppress the onChange that fires immediately after the initial parse +
+  // replaceBlocks — the content hasn't actually changed from the user's
+  // perspective, and we don't want the chip round-trip to mutate the
+  // persisted source on first open.
+  const isInitialLoad = useRef(true);
+
   // Seed with initial HTML on mount.
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      if (!initialHTML) return;
+      if (!initialHTML) {
+        isInitialLoad.current = false;
+        return;
+      }
       try {
-        const blocks = await editor.tryParseHTMLToBlocks(initialHTML);
+        const blocks = await editor.tryParseHTMLToBlocks(
+          preprocessTemplateHTML(initialHTML)
+        );
         if (cancelled) return;
         if (blocks.length > 0) editor.replaceBlocks(editor.document, blocks);
       } catch {
@@ -251,6 +483,11 @@ function BlockEditorInner(
           },
         ] as any);
       }
+      // Let BlockNote's onChange fire once (from replaceBlocks) before we
+      // start forwarding edits upstream.
+      queueMicrotask(() => {
+        isInitialLoad.current = false;
+      });
     })();
     return () => {
       cancelled = true;
@@ -259,6 +496,7 @@ function BlockEditorInner(
   }, []);
 
   const emitChange = useCallback(async () => {
+    if (isInitialLoad.current) return;
     if (!onChangeRef.current) return;
     const html = await editor.blocksToHTMLLossy(editor.document);
     onChangeRef.current(html);
@@ -269,8 +507,53 @@ function BlockEditorInner(
     () => ({
       toHTML: async () => editor.blocksToHTMLLossy(editor.document),
       loadFromHTML: async (html: string) => {
-        const blocks = await editor.tryParseHTMLToBlocks(html);
+        const blocks = await editor.tryParseHTMLToBlocks(
+          preprocessTemplateHTML(html)
+        );
         if (blocks.length > 0) editor.replaceBlocks(editor.document, blocks);
+      },
+      insertText: (text: string) => {
+        // If the sidebar / command palette handed us a `{{ … }}` expression,
+        // drop it in as a proper Placeholder chip so the user sees a friendly
+        // pill instead of raw mustache text. Plain text still takes the
+        // normal path.
+        const trimmed = text.trim();
+        const isTemplate =
+          trimmed.startsWith("{{") && trimmed.endsWith("}}");
+        try {
+          if (isTemplate) {
+            const info = classifyExpr(trimmed);
+            editor.insertInlineContent([
+              {
+                type: "placeholder",
+                props: {
+                  expr: info.expr,
+                  label: info.label,
+                  kind: info.kind,
+                },
+              },
+              // Trailing space so the cursor lands after the chip and the
+              // user can continue typing without the chip absorbing input.
+              { type: "text", text: " ", styles: {} },
+            ] as any);
+            return;
+          }
+          editor.insertInlineContent([
+            { type: "text", text, styles: {} },
+          ] as any);
+        } catch {
+          // Fallback: append a paragraph when no cursor is available.
+          editor.insertBlocks(
+            [
+              {
+                type: "paragraph",
+                content: [{ type: "text", text, styles: {} }],
+              },
+            ] as any,
+            editor.getTextCursorPosition?.()?.block ?? editor.document[0],
+            "after"
+          );
+        }
       },
     }),
     [editor]
@@ -357,13 +640,21 @@ function BlockEditorInner(
       },
       {
         title: "Placeholder",
-        subtext: "Insert {{ .field }}",
+        subtext: "Insert a data field chip",
         icon: <FileCode2 className="h-4 w-4" />,
         aliases: ["placeholder", "field", "var", "variable"],
         group: "Template",
         onItemClick: () => {
           ed.insertInlineContent([
-            { type: "text", text: "{{ .field }}", styles: {} },
+            {
+              type: "placeholder",
+              props: {
+                expr: "{{ .field }}",
+                label: "Field",
+                kind: "field",
+              },
+            },
+            { type: "text", text: " ", styles: {} },
           ] as any);
         },
       },

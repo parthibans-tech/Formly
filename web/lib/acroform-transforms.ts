@@ -46,14 +46,54 @@ export const TRANSFORM_CATALOG: {
 ];
 
 // Normalize a legacy string transform ("uppercase") or undefined into a
-// structured Transform object.
+// structured Transform object. If an array pipeline is passed, the first
+// step is returned (use normalizePipeline for the full chain).
 export function normalizeTransform(raw: unknown): Transform {
   if (!raw) return { op: "none" };
   if (typeof raw === "string") return { op: (raw as TransformOp) || "none" };
+  if (Array.isArray(raw)) {
+    if (raw.length === 0) return { op: "none" };
+    return normalizeTransform(raw[0]);
+  }
   if (typeof raw === "object" && raw && "op" in (raw as any)) {
     return raw as Transform;
   }
   return { op: "none" };
+}
+
+// Coerce any legal transform representation into a pipeline (array) of
+// Transform objects. Empty or effectively no-op inputs return [].
+export function normalizePipeline(raw: unknown): Transform[] {
+  if (raw == null) return [];
+  if (Array.isArray(raw)) {
+    const out: Transform[] = [];
+    for (const step of raw) {
+      const t = normalizeTransform(step);
+      if (t.op && t.op !== "none") out.push(t);
+    }
+    return out;
+  }
+  const single = normalizeTransform(raw);
+  if (!single.op || single.op === "none") return [];
+  return [single];
+}
+
+// Apply a chain of transforms in order. Returns the final string result.
+// `value` is the raw input; `row` is the full data object for template/concat ops.
+export function applyTransformPipeline(
+  value: unknown,
+  raw: unknown,
+  row: Record<string, any> = {}
+): string {
+  const pipeline = normalizePipeline(raw);
+  if (pipeline.length === 0) {
+    return applyTransform(value, { op: "none" }, row);
+  }
+  let cur: unknown = value;
+  for (let i = 0; i < pipeline.length; i++) {
+    cur = applyTransform(cur, pipeline[i], row);
+  }
+  return typeof cur === "string" ? cur : String(cur ?? "");
 }
 
 export function applyTransform(
