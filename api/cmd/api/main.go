@@ -27,8 +27,10 @@ import (
 	"github.com/docforge/api/internal/mockdata"
 	"github.com/docforge/api/internal/observability"
 	"github.com/docforge/api/internal/memberships"
+	"github.com/docforge/api/internal/onlyoffice"
 	"github.com/docforge/api/internal/orggate"
 	"github.com/docforge/api/internal/platform"
+	"github.com/docforge/api/internal/vault"
 	"github.com/docforge/api/internal/platformaudit"
 	"github.com/docforge/api/internal/me"
 	"github.com/docforge/api/internal/orgdashboard"
@@ -46,6 +48,9 @@ import (
 	"github.com/docforge/api/internal/storage"
 	"github.com/docforge/api/internal/team"
 	"github.com/docforge/api/internal/templates"
+	"github.com/docforge/api/internal/mergerecipes"
+	"github.com/docforge/api/internal/pdfmerge"
+	"github.com/docforge/api/internal/textcontent"
 	"github.com/docforge/api/internal/webhooks"
 	"github.com/hibiken/asynq"
 	"github.com/go-chi/chi/v5"
@@ -88,6 +93,7 @@ func main() {
 	t.Queue = qc
 	f := files.New(pool, store)
 	f.Detector = t.DetectAndCreate
+	f.Queue = qc
 	img := images.New(pool, store)
 	md := mockdata.New(pool)
 	jh := jobs.New(pool)
@@ -114,11 +120,37 @@ func main() {
 	pr := presence.New(pool)
 	rl := reviewlinks.New(pool)
 
+	// ONLYOFFICE Document Server integration. Optional — if the JWT
+	// secret env var isn't set, we leave the routes unwired so deploys
+	// without a document server fall back to the existing behaviour
+	// (download / PDF-export). New() returns the config error so we can
+	// log it once at startup and move on.
+	oo, ooErr := onlyoffice.New(pool, store)
+	if ooErr != nil {
+		logger.Info("onlyoffice disabled", "reason", ooErr.Error())
+	}
+
+	// Code-editor (CodeMirror) backend. Pure GET/PUT of UTF-8 text;
+	// no third-party dance, just our API and the browser.
+	tc := textcontent.New(pool, store)
+
+	// PDF merge / stitch / page-ops module. Sync path runs inline for
+	// small native-PDF jobs; large or heterogeneous (DOCX/RTF/image)
+	// inputs route through asynq via the shared queue client.
+	pm := pdfmerge.New(pool, store, qc)
+
+	// Saved merge recipes — the productized merge module. CRUD lives
+	// in /v1/merge-recipes; running a recipe shares the merge_jobs
+	// table (and therefore /v1/merge-jobs/{id} polling) with the
+	// ad-hoc /v1/files/merge endpoint.
+	mr := mergerecipes.New(pool, store, t.Runner, pm, qc)
+
 	// Security & compliance handlers.
 	ad := audit.New(pool)
 	mf := mfa.New(pool, a)
 	ss := sessions.New(pool)
 	cp := compliance.New(pool)
+	vt := vault.New(pool)
 
 	// Super-admin user management (Phase 1 — list, lock, MFA reset,
 	// session revoke). Routes are protected by the requireSuperAdmin
@@ -191,6 +223,12 @@ func main() {
 			Action: action, IP: ip, UserAgent: ua, Meta: meta,
 		})
 	}
+
+	// Vault re-uses the same audit sink + the existing MFA hooks so
+	// unlocks get the same enforcement as fresh logins.
+	vt.AuditFn = a.AuditFn
+	vt.MFAVerify = mf.VerifyChallenge
+	vt.MFARequired = mf.ChallengeRequired
 
 	// Register the API key verifier with auth so Bearer tokens starting with
 	// `fk_` authenticate against the api_keys table instead of as a JWT. We
@@ -265,6 +303,16 @@ func main() {
 	r.Post("/v1/webhooks/razorpay", bl.RazorpayWebhook)
 	r.Post("/v1/webhooks/stripe", bl.StripeWebhook)
 
+	// ONLYOFFICE document server endpoints. Both content and callback
+	// are server-to-server (the document server hits us, not a browser),
+	// so they live in the public block — auth is enforced by the
+	// short-lived HMAC token + JWT-in-body that ONLYOFFICE attaches.
+	// Config is auth'd and lives in the Group() block below.
+	if oo != nil {
+		r.Get("/v1/files/{id}/onlyoffice/content", oo.Content)
+		r.Post("/v1/files/{id}/onlyoffice/callback", oo.Callback)
+	}
+
 	r.Group(func(r chi.Router) {
 		r.Use(a.Middleware)
 		// Org gate (Phase 3): enforce frozen / deleted flags before any
@@ -305,6 +353,41 @@ func main() {
 		// images / HTML / markdown uploaded before their detector
 		// shipped without forcing a re-upload.
 		r.Post("/v1/files/{id}/ensure-template", f.EnsureTemplate)
+		// Explicit, user-triggered office-doc → PDF export. The source
+		// stays in its original format; the PDF lands as a sibling row.
+		r.Post("/v1/files/{id}/export-pdf", f.ExportPDF)
+		// ONLYOFFICE editor config. Auth'd: enforces read/edit ACL and
+		// returns the JWT-signed config the browser feeds to DocsAPI.
+		// Content + callback (which are server-to-server) live in the
+		// public block above.
+		if oo != nil {
+			r.Get("/v1/files/{id}/onlyoffice/config", oo.Config)
+		}
+		// Code editor content read/write. Auth'd; ACL enforced inside
+		// the handler. Mounted next to the other file routes.
+		r.Get("/v1/files/{id}/content", tc.Get)
+		r.Put("/v1/files/{id}/content", tc.Put)
+		// PDF merge module. /v1/files/merge stitches N inputs into a
+		// new PDF; /v1/files/{id}/insert splices a source's pages into
+		// an existing PDF in place; /v1/files/{id}/pages handles
+		// rotate / remove / extract on a single PDF. Async jobs are
+		// reported via /v1/merge-jobs/{id}.
+		r.Post("/v1/files/merge", pm.Merge)
+		r.Post("/v1/files/{id}/insert", pm.Insert)
+		r.Post("/v1/files/{id}/pages", pm.PageOps)
+		r.Get("/v1/merge-jobs/{id}", pm.JobStatus)
+
+		// Saved merge recipes (the productized merge module).
+		// CRUD: list / get / create / update / delete. Running a
+		// recipe is a separate verb because it has side effects (new
+		// file row, optional async job).
+		r.Get("/v1/merge-recipes", mr.List)
+		r.Post("/v1/merge-recipes", mr.Create)
+		r.Get("/v1/merge-recipes/{id}", mr.Get)
+		r.Patch("/v1/merge-recipes/{id}", mr.Update)
+		r.Delete("/v1/merge-recipes/{id}", mr.Delete)
+		r.Get("/v1/merge-recipes/{id}/schema", mr.Schema)
+		r.Post("/v1/merge-recipes/{id}/run", mr.Run)
 		r.Get("/v1/files", f.List)
 		r.Get("/v1/files/{id}", f.Get)
 		r.Patch("/v1/files/{id}", f.Patch)
@@ -330,6 +413,15 @@ func main() {
 		r.Get("/v1/folders/{id}/breadcrumbs", fh.Breadcrumbs)
 		r.Patch("/v1/folders/{id}", fh.Patch)
 		r.Delete("/v1/folders/{id}", fh.Delete)
+
+		// Vault: per-folder lock toggle + global re-auth session.
+		// /vault/unlock issues a 5-minute unlock; locked folders return
+		// 423 until the caller has an active vault_sessions row.
+		r.Post("/v1/folders/{id}/lock", vt.LockFolder)
+		r.Delete("/v1/folders/{id}/lock", vt.UnlockFolder)
+		r.Get("/v1/vault/status", vt.Status)
+		r.Post("/v1/vault/unlock", vt.Unlock)
+		r.Post("/v1/vault/lock", vt.Lock)
 
 		// Shares (public token links).
 		r.Post("/v1/files/{id}/share", sh.Create)

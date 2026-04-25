@@ -3,11 +3,13 @@ package folders
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
 	"github.com/docforge/api/internal/auth"
 	"github.com/docforge/api/internal/sharing"
+	"github.com/docforge/api/internal/vault"
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -21,6 +23,12 @@ type folderDTO struct {
 	ParentID  *string   `json:"parentId"`
 	Name      string    `json:"name"`
 	CreatedAt time.Time `json:"createdAt"`
+	// Locked = folder is part of the vault. The web UI uses this to
+	// render the lock chip and decide whether to prompt for re-auth on
+	// click. Listing children of a locked folder still requires the
+	// caller to have an active vault session — see vault.RequireUnlocked.
+	Locked   bool   `json:"locked"`
+	LockedAt string `json:"lockedAt,omitempty"`
 }
 
 type createReq struct {
@@ -68,7 +76,21 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	parent := q.Get("parent") // empty = root
 	orgWide := c.IsAdmin() && q.Get("scope") == "org"
 
-	sql := `SELECT id, parent_id, name, created_at FROM folders
+	// Listing children of a locked folder requires an unlocked vault.
+	// Root listings (parent="") are always allowed — they only show
+	// folder *names* (and a `locked` flag the UI can chip), not contents.
+	if parent != "" {
+		if err := vault.RequireUnlocked(r.Context(), h.DB, c.UserID, parent); err != nil {
+			if errors.Is(err, vault.ErrLocked) {
+				vault.WriteLockedError(w)
+				return
+			}
+			writeErr(w, 500, "db_error", err.Error())
+			return
+		}
+	}
+
+	sql := `SELECT id, parent_id, name, created_at, locked_at FROM folders
 		 WHERE org_id=$1 AND (($2='' AND parent_id IS NULL) OR parent_id::text=$2)`
 	args := []any{c.OrgID, parent}
 	if !orgWide {
@@ -86,9 +108,14 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	out := []folderDTO{}
 	for rows.Next() {
 		var f folderDTO
-		if err := rows.Scan(&f.ID, &f.ParentID, &f.Name, &f.CreatedAt); err != nil {
+		var lockedAt *time.Time
+		if err := rows.Scan(&f.ID, &f.ParentID, &f.Name, &f.CreatedAt, &lockedAt); err != nil {
 			writeErr(w, 500, "db_error", err.Error())
 			return
+		}
+		if lockedAt != nil {
+			f.Locked = true
+			f.LockedAt = lockedAt.UTC().Format(time.RFC3339)
 		}
 		out = append(out, f)
 	}

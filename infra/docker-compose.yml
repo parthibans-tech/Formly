@@ -37,6 +37,46 @@ services:
       mc mb --ignore-existing local/docforge || true
       "
 
+  # ONLYOFFICE Document Server (Community Edition, AGPL).
+  #
+  # Runs alongside the rest of the dev stack on port 8090. JWT is
+  # mandatory in production builds — we share the same secret via the
+  # ONLYOFFICE_JWT_SECRET env var that the Go API also reads, so configs
+  # the API mints can be verified by the document server, and save
+  # callbacks the document server posts can be verified by the API.
+  #
+  # Network reachability: the ONLYOFFICE container runs in the compose
+  # network and needs to reach the Go API (which runs on the host on
+  # :8080) to fetch document bytes and to receive save callbacks. On
+  # Docker Desktop (macOS / Windows) the magic hostname
+  # `host.docker.internal` resolves to the host. On Linux dev machines
+  # the equivalent is enabled by `extra_hosts` below.
+  #
+  # The Community edition is capped at 20 concurrent edit-mode
+  # connections per server; that's plenty for early users. Mitigations
+  # (default-to-view-mode, idle-tab disconnect, multi-instance sharding)
+  # live in the API/UI layer, not here.
+  onlyoffice:
+    image: onlyoffice/documentserver:latest
+    ports:
+      - "8090:80"
+    environment:
+      JWT_ENABLED: "true"
+      JWT_SECRET: ${ONLYOFFICE_JWT_SECRET:-dev-onlyoffice-secret}
+      JWT_HEADER: "Authorization"
+      JWT_IN_BODY: "true"
+      # ONLYOFFICE caches its document conversion outputs locally; in dev
+      # we just let it churn on the container filesystem.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - onlyoffice_data:/var/www/onlyoffice/Data
+      - onlyoffice_log:/var/log/onlyoffice
+      - onlyoffice_cache:/var/lib/onlyoffice/documentserver/App_Data/cache/files
+
 volumes:
   pgdata:
   miniodata:
+  onlyoffice_data:
+  onlyoffice_log:
+  onlyoffice_cache:

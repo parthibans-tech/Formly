@@ -222,7 +222,17 @@ func isMarkdown(mime, name string) bool {
 		return true
 	}
 	ext := strings.ToLower(filepath.Ext(name))
-	return ext == ".md" || ext == ".markdown"
+	switch ext {
+	case ".md", ".markdown":
+		return true
+	}
+	// Plain text (.txt / text/plain) intentionally falls through. It
+	// used to be treated as markdown here so the markdown designer
+	// would pick it up; that conflated "edit text" with "edit a
+	// templated markdown document" and surprised users who just wanted
+	// to open a .txt. Plain text now routes to the ONLYOFFICE document
+	// editor instead (see internal/onlyoffice.IsEditableByOnlyOffice).
+	return false
 }
 
 // detectMarkdown behaves like detectHTML but stores mode="markdown".

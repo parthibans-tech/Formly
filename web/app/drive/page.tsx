@@ -25,6 +25,8 @@ import {
   KeyRound,
   LayoutList,
   Link2,
+  Lock,
+  LockOpen,
   MoreHorizontal,
   Move,
   PencilLine,
@@ -41,12 +43,25 @@ import {
   X,
 } from "lucide-react";
 import { api, ApiError, clearSession, getToken, getUser } from "@/lib/api";
+import {
+  canExportPDF,
+  canOpenInCodeEditor,
+  canOpenInDesigner,
+  canOpenInOnlyOffice,
+  openInCodeEditor,
+  openInDesigner as openInDesignerShared,
+  openInOnlyOffice,
+  requestPDFExport,
+} from "@/lib/file-open";
 import { useToast } from "@/components/toast";
 import {
   UploadConflictDialog,
   type ConflictChoice,
   type UploadConflict,
 } from "@/components/upload-conflict-dialog";
+import { UploadDropzone } from "@/components/upload-dropzone";
+import { MergeFilesDialog } from "@/components/merge-files-dialog";
+import { InsertPagesDialog } from "@/components/insert-pages-dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -126,6 +141,18 @@ type FileItem = {
   createdAt: string;
   // Per-user starred flag (see api/internal/files — starred_files JOIN).
   starred?: boolean;
+  // Office-doc preview pipeline. Populated for sources that go through
+  // soffice convert-to-pdf. When convertStatus is "ready" or
+  // "macro_warning", previewPdfId points at the sibling PDF row.
+  previewPdfId?: string | null;
+  convertStatus?:
+    | "pending"
+    | "ready"
+    | "failed"
+    | "unsupported"
+    | "macro_warning"
+    | null;
+  convertWarning?: string | null;
 };
 
 type Folder = {
@@ -133,6 +160,11 @@ type Folder = {
   parentId: string | null;
   name: string;
   createdAt: string;
+  // Locked = folder is part of the vault. Server returns 423 when listing
+  // contents without an active vault session — the global VaultUnlockProvider
+  // intercepts that and prompts for re-auth automatically.
+  locked?: boolean;
+  lockedAt?: string;
 };
 
 type Share = {
@@ -199,6 +231,12 @@ export default function DrivePage() {
     "all" | "templates" | "pdf" | "html" | "markdown" | "image" | "other"
   >("all");
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  // PDF merge / insert dialog state. mergeOpen drives the multi-file
+  // stitch flow (bulk toolbar entry); insertFor drives the single-PDF
+  // splice flow (row-action entry on PDF rows). Mutually exclusive in
+  // practice — only one dialog mounts at a time.
+  const [mergeOpen, setMergeOpen] = useState(false);
+  const [insertFor, setInsertFor] = useState<{ id: string; name: string } | null>(null);
   const [dropTargetFolder, setDropTargetFolder] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
@@ -339,6 +377,51 @@ export default function DrivePage() {
     }
   }
 
+  // uploadMany sequences a batch of dropped files through the existing
+  // upload() pipeline. Sequential (not parallel) on purpose:
+  //
+  //   - Storage presign + complete + template-detect happen per file;
+  //     parallelizing them would multiply the load on the API for
+  //     little user-visible win on a typical 1–10 file drop.
+  //   - The conflict dialog is single-instance — running uploads in
+  //     parallel would race two files into the same prompt and the
+  //     UX would devolve into confusion.
+  //   - load() runs once at the end so the file list updates in a
+  //     single re-render instead of flickering on every completion.
+  async function uploadMany(files: File[]) {
+    for (const f of files) {
+      // Skip files that show up empty (rare but possible — e.g. user
+      // drops a 0-byte file on macOS). The presign endpoint would
+      // accept it; we'd just have a useless empty file in Drive.
+      if (f.size === 0) {
+        toast.show("info", `Skipped empty file ${f.name}`);
+        continue;
+      }
+      // upload() already handles its own toasts and conflict prompt.
+      // Awaiting in serial means the conflict dialog can't be
+      // double-mounted by a second drop arriving mid-prompt.
+      // eslint-disable-next-line no-await-in-loop
+      await upload(f);
+    }
+  }
+
+  // openInDesigner: thin wrapper around the shared helper for the
+  // PDF / form-style designer flows (image / markdown / html / pdf /
+  // text + office docs that already have a ready PDF preview). DOCX
+  // and friends *without* a preview route to ONLYOFFICE via
+  // openInOnlyOffice — the document editor is the right surface for
+  // native DOCX editing, the PDF designer is not.
+  async function openInDesigner(f: FileItem) {
+    try {
+      const id = await openInDesignerShared(f, (href) => router.push(href));
+      if (!id) {
+        toast.show("error", "No designer available for this file type.");
+      }
+    } catch (e: any) {
+      toast.show("error", e.message);
+    }
+  }
+
   async function download(id: string) {
     try {
       const { downloadUrl } = await api<{ downloadUrl: string }>(
@@ -443,6 +526,32 @@ export default function DrivePage() {
     try {
       await api(`/v1/folders/${f.id}`, { method: "DELETE" });
       toast.show("success", "Folder deleted");
+      await load();
+    } catch (e: any) {
+      toast.show("error", e.message);
+    }
+  }
+
+  // Toggle the vault lock on a folder. Locking adds the folder to the
+  // vault — anyone (including the owner) listing or downloading from
+  // it has to re-authenticate first. Unlocking is owner/admin-only and
+  // is the only way to remove a folder from the vault permanently;
+  // re-auth only opens a 5-minute window.
+  async function toggleFolderLock(f: Folder) {
+    const next = !f.locked;
+    const ok = await confirm({
+      title: next ? `Lock "${f.name}"?` : `Remove lock from "${f.name}"?`,
+      description: next
+        ? "Anyone accessing this folder will need to re-enter their password."
+        : "The folder will be accessible without re-authentication.",
+      confirmLabel: next ? "Lock folder" : "Remove lock",
+    });
+    if (!ok) return;
+    try {
+      await api(`/v1/folders/${f.id}/lock`, {
+        method: next ? "POST" : "DELETE",
+      });
+      toast.show("success", next ? "Folder locked" : "Lock removed");
       await load();
     } catch (e: any) {
       toast.show("error", e.message);
@@ -829,6 +938,26 @@ export default function DrivePage() {
         placeholder: "Search files and folders…",
       }}
     >
+      {/* Drag-and-drop upload. Listens at window level so the user
+          can drop anywhere inside /drive — the visual overlay only
+          appears while a file drag is in progress. We disable it
+          while an upload is mid-flight so a second drop can't
+          double-fire the conflict dialog. */}
+      <UploadDropzone
+        disabled={!!uploading}
+        label="Drop to upload"
+        sublabel={
+          breadcrumbs.length > 0
+            ? `Uploading to ${breadcrumbs[breadcrumbs.length - 1].name}`
+            : "Uploading to My Drive"
+        }
+        onFiles={(files) => void uploadMany(files)}
+        onFolderRejected={() =>
+          toast.show("info", "Folder uploads aren't supported yet", {
+            description: "Drop individual files, or zip the folder first.",
+          })
+        }
+      />
       <div>
         {/* Breadcrumb */}
         <nav aria-label="Breadcrumb" className="mb-3">
@@ -961,10 +1090,18 @@ export default function DrivePage() {
             <input
               ref={inputRef}
               type="file"
+              multiple
               className="hidden"
               onChange={(e) => {
-                const f = e.target.files?.[0];
-                if (f) upload(f);
+                // Route through uploadMany so the picker behaves the
+                // same as the drag-and-drop overlay — sequential
+                // uploads, single re-render at the end.
+                const list = e.target.files;
+                if (list && list.length > 0) {
+                  const files: File[] = [];
+                  for (let i = 0; i < list.length; i++) files.push(list[i]);
+                  void uploadMany(files);
+                }
                 e.target.value = "";
               }}
             />
@@ -1166,6 +1303,22 @@ export default function DrivePage() {
                 <Download className="h-4 w-4" />
                 Download
               </Button>
+              {/* Merge into a single PDF — only relevant for 2+ files,
+                  and only when at least one is something we can convert
+                  (PDF, image, or office doc). The dialog enforces the
+                  details; this gate just keeps the button unobtrusive
+                  when the selection is e.g. all .zip archives. */}
+              {selected.size >= 2 && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setMergeOpen(true)}
+                  title="Stitch the selected files into a single PDF"
+                >
+                  <FileType2 className="h-4 w-4" />
+                  Merge to PDF
+                </Button>
+              )}
               <Button
                 variant="ghost"
                 size="sm"
@@ -1376,6 +1529,15 @@ export default function DrivePage() {
                         <span className="font-medium text-foreground group-hover:text-primary">
                           {f.name}
                         </span>
+                        {f.locked && (
+                          <span
+                            className="inline-flex items-center gap-1 rounded-full bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400"
+                            title="Locked folder — re-auth required"
+                          >
+                            <Lock className="h-3 w-3" />
+                            Locked
+                          </span>
+                        )}
                       </Link>
                     </td>
                     <td className="hidden px-3 py-2 text-xs text-muted-foreground md:table-cell">
@@ -1416,6 +1578,19 @@ export default function DrivePage() {
                             <Users className="h-4 w-4" />
                             Share with people
                           </DropdownMenuItem>
+                          <DropdownMenuItem onClick={() => toggleFolderLock(f)}>
+                            {f.locked ? (
+                              <>
+                                <LockOpen className="h-4 w-4" />
+                                Remove lock
+                              </>
+                            ) : (
+                              <>
+                                <Lock className="h-4 w-4" />
+                                Lock folder
+                              </>
+                            )}
+                          </DropdownMenuItem>
                           <DropdownMenuSeparator />
                           <DropdownMenuItem
                             onClick={() => deleteFolder(f)}
@@ -1445,40 +1620,37 @@ export default function DrivePage() {
                       }}
                       onClick={async (e) => {
                         if ((e.target as HTMLElement).closest("button,a")) return;
-                        if (file.templateId) {
-                          router.push(`/templates/${file.templateId}/designer`);
+                        // DOCX / RTF / ODT / TXT always route to the
+                        // ONLYOFFICE document editor on click. The
+                        // document editor edits the source bytes, which
+                        // is what users intuitively expect from a
+                        // double-click on a .docx or .txt. The form/
+                        // static designer is still available via the
+                        // row menu for files that have a templateId or
+                        // a ready PDF preview attached.
+                        if (canOpenInOnlyOffice(file)) {
+                          openInOnlyOffice(file, (href) => router.push(href));
                           return;
                         }
-                        // Images / HTML / markdown uploaded before the
-                        // detector shipped have no templateId on their
-                        // files row — ask the server to backfill one
-                        // (idempotent; returns an existing ID if the
-                        // detector already ran). Falls through to the
-                        // old behaviour if the file isn't a known type.
-                        const isImage = file.mime.startsWith("image/") && !file.mime.includes("svg");
-                        if (isImage) {
-                          try {
-                            const { templateId } = await api<{ templateId: string }>(
-                              `/v1/files/${file.id}/ensure-template`,
-                              { method: "POST" }
-                            );
-                            if (templateId) {
-                              router.push(`/templates/${templateId}/designer`);
-                              return;
-                            }
-                          } catch (err: any) {
-                            toast.show("error", err.message);
-                            return;
-                          }
+                        // Source code / config / plain-text route to
+                        // the in-app CodeMirror editor. Sits between
+                        // ONLYOFFICE (which owns docx/xlsx/pptx) and
+                        // the designer (which owns pdf/image/html/md).
+                        if (canOpenInCodeEditor(file)) {
+                          openInCodeEditor(file, (href) => router.push(href));
+                          return;
+                        }
+                        // PDF / image / markdown / html / native templates
+                        // route to the form/static designer.
+                        if (canOpenInDesigner(file)) {
+                          await openInDesigner(file);
+                          return;
                         }
                         if (file.mime === "application/pdf") {
-                          // Plain PDFs now open an in-app preview instead
-                          // of a silent download. Users can still hit
-                          // Download from the preview or the row menu.
                           setPreviewFor(file);
-                        } else {
-                          download(file.id);
+                          return;
                         }
+                        download(file.id);
                       }}
                       className={cn(
                         "group cursor-pointer border-b last:border-0 transition-colors hover:bg-muted/40",
@@ -1571,7 +1743,38 @@ export default function DrivePage() {
                             </Button>
                           </DropdownMenuTrigger>
                           <DropdownMenuContent align="end" className="w-48">
-                            {file.templateId && (
+                            {/* Office files (DOCX/RTF/ODT/TXT) get the
+                                document editor only. Any templateId on
+                                these is leftover from earlier auto-
+                                detect runs (e.g. .txt → markdown) and
+                                surfacing a "Open designer" entry on top
+                                of it just confuses the user. The form/
+                                static designer is the right tool for
+                                derived PDFs, not for the source bytes
+                                of a Word doc. */}
+                            {canOpenInOnlyOffice(file) ? (
+                              <DropdownMenuItem
+                                onClick={() =>
+                                  openInOnlyOffice(file, (href) =>
+                                    router.push(href)
+                                  )
+                                }
+                              >
+                                <PencilLine className="h-4 w-4" />
+                                Open in document editor
+                              </DropdownMenuItem>
+                            ) : canOpenInCodeEditor(file) ? (
+                              <DropdownMenuItem
+                                onClick={() =>
+                                  openInCodeEditor(file, (href) =>
+                                    router.push(href)
+                                  )
+                                }
+                              >
+                                <PencilLine className="h-4 w-4" />
+                                Open in code editor
+                              </DropdownMenuItem>
+                            ) : file.templateId ? (
                               <DropdownMenuItem asChild>
                                 <Link
                                   href={`/templates/${file.templateId}/designer`}
@@ -1580,7 +1783,12 @@ export default function DrivePage() {
                                   Open designer
                                 </Link>
                               </DropdownMenuItem>
-                            )}
+                            ) : canOpenInDesigner(file) ? (
+                              <DropdownMenuItem onClick={() => openInDesigner(file)}>
+                                <PencilLine className="h-4 w-4" />
+                                Open designer
+                              </DropdownMenuItem>
+                            ) : null}
                             {!file.templateId &&
                               file.mime === "application/pdf" && (
                                 <DropdownMenuItem
@@ -1590,12 +1798,63 @@ export default function DrivePage() {
                                   Preview
                                 </DropdownMenuItem>
                               )}
+                            {/* Insert pages from another file into this
+                                PDF in place. Only meaningful for native
+                                PDFs (the splice happens against an
+                                existing PDF; non-PDF rows would need to
+                                be exported first via a separate flow). */}
+                            {!file.templateId &&
+                              file.mime === "application/pdf" && (
+                                <DropdownMenuItem
+                                  onClick={() =>
+                                    setInsertFor({
+                                      id: file.id,
+                                      name: file.name,
+                                    })
+                                  }
+                                >
+                                  <FileType2 className="h-4 w-4" />
+                                  Insert pages…
+                                </DropdownMenuItem>
+                              )}
                             <DropdownMenuItem
                               onClick={() => download(file.id)}
                             >
                               <Download className="h-4 w-4" />
                               Download
                             </DropdownMenuItem>
+                            {canExportPDF(file) && (
+                              <DropdownMenuItem
+                                onClick={async () => {
+                                  try {
+                                    await requestPDFExport(file.id);
+                                    toast.show(
+                                      "success",
+                                      "Exporting to PDF",
+                                      {
+                                        description:
+                                          "We'll add the PDF as a sibling file when it's ready.",
+                                      }
+                                    );
+                                    setFiles((xs) =>
+                                      xs.map((x) =>
+                                        x.id === file.id
+                                          ? { ...x, convertStatus: "pending" }
+                                          : x
+                                      )
+                                    );
+                                  } catch (e: any) {
+                                    toast.show("error", e.message);
+                                  }
+                                }}
+                                disabled={file.convertStatus === "pending"}
+                              >
+                                <Download className="h-4 w-4" />
+                                {file.convertStatus === "pending"
+                                  ? "Exporting…"
+                                  : "Export as PDF"}
+                              </DropdownMenuItem>
+                            )}
                             <DropdownMenuItem
                               onClick={() =>
                                 setSharePeopleFor({
@@ -1673,6 +1932,7 @@ export default function DrivePage() {
                             type: "folder",
                           })
                         }
+                        onToggleLock={() => toggleFolderLock(f)}
                       />
                     ))}
                   </div>
@@ -1704,7 +1964,16 @@ export default function DrivePage() {
                         // the "menu click also downloaded the file"
                         // confusion.
                         onOpenDetails={
-                          file.templateId
+                          // Office files always route to the document
+                          // editor on card click. Designer access for
+                          // templated files lives in the menuItems list
+                          // below so it stays one click away without
+                          // hijacking the primary open action.
+                          canOpenInOnlyOffice(file)
+                            ? () => openInOnlyOffice(file, (href) => router.push(href))
+                            : canOpenInCodeEditor(file)
+                            ? () => openInCodeEditor(file, (href) => router.push(href))
+                            : file.templateId
                             ? () => router.push(`/templates/${file.templateId}/designer`)
                             : file.mime === "application/pdf"
                               ? () => setPreviewFor(file)
@@ -1728,17 +1997,52 @@ export default function DrivePage() {
                         }
                         onDownload={() => download(file.id)}
                         menuItems={[
-                          file.templateId ? {
+                          canOpenInOnlyOffice(file) ? {
+                            label: "Open in document editor",
+                            icon: <PencilLine className="h-4 w-4" />,
+                            onClick: () => openInOnlyOffice(file, (href) => router.push(href)),
+                          } : null,
+                          !canOpenInOnlyOffice(file) && canOpenInCodeEditor(file) ? {
+                            label: "Open in code editor",
+                            icon: <PencilLine className="h-4 w-4" />,
+                            onClick: () => openInCodeEditor(file, (href) => router.push(href)),
+                          } : null,
+                          !canOpenInOnlyOffice(file) && !canOpenInCodeEditor(file) && file.templateId ? {
                             label: "Open designer",
                             icon: <PencilLine className="h-4 w-4" />,
                             href: `/templates/${file.templateId}/designer`,
-                          } : null,
+                          } : !canOpenInOnlyOffice(file) && !canOpenInCodeEditor(file) && canOpenInDesigner(file)
+                            ? {
+                                label: "Open designer",
+                                icon: <PencilLine className="h-4 w-4" />,
+                                onClick: () => openInDesigner(file),
+                              }
+                            : null,
                           !file.templateId && file.mime === "application/pdf" ? {
                             label: "Preview",
                             icon: <Eye className="h-4 w-4" />,
                             onClick: () => setPreviewFor(file),
                           } : null,
                           { label: "Download", icon: <Download className="h-4 w-4" />, onClick: () => download(file.id) },
+                          canExportPDF(file) ? {
+                            label: file.convertStatus === "pending" ? "Exporting…" : "Export as PDF",
+                            icon: <Download className="h-4 w-4" />,
+                            onClick: async () => {
+                              try {
+                                await requestPDFExport(file.id);
+                                toast.show("success", "Exporting to PDF", {
+                                  description: "We'll add the PDF as a sibling file when it's ready.",
+                                });
+                                setFiles((xs) =>
+                                  xs.map((x) =>
+                                    x.id === file.id ? { ...x, convertStatus: "pending" } : x
+                                  )
+                                );
+                              } catch (e: any) {
+                                toast.show("error", e.message);
+                              }
+                            },
+                          } : null,
                           { label: "Share with people", icon: <Users className="h-4 w-4" />, onClick: () => setSharePeopleFor({ id: file.id, name: file.name, type: "file" }) },
                           { label: "Get link…", icon: <Share2 className="h-4 w-4" />, onClick: () => setShareFor(file) },
                           { label: "Move…", icon: <Move className="h-4 w-4" />, onClick: () => moveFile(file) },
@@ -1825,6 +2129,48 @@ export default function DrivePage() {
           onShare={() => {
             setShareFor(previewFor);
             setPreviewFor(null);
+          }}
+        />
+      )}
+
+      {/* Multi-file → single-PDF stitch. We feed the dialog the
+          currently-selected files so the user sees the same set they
+          ticked in the toolbar. Drop into the active folder so the
+          merged PDF lands next to its inputs. */}
+      {mergeOpen && (
+        <MergeFilesDialog
+          open={mergeOpen}
+          onOpenChange={setMergeOpen}
+          files={files
+            .filter((f) => selected.has(f.id))
+            .map((f) => ({
+              id: f.id,
+              name: f.name,
+              mime: f.mime,
+              size: f.size,
+            }))}
+          defaultFolderId={currentFolderId || null}
+          onMerged={async (id) => {
+            // Refresh so the new file appears, then clear the
+            // selection — it's no longer relevant.
+            await load();
+            clearSelection();
+            void id;
+          }}
+        />
+      )}
+
+      {/* Single-PDF page splice. Target row's id/name comes from the
+          row-action callback; the dialog handles source picker + page
+          range + splice point internally. */}
+      {insertFor && (
+        <InsertPagesDialog
+          open={!!insertFor}
+          onOpenChange={(o) => !o && setInsertFor(null)}
+          targetId={insertFor.id}
+          targetName={insertFor.name}
+          onInserted={() => {
+            void load();
           }}
         />
       )}

@@ -33,6 +33,11 @@ export type FileItem = {
   // this file. Optional because the server may omit it on views that
   // don't join starred_files (older handlers, public share endpoints).
   starred?: boolean;
+  // Office-doc preview pipeline. previewPdfId points at a sibling
+  // converted PDF row when convertStatus === 'ready' (or 'macro_warning').
+  previewPdfId?: string | null;
+  convertStatus?: "pending" | "ready" | "failed" | "unsupported" | "macro_warning" | null;
+  convertWarning?: string | null;
 };
 
 type RowAction = {
@@ -285,6 +290,7 @@ export function FileList({
                           Template
                         </Badge>
                       )}
+                      <ConvertChip file={file} />
                     </div>
                   </div>
                 </td>
@@ -338,6 +344,52 @@ export function FileList({
       </table>
     </div>
   );
+}
+
+// ConvertChip surfaces the office-doc → PDF conversion state next to a
+// file's name. Shown only when the source is going through (or has been
+// through) soffice; PDFs/images leave convertStatus null and render
+// nothing. Pending → spinner-style chip; failed/unsupported → muted
+// "no preview"; macro_warning → amber advisory; ready is silent because
+// the user already sees a PDF preview.
+function ConvertChip({ file }: { file: FileItem }) {
+  const s = file.convertStatus;
+  if (!s) return null;
+  switch (s) {
+    case "pending":
+      return (
+        <Badge variant="secondary" className="mt-0.5 text-[10px]">
+          Converting…
+        </Badge>
+      );
+    case "failed":
+      return (
+        <Badge
+          variant="secondary"
+          className="mt-0.5 border-rose-200 bg-rose-50 text-[10px] text-rose-700 dark:border-rose-900 dark:bg-rose-950 dark:text-rose-300"
+        >
+          Preview unavailable
+        </Badge>
+      );
+    case "unsupported":
+      return (
+        <Badge variant="secondary" className="mt-0.5 text-[10px]">
+          No preview
+        </Badge>
+      );
+    case "macro_warning":
+      return (
+        <Badge
+          variant="secondary"
+          className="mt-0.5 border-amber-200 bg-amber-50 text-[10px] text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200"
+          title={file.convertWarning ?? "Macros stripped during conversion"}
+        >
+          Macros stripped
+        </Badge>
+      );
+    default:
+      return null;
+  }
 }
 
 export function fmtSize(b: number) {

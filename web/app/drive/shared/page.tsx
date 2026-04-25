@@ -16,6 +16,14 @@ import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Download, Eye, PencilLine, Share2, Star } from "lucide-react";
 import { api, getUser } from "@/lib/api";
+import {
+  canOpenInCodeEditor,
+  canOpenInDesigner,
+  canOpenInOnlyOffice,
+  openInCodeEditor,
+  openInDesigner,
+  openInOnlyOffice,
+} from "@/lib/file-open";
 import { useToast } from "@/components/toast";
 import { AppShell } from "@/components/app-shell";
 import { FileList, type FileItem } from "@/components/file-list";
@@ -167,15 +175,55 @@ export default function SharedWithMePage() {
             const shared = f as SharedFileItem;
             const canEdit = shared.role === "editor";
             return [
-              // Viewers get a read-only "Open" (preview); editors see
-              // "Open designer" when the file has a template attached.
-              ...(f.templateId && canEdit
+              // Editors see the right "Open …" entry. DOCX-style files
+              // route to the document editor (ONLYOFFICE); everything
+              // else flows through the PDF designer. Viewers get a
+              // read-only Preview entry below.
+              ...(canEdit && canOpenInOnlyOffice(f)
+                ? [
+                    {
+                      label: "Open in document editor",
+                      icon: <PencilLine className="h-4 w-4" />,
+                      onClick: () =>
+                        openInOnlyOffice(f, (href) => router.push(href)),
+                    },
+                  ]
+                : []),
+              ...(canEdit &&
+              !canOpenInOnlyOffice(f) &&
+              canOpenInCodeEditor(f)
+                ? [
+                    {
+                      label: "Open in code editor",
+                      icon: <PencilLine className="h-4 w-4" />,
+                      onClick: () =>
+                        openInCodeEditor(f, (href) => router.push(href)),
+                    },
+                  ]
+                : []),
+              ...(canEdit &&
+              !canOpenInOnlyOffice(f) &&
+              !canOpenInCodeEditor(f) &&
+              canOpenInDesigner(f)
                 ? [
                     {
                       label: "Open designer",
                       icon: <PencilLine className="h-4 w-4" />,
-                      onClick: () =>
-                        router.push(`/templates/${f.templateId}/designer`),
+                      onClick: async () => {
+                        try {
+                          const id = await openInDesigner(f, (href) =>
+                            router.push(href)
+                          );
+                          if (!id) {
+                            toast.show(
+                              "error",
+                              "No designer available for this file type."
+                            );
+                          }
+                        } catch (e: any) {
+                          toast.show("error", e.message);
+                        }
+                      },
                     },
                   ]
                 : []),

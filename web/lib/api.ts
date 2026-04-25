@@ -57,10 +57,20 @@ export class ApiError extends Error {
   }
 }
 
-export async function api<T = any>(path: string, init: RequestInit = {}): Promise<T> {
+// vaultUnlocker is set by the <VaultUnlockProvider> at the app root.
+// When the API returns 423 vault_locked, api() pauses, calls this hook
+// to pop the re-auth modal, and — if the user successfully unlocks —
+// transparently retries the original request once. If no provider is
+// mounted (e.g. on the public form pages), 423 just throws.
+let vaultUnlocker: (() => Promise<boolean>) | null = null;
+export function setVaultUnlocker(fn: (() => Promise<boolean>) | null) {
+  vaultUnlocker = fn;
+}
+
+async function doFetch(path: string, init: RequestInit) {
   const token = getToken();
   const isFormData = init.body instanceof FormData;
-  const res = await fetch(`${API_URL}${path}`, {
+  return fetch(`${API_URL}${path}`, {
     ...init,
     headers: {
       ...(isFormData ? {} : { "Content-Type": "application/json" }),
@@ -68,6 +78,19 @@ export async function api<T = any>(path: string, init: RequestInit = {}): Promis
       ...(init.headers || {}),
     },
   });
+}
+
+export async function api<T = any>(path: string, init: RequestInit = {}): Promise<T> {
+  let res = await doFetch(path, init);
+  // 423 = folder vault locked. Pop the re-auth modal and retry once.
+  // The retry is single-shot: if the modal closes without unlocking
+  // (or unlock fails), we fall through to the normal error path.
+  if (res.status === 423 && vaultUnlocker) {
+    const unlocked = await vaultUnlocker();
+    if (unlocked) {
+      res = await doFetch(path, init);
+    }
+  }
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: { message: res.statusText } }));
     const err = body.error ?? {};

@@ -69,6 +69,65 @@ func (c *Client) PresignPut(ctx context.Context, key string, ttl time.Duration) 
 	return u.String(), nil
 }
 
+// PostUpload bundles everything a browser needs to POST a multipart form
+// upload to the bucket. The fields map carries the signature, policy
+// hash, and other AWS-style form parameters; the URL is the bucket
+// endpoint. Clients build a FormData with every field plus a final
+// "file" part and POST to the URL.
+type PostUpload struct {
+	URL    string            `json:"url"`
+	Fields map[string]string `json:"fields"`
+}
+
+// PresignPost returns a presigned POST policy that lets the browser
+// upload directly to the bucket. Unlike PresignedPutObject, this lets us
+// bake hard constraints into the policy itself:
+//
+//   - content-length range — MinIO refuses oversize uploads at the edge,
+//     so we don't waste bandwidth/storage on a payload we'd reject anyway.
+//   - exact key — clients can't rewrite the object key.
+//   - content-type — clients can't lie about the type at the storage
+//     layer (they still can to our API, but the stored object's
+//     Content-Type matches what was advertised).
+//
+// `expectedMime` is what the client claimed when calling our presign
+// endpoint; we lock the storage object to that value. `maxBytes` comes
+// from the resolved upload policy.
+func (c *Client) PresignPost(
+	ctx context.Context,
+	key, expectedMime string,
+	maxBytes int64,
+	ttl time.Duration,
+) (*PostUpload, error) {
+	pp := minio.NewPostPolicy()
+	if err := pp.SetBucket(c.bucket); err != nil {
+		return nil, err
+	}
+	if err := pp.SetKey(key); err != nil {
+		return nil, err
+	}
+	if err := pp.SetExpires(time.Now().UTC().Add(ttl)); err != nil {
+		return nil, err
+	}
+	if expectedMime == "" {
+		expectedMime = "application/octet-stream"
+	}
+	if err := pp.SetContentType(expectedMime); err != nil {
+		return nil, err
+	}
+	// Min 1 byte (so empty uploads aren't silently accepted), max from
+	// policy. SetContentLengthRange is what makes the bucket reject
+	// >maxBytes at write time.
+	if err := pp.SetContentLengthRange(1, maxBytes); err != nil {
+		return nil, err
+	}
+	u, fields, err := c.publicMC.PresignedPostPolicy(ctx, pp)
+	if err != nil {
+		return nil, err
+	}
+	return &PostUpload{URL: u.String(), Fields: fields}, nil
+}
+
 func (c *Client) PresignGet(ctx context.Context, key, filename string, ttl time.Duration) (string, error) {
 	params := url.Values{}
 	if filename != "" {
@@ -127,6 +186,30 @@ func (c *Client) GetBytes(ctx context.Context, key string) ([]byte, error) {
 	}
 	defer obj.Close()
 	return io.ReadAll(obj)
+}
+
+// HeadBytes reads the first `n` bytes of the object via a Range request,
+// without pulling down the full payload. Used by the upload-policy MIME
+// sniffer (n=512 is enough for http.DetectContentType to do its job).
+func (c *Client) HeadBytes(ctx context.Context, key string, n int) ([]byte, error) {
+	if n <= 0 {
+		return nil, nil
+	}
+	opts := minio.GetObjectOptions{}
+	if err := opts.SetRange(0, int64(n-1)); err != nil {
+		return nil, err
+	}
+	obj, err := c.mc.GetObject(ctx, c.bucket, key, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer obj.Close()
+	buf := make([]byte, n)
+	read, err := io.ReadFull(obj, buf)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return nil, err
+	}
+	return buf[:read], nil
 }
 
 func getenv(k, def string) string {

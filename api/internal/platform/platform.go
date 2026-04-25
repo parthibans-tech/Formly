@@ -139,6 +139,13 @@ var scopeRules = []scopeRequirement{
 	{prefix: "/v1/templates", method: "", scope: "templates:write"},
 	// Generation
 	{prefix: "/v1/templates", method: "POST", scope: "generate:write"},
+	// Merge recipes — the productized merge module. Read covers list /
+	// get / schema (all the integrator needs to discover the data
+	// shape); write covers create/update/delete and POST .../run
+	// (running has the side effect of creating an output file, hence
+	// write semantics).
+	{prefix: "/v1/merge-recipes", method: "GET", scope: "merge:read"},
+	{prefix: "/v1/merge-recipes", method: "", scope: "merge:write"},
 	// Shares
 	{prefix: "/v1/shares", method: "", scope: "shares:write"},
 	// Webhooks

@@ -8,6 +8,14 @@ import { useToast } from "@/components/toast";
 import { useConfirm } from "@/components/ui/confirm";
 import { AppShell } from "@/components/app-shell";
 import { FileList, type FileItem } from "@/components/file-list";
+import {
+  canOpenInCodeEditor,
+  canOpenInDesigner,
+  canOpenInOnlyOffice,
+  openInCodeEditor,
+  openInDesigner,
+  openInOnlyOffice,
+} from "@/lib/file-open";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/ui/empty-state";
 import { ViewToggle } from "@/components/view-toggle";
@@ -121,13 +129,50 @@ export default function RecentPage() {
           actorLabel="You opened"
           onToggleStar={toggleStar}
           actions={(f) => [
-            ...(f.templateId
+            // DOCX / RTF / ODT / TXT — native document editor. Always
+            // exposed when the file type qualifies; the form/static
+            // designer (when a template exists) is rendered as a
+            // separate entry below so power users can still reach it.
+            ...(canOpenInOnlyOffice(f)
+              ? [
+                  {
+                    label: "Open in document editor",
+                    icon: <PencilLine className="h-4 w-4" />,
+                    onClick: () =>
+                      openInOnlyOffice(f, (href) => router.push(href)),
+                  },
+                ]
+              : []),
+            ...(!canOpenInOnlyOffice(f) && canOpenInCodeEditor(f)
+              ? [
+                  {
+                    label: "Open in code editor",
+                    icon: <PencilLine className="h-4 w-4" />,
+                    onClick: () =>
+                      openInCodeEditor(f, (href) => router.push(href)),
+                  },
+                ]
+              : []),
+            ...(!canOpenInOnlyOffice(f) && !canOpenInCodeEditor(f) && canOpenInDesigner(f)
               ? [
                   {
                     label: "Open designer",
                     icon: <PencilLine className="h-4 w-4" />,
-                    onClick: () =>
-                      router.push(`/templates/${f.templateId}/designer`),
+                    onClick: async () => {
+                      try {
+                        const id = await openInDesigner(f, (href) =>
+                          router.push(href)
+                        );
+                        if (!id) {
+                          toast.show(
+                            "error",
+                            "No designer available for this file type."
+                          );
+                        }
+                      } catch (e: any) {
+                        toast.show("error", e.message);
+                      }
+                    },
                   },
                 ]
               : []),

@@ -130,6 +130,19 @@ func (r *Runner) render(ctx context.Context, orgID, templateID string, data map[
 	return output, tplName, nil
 }
 
+// RenderInline returns the rendered bytes WITHOUT persisting them to
+// the files table or uploading to storage. Used by merge-recipes when
+// a template component participates in a stitched output: the template
+// PDF is an intermediate artefact, not a file the user expects to see
+// in their drive. The merge-recipes runner pipes these bytes straight
+// into pdfmerge.AssembleInline.
+//
+// Returns (output bytes, template name) — the latter is handy for
+// fallback filenames when the recipe doesn't set output_name_template.
+func (r *Runner) RenderInline(ctx context.Context, orgID, templateID string, data map[string]interface{}, flatten bool) ([]byte, string, error) {
+	return r.render(ctx, orgID, templateID, data, flatten)
+}
+
 // Run loads a template and renders it with the supplied data. The output is
 // persisted as a new File row and uploaded to MinIO. Returns a Result.
 //

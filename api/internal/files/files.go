@@ -3,6 +3,7 @@ package files
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"path/filepath"
@@ -11,12 +12,44 @@ import (
 
 	"github.com/docforge/api/internal/auth"
 	"github.com/docforge/api/internal/billing"
+	"github.com/docforge/api/internal/docconvert"
 	"github.com/docforge/api/internal/events"
+	"github.com/docforge/api/internal/queue"
 	"github.com/docforge/api/internal/sharing"
 	"github.com/docforge/api/internal/storage"
+	"github.com/docforge/api/internal/uploadpolicy"
+	"github.com/docforge/api/internal/vault"
 	"github.com/go-chi/chi/v5"
+	"github.com/hibiken/asynq"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// vaultGateFile resolves the file's folder_id and refuses access when
+// that folder (or an ancestor) is locked and the caller's vault is
+// closed. Used by Get and Download — list views gate via the `?folder=`
+// query parameter directly. Returns true when the request should
+// continue; false when a 423/error has already been written to w.
+func (h *Handler) vaultGateFile(w http.ResponseWriter, r *http.Request, fileID, userID string) bool {
+	var folderID *string
+	if err := h.DB.QueryRow(r.Context(),
+		`SELECT folder_id::text FROM files WHERE id=$1`, fileID,
+	).Scan(&folderID); err != nil {
+		// File doesn't exist → let the caller's regular 404 path handle it.
+		return true
+	}
+	if folderID == nil || *folderID == "" {
+		return true
+	}
+	if err := vault.RequireUnlocked(r.Context(), h.DB, userID, *folderID); err != nil {
+		if errors.Is(err, vault.ErrLocked) {
+			vault.WriteLockedError(w)
+			return false
+		}
+		writeErr(w, 500, "db_error", err.Error())
+		return false
+	}
+	return true
+}
 
 // Detector runs after a file upload completes. It may return a template ID if one was created.
 type Detector func(ctx context.Context, fileID, orgID, name, mime, storageKey string) (string, error)
@@ -25,6 +58,14 @@ type Handler struct {
 	DB       *pgxpool.Pool
 	Storage  *storage.Client
 	Detector Detector
+	// Queue enqueues async jobs (today: convert-to-PDF for office docs).
+	// Optional — when nil, conversion is skipped silently and the source
+	// file is left without a preview rather than blocking the upload.
+	Queue *asynq.Client
+	// Policy resolves the layered upload-security configuration (product
+	// defaults → per-org overrides). Required for CreateUploadURL and
+	// Complete. main.go wires this in after construction.
+	Policy *uploadpolicy.Service
 }
 
 func New(db *pgxpool.Pool, s *storage.Client) *Handler {
@@ -44,11 +85,24 @@ type fileDTO struct {
 	// this file. Computed via a LEFT JOIN against starred_files so
 	// the whole list returns in a single round trip.
 	Starred bool `json:"starred"`
+	// Office-doc preview pipeline. Populated for sources that go
+	// through soffice convert-to-pdf. NULL/empty for files that need
+	// no conversion (PDF, image) or where conversion hasn't run yet.
+	PreviewPdfID    *string `json:"previewPdfId,omitempty"`
+	ConvertStatus   *string `json:"convertStatus,omitempty"`
+	ConvertWarning  *string `json:"convertWarning,omitempty"`
 }
 
 type uploadURLReq struct {
 	Name string `json:"name"`
 	Mime string `json:"mime"`
+	// Declared content length. Required when the upload-policy enforces a
+	// max size — the server validates this against the resolved policy
+	// before issuing the presign and bakes the same ceiling into the
+	// presigned POST policy so MinIO refuses oversize uploads at the
+	// edge. Pass 0 (or omit) for clients that legitimately don't know
+	// the size up front; the Complete handler still re-checks.
+	Size int64 `json:"size,omitempty"`
 	// Optional destination folder (empty / omitted = root). Passing this
 	// up-front lets the collision check run against the correct scope —
 	// previously the client uploaded to root and then PATCHed folder_id,
@@ -62,9 +116,22 @@ type uploadURLReq struct {
 }
 
 type uploadURLResp struct {
-	FileID    string `json:"fileId"`
-	UploadURL string `json:"uploadUrl"`
-	Key       string `json:"key"`
+	FileID string `json:"fileId"`
+	// UploadURL is the legacy presigned-PUT URL. Kept for backward compat
+	// with clients that haven't migrated to the POST flow yet, but new
+	// code should use Upload below — the POST policy carries the storage-
+	// layer content-length-range enforcement.
+	UploadURL string `json:"uploadUrl,omitempty"`
+	// Upload is the presigned POST descriptor (URL + form fields). This
+	// is the canonical upload path: the bucket policy hard-caps the
+	// content length, locks the object key, and pins the content type
+	// so a malicious client can't stream gigabytes or overwrite a
+	// neighbour's key.
+	Upload *storage.PostUpload `json:"upload,omitempty"`
+	// MaxBytes echoes the resolved policy ceiling so the web client can
+	// reject the file in the picker before even POSTing back to us.
+	MaxBytes int64  `json:"maxBytes,omitempty"`
+	Key      string `json:"key"`
 	// True when the server auto-renamed the file (conflict=keep path).
 	// The client reads this so it can show the actual saved name in the
 	// success toast instead of the one the user dropped in.
@@ -343,6 +410,58 @@ func (h *Handler) EnsureTemplate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"templateId": tplID, "created": true})
 }
 
+// ExportPDF enqueues a worker-side LibreOffice conversion of a DOCX/RTF/ODT
+// /etc. source file to PDF. The PDF lands as a sibling files row linked
+// via files.preview_pdf_id; the source row's convert_status flips
+// pending → ready. Idempotent: re-running on a file with an existing
+// ready preview just re-runs the conversion (asynq handler overwrites
+// the link). This is the *user-triggered* counterpart to what used to
+// happen automatically on upload — drive semantics demand the source
+// stays in its original format unless the user opts in.
+func (h *Handler) ExportPDF(w http.ResponseWriter, r *http.Request) {
+	c := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
+	id := chi.URLParam(r, "id")
+
+	var name, mime string
+	if err := h.DB.QueryRow(r.Context(),
+		`SELECT name, mime FROM files WHERE id=$1 AND org_id=$2 AND trashed_at IS NULL`,
+		id, c.OrgID,
+	).Scan(&name, &mime); err != nil {
+		writeErr(w, 404, "not_found", "file not found")
+		return
+	}
+	if docconvert.IsExplicitlyUnsupported(mime, name) {
+		writeErr(w, 400, "unsupported_format", "PDF export not supported for this file type")
+		return
+	}
+	if !docconvert.IsConvertible(mime, name) {
+		writeErr(w, 400, "not_convertible", "PDF export only available for office documents")
+		return
+	}
+	if h.Queue == nil {
+		writeErr(w, 503, "queue_unavailable", "conversion worker not configured")
+		return
+	}
+	if _, err := h.DB.Exec(r.Context(),
+		`UPDATE files SET convert_status='pending', convert_warning=NULL, updated_at=now() WHERE id=$1`, id,
+	); err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+	task, err := queue.NewConvertToPDF(queue.ConvertToPDFPayload{
+		OrgID: c.OrgID, UserID: c.UserID, FileID: id,
+	})
+	if err != nil {
+		writeErr(w, 500, "queue_error", err.Error())
+		return
+	}
+	if _, err := h.Queue.EnqueueContext(r.Context(), task); err != nil {
+		writeErr(w, 500, "queue_error", err.Error())
+		return
+	}
+	writeJSON(w, 202, map[string]any{"ok": true, "convertStatus": "pending"})
+}
+
 func (h *Handler) Complete(w http.ResponseWriter, r *http.Request) {
 	c := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
 	id := chi.URLParam(r, "id")
@@ -391,6 +510,12 @@ func (h *Handler) Complete(w http.ResponseWriter, r *http.Request) {
 			resp["templateId"] = tplID
 		}
 	}
+
+	// PDF conversion is opt-in (POST /v1/files/{id}/export-pdf), not a
+	// silent on-ingest pipeline. A drive's job is to preserve the source
+	// bytes — DOCX should round-trip as DOCX, not be flattened to PDF
+	// behind the user's back. The conversion machinery is still here
+	// for the explicit Export action; we just don't trigger it here.
 	events.Publish(r.Context(), events.FileUploaded, c.OrgID, map[string]interface{}{
 		"fileId":     id,
 		"name":       name,
@@ -434,10 +559,18 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	// separate endpoint and keeps the visibility/scope logic in one place.
 	baseSelect := `SELECT files.id, files.name, files.mime, files.size, files.status,
 	                       files.template_id, files.folder_id, files.created_at,
-	                       (sf.user_id IS NOT NULL) AS starred
+	                       (sf.user_id IS NOT NULL) AS starred,
+	                       files.preview_pdf_id::text, files.convert_status, files.convert_warning
 	               FROM files
 	               LEFT JOIN starred_files sf
 	                 ON sf.file_id = files.id AND sf.user_id = $1::uuid`
+
+	// Hide preview-PDF children produced by the office-doc convert
+	// pipeline. Those rows exist so we can store and serve a sibling
+	// PDF, but they should never appear in listings — the user already
+	// sees the source DOC/RTF/etc. and would otherwise see two rows
+	// for the same logical document.
+	hidePreviews := ` AND NOT EXISTS (SELECT 1 FROM files src WHERE src.preview_pdf_id = files.id)`
 
 	var sql string
 	var args []any
@@ -445,21 +578,21 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	case "trashed":
 		vis, vargs := visClause(3)
 		sql = baseSelect + `
-		       WHERE files.org_id=$2 AND files.trashed_at IS NOT NULL` + vis + `
+		       WHERE files.org_id=$2 AND files.trashed_at IS NOT NULL` + vis + hidePreviews + `
 		       ORDER BY files.created_at DESC
 		       LIMIT 200`
 		args = append([]any{c.UserID, c.OrgID}, vargs...)
 	case "templates":
 		vis, vargs := visClause(3)
 		sql = baseSelect + `
-		       WHERE files.org_id=$2 AND files.trashed_at IS NULL AND files.template_id IS NOT NULL` + vis + `
+		       WHERE files.org_id=$2 AND files.trashed_at IS NULL AND files.template_id IS NOT NULL` + vis + hidePreviews + `
 		       ORDER BY files.created_at DESC
 		       LIMIT 200`
 		args = append([]any{c.UserID, c.OrgID}, vargs...)
 	case "recent":
 		vis, vargs := visClause(3)
 		sql = baseSelect + `
-		       WHERE files.org_id=$2 AND files.trashed_at IS NULL` + vis + `
+		       WHERE files.org_id=$2 AND files.trashed_at IS NULL` + vis + hidePreviews + `
 		       ORDER BY files.created_at DESC
 		       LIMIT 50`
 		args = append([]any{c.UserID, c.OrgID}, vargs...)
@@ -473,16 +606,30 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 		vis, vargs := visClause(3)
 		sql = baseSelect + `
 		       WHERE files.org_id=$2 AND files.trashed_at IS NULL
-		         AND sf.user_id IS NOT NULL` + vis + `
+		         AND sf.user_id IS NOT NULL` + vis + hidePreviews + `
 		       ORDER BY sf.created_at DESC
 		       LIMIT 200`
 		args = append([]any{c.UserID, c.OrgID}, vargs...)
 	default:
 		folder := q.Get("folder") // "" = root
+		// Listing a locked folder requires an unlocked vault. We only
+		// gate the named-folder path; root and view-based listings
+		// (recent/starred/templates) span every folder and would be
+		// unusable if any one locked folder turned them off.
+		if folder != "" {
+			if err := vault.RequireUnlocked(r.Context(), h.DB, c.UserID, folder); err != nil {
+				if errors.Is(err, vault.ErrLocked) {
+					vault.WriteLockedError(w)
+					return
+				}
+				writeErr(w, 500, "db_error", err.Error())
+				return
+			}
+		}
 		vis, vargs := visClause(4)
 		sql = baseSelect + `
 		       WHERE files.org_id=$2 AND files.trashed_at IS NULL
-		         AND (($3='' AND files.folder_id IS NULL) OR files.folder_id::text=$3)` + vis + `
+		         AND (($3='' AND files.folder_id IS NULL) OR files.folder_id::text=$3)` + vis + hidePreviews + `
 		       ORDER BY files.created_at DESC`
 		args = append([]any{c.UserID, c.OrgID, folder}, vargs...)
 	}
@@ -496,7 +643,7 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	out := []fileDTO{}
 	for rows.Next() {
 		var f fileDTO
-		if err := rows.Scan(&f.ID, &f.Name, &f.Mime, &f.Size, &f.Status, &f.TemplateID, &f.FolderID, &f.CreatedAt, &f.Starred); err != nil {
+		if err := rows.Scan(&f.ID, &f.Name, &f.Mime, &f.Size, &f.Status, &f.TemplateID, &f.FolderID, &f.CreatedAt, &f.Starred, &f.PreviewPdfID, &f.ConvertStatus, &f.ConvertWarning); err != nil {
 			writeErr(w, 500, "db_error", err.Error())
 			return
 		}
@@ -540,17 +687,21 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "not_found", "file not found")
 		return
 	}
+	if !h.vaultGateFile(w, r, id, c.UserID) {
+		return
+	}
 	var f fileDTO
 	if err := h.DB.QueryRow(r.Context(),
 		`SELECT files.id, files.name, files.mime, files.size, files.status,
 		        files.template_id, files.folder_id, files.created_at,
-		        (sf.user_id IS NOT NULL) AS starred
+		        (sf.user_id IS NOT NULL) AS starred,
+		        files.preview_pdf_id::text, files.convert_status, files.convert_warning
 		 FROM files
 		 LEFT JOIN starred_files sf
 		   ON sf.file_id = files.id AND sf.user_id = $3::uuid
 		 WHERE files.id=$1 AND files.org_id=$2 AND files.trashed_at IS NULL`,
 		id, c.OrgID, c.UserID,
-	).Scan(&f.ID, &f.Name, &f.Mime, &f.Size, &f.Status, &f.TemplateID, &f.FolderID, &f.CreatedAt, &f.Starred); err != nil {
+	).Scan(&f.ID, &f.Name, &f.Mime, &f.Size, &f.Status, &f.TemplateID, &f.FolderID, &f.CreatedAt, &f.Starred, &f.PreviewPdfID, &f.ConvertStatus, &f.ConvertWarning); err != nil {
 		writeErr(w, 404, "not_found", "file not found")
 		return
 	}
@@ -619,6 +770,9 @@ func (h *Handler) Download(w http.ResponseWriter, r *http.Request) {
 	}
 	if !ok {
 		writeErr(w, 404, "not_found", "file not found")
+		return
+	}
+	if !h.vaultGateFile(w, r, id, c.UserID) {
 		return
 	}
 	var key, name string
@@ -722,6 +876,15 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "not_found", "file not found")
 		return
 	}
+	// Cascade the trash flag to any office-doc preview PDF child so the
+	// converted sibling doesn't linger as a hidden orphan after the source
+	// is gone. Best-effort — the user-visible source is already in trash.
+	_, _ = h.DB.Exec(r.Context(),
+		`UPDATE files SET trashed_at=now()
+		   WHERE id = (SELECT preview_pdf_id FROM files WHERE id=$1)
+		     AND org_id=$2 AND trashed_at IS NULL`,
+		id, c.OrgID,
+	)
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
@@ -761,6 +924,19 @@ func (h *Handler) Purge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Capture the office-doc preview child (if any) before we DELETE the
+	// source row. The FK is ON DELETE SET NULL on the source side, so
+	// deleting the source doesn't touch the preview row — we'd leak an
+	// orphan PDF (and its blob) if we didn't grab it now.
+	var previewID, previewKey string
+	_ = h.DB.QueryRow(r.Context(),
+		`SELECT p.id::text, p.storage_key
+		   FROM files src
+		   JOIN files p ON p.id = src.preview_pdf_id
+		  WHERE src.id=$1 AND src.org_id=$2`,
+		id, c.OrgID,
+	).Scan(&previewID, &previewKey)
+
 	tag, err := h.DB.Exec(r.Context(),
 		`DELETE FROM files WHERE id=$1 AND org_id=$2 AND trashed_at IS NOT NULL `+ownerFilter,
 		args...,
@@ -781,6 +957,12 @@ func (h *Handler) Purge(w http.ResponseWriter, r *http.Request) {
 	// up. The storage layer is expected to have its own orphan sweeper.
 	if storageKey != "" {
 		_ = h.Storage.Remove(r.Context(), storageKey)
+	}
+	if previewID != "" {
+		_, _ = h.DB.Exec(r.Context(), `DELETE FROM files WHERE id=$1`, previewID)
+		if previewKey != "" {
+			_ = h.Storage.Remove(r.Context(), previewKey)
+		}
 	}
 
 	writeJSON(w, 200, map[string]any{"ok": true})

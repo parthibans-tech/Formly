@@ -50,9 +50,15 @@ const DialogContent = React.forwardRef<
 ));
 DialogContent.displayName = DialogPrimitive.Content.displayName;
 
+// pr-8 reserves a fixed gutter on the right so DialogPrimitive.Close
+// (absolutely positioned at right-4 top-4 inside DialogContent) never
+// overlaps the title or description text. Previously long titles /
+// descriptions could run under the X icon — visually noisy and the X
+// became hard to hit. This is the single fix for every dialog in the
+// app, instead of every caller remembering to add their own padding.
 const DialogHeader = ({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) => (
   <div
-    className={cn("flex flex-col space-y-1.5 text-left", className)}
+    className={cn("flex flex-col space-y-1.5 pr-8 text-left", className)}
     {...props}
   />
 );

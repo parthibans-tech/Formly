@@ -1,7 +1,15 @@
 "use client";
 
 import Link from "next/link";
-import { Folder as FolderIcon, MoreHorizontal, PencilLine, Trash2, Users } from "lucide-react";
+import {
+  Folder as FolderIcon,
+  Lock,
+  LockOpen,
+  MoreHorizontal,
+  PencilLine,
+  Trash2,
+  Users,
+} from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -17,6 +25,7 @@ export type GridFolder = {
   parentId: string | null;
   name: string;
   createdAt: string;
+  locked?: boolean;
 };
 
 type Props = {
@@ -28,6 +37,7 @@ type Props = {
   onRename: () => void;
   onDelete: () => void;
   onShare?: () => void;
+  onToggleLock?: () => void;
 };
 
 export function FolderGridCard({
@@ -39,6 +49,7 @@ export function FolderGridCard({
   onRename,
   onDelete,
   onShare,
+  onToggleLock,
 }: Props) {
   return (
     <div
@@ -74,6 +85,14 @@ export function FolderGridCard({
         <span className="truncate text-[13px] font-medium text-foreground">
           {folder.name}
         </span>
+        {folder.locked && (
+          <span
+            className="inline-flex items-center gap-1 rounded-full bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400"
+            title="Locked folder — re-auth required"
+          >
+            <Lock className="h-3 w-3" />
+          </span>
+        )}
       </Link>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
@@ -95,6 +114,21 @@ export function FolderGridCard({
             <DropdownMenuItem onClick={onShare}>
               <Users className="h-4 w-4" />
               Share with people
+            </DropdownMenuItem>
+          )}
+          {onToggleLock && (
+            <DropdownMenuItem onClick={onToggleLock}>
+              {folder.locked ? (
+                <>
+                  <LockOpen className="h-4 w-4" />
+                  Remove lock
+                </>
+              ) : (
+                <>
+                  <Lock className="h-4 w-4" />
+                  Lock folder
+                </>
+              )}
             </DropdownMenuItem>
           )}
           <DropdownMenuSeparator />

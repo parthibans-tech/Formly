@@ -45,6 +45,12 @@ export type GridFile = {
   // Per-user starred flag. Rendered as a star overlay on the thumbnail
   // when true; toggles via `onToggleStar`.
   starred?: boolean;
+  // Office-doc preview pipeline. Drives a small status chip on the
+  // grid card and routes the thumbnail/preview to the converted PDF
+  // when ready. Null on files that don't go through soffice.
+  previewPdfId?: string | null;
+  convertStatus?: "pending" | "ready" | "failed" | "unsupported" | "macro_warning" | null;
+  convertWarning?: string | null;
 };
 
 export type GridCardMenuItem = {
@@ -332,9 +338,55 @@ export function FileGridCard({
             Template
           </Badge>
         )}
+        <ConvertChip file={file} />
       </div>
     </div>
   );
+}
+
+// ConvertChip: same status semantics as the FileList chip — only shown
+// when the file goes through the office-doc conversion pipeline. Sized
+// for the grid-card footer (text-[9px], tucked to the right with ml-auto
+// when no Template badge is present).
+function ConvertChip({ file }: { file: GridFile }) {
+  const s = file.convertStatus;
+  if (!s) return null;
+  const base = "text-[9px]" + (file.templateId ? "" : " ml-auto");
+  switch (s) {
+    case "pending":
+      return (
+        <Badge variant="secondary" className={base}>
+          Converting…
+        </Badge>
+      );
+    case "failed":
+      return (
+        <Badge
+          variant="secondary"
+          className={`${base} border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-900 dark:bg-rose-950 dark:text-rose-300`}
+        >
+          Preview unavailable
+        </Badge>
+      );
+    case "unsupported":
+      return (
+        <Badge variant="secondary" className={base}>
+          No preview
+        </Badge>
+      );
+    case "macro_warning":
+      return (
+        <Badge
+          variant="secondary"
+          className={`${base} border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200`}
+          title={file.convertWarning ?? "Macros stripped during conversion"}
+        >
+          Macros stripped
+        </Badge>
+      );
+    default:
+      return null;
+  }
 }
 
 /* ---------------- FileTypeBadge ---------------- */

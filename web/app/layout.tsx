@@ -5,6 +5,7 @@ import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ConfirmProvider } from "@/components/ui/confirm";
 import { PromptProvider } from "@/components/ui/prompt";
+import { VaultUnlockProvider } from "@/components/vault-unlock";
 
 export const metadata: Metadata = {
   title: "Drive360 — Document automation platform",
@@ -24,7 +25,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <TooltipProvider delayDuration={150}>
           <ConfirmProvider>
             <PromptProvider>
-              <ToastProvider>{children}</ToastProvider>
+              <VaultUnlockProvider>
+                <ToastProvider>{children}</ToastProvider>
+              </VaultUnlockProvider>
               <Toaster />
             </PromptProvider>
           </ConfirmProvider>

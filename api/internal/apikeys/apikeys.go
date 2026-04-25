@@ -79,6 +79,11 @@ var AllScopes = []string{
 	"files:read", "files:write",
 	"templates:read", "templates:write",
 	"generate:write",
+	// merge:read covers GET /v1/merge-recipes and the per-recipe schema
+	// endpoint that integrators use to discover the data shape; merge:write
+	// covers create/update/delete plus POST .../run (running a recipe is
+	// the "produce a new file" side effect, hence write).
+	"merge:read", "merge:write",
 	"shares:read", "shares:write",
 	"webhooks:read", "webhooks:write",
 	"audit:read",
