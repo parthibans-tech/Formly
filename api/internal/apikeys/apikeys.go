@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/docforge/api/internal/auth"
+	"github.com/docforge/api/internal/billing"
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -199,6 +200,12 @@ type createResp struct {
 
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	c := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
+	if err := billing.RequireFeature(r.Context(), h.DB, c.OrgID, "api_keys"); err != nil {
+		if le, ok := billing.IsLimitError(err); ok {
+			writeErr(w, le.Status, le.Code, le.Message)
+			return
+		}
+	}
 	var req createReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, "invalid_body", err.Error())

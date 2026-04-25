@@ -1,12 +1,12 @@
 "use client";
 
-// Legacy URL — email audit folded into the unified /settings/audit module
-// under the Email tab. Existing bookmarks redirect there.
+// Legacy URL — the audit module was unified at /settings/audit. Bookmarks
+// to the old super-admin-only path still work via this redirect.
 
 import { useEffect } from "react";
 import { useRouter } from "next/navigation";
 
-export default function LegacyAdminEmailPage() {
+export default function LegacyPlatformAuditPage() {
   const router = useRouter();
   useEffect(() => {
     router.replace("/settings/audit");

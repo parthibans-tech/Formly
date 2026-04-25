@@ -54,13 +54,6 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import {
-  Sheet,
-  SheetContent,
-  SheetDescription,
-  SheetHeader,
-  SheetTitle,
-} from "@/components/ui/sheet";
-import {
   Dialog,
   DialogContent,
   DialogDescription,
@@ -161,7 +154,10 @@ export default function AdminUsersPage() {
     } finally {
       setRefreshing(false);
     }
-  }, [q, orgFilter, statusFilter, roleFilter, toast]);
+    // toast is a fresh object every render — including it would re-create
+    // `load` and re-fire the debounced effect on every keystroke
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [q, orgFilter, statusFilter, roleFilter]);
 
   // Debounced search: rebuild the query 300ms after the user stops
   // typing so the API isn't hammered on every keystroke.
@@ -183,7 +179,8 @@ export default function AdminUsersPage() {
       .then(setDetail)
       .catch((e) => toast.show("error", e?.message || "Failed to load user"))
       .finally(() => setDetailLoading(false));
-  }, [openId, toast]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openId]);
 
   async function unlock(u: UserRow) {
     try {
@@ -314,84 +311,82 @@ export default function AdminUsersPage() {
         </p>
       </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">Filters</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="grid gap-3 md:grid-cols-4">
-            <div className="space-y-1.5">
-              <Label className="text-xs">Search</Label>
-              <div className="relative">
-                <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-                <Input
-                  value={q}
-                  onChange={(e) => setQ(e.target.value)}
-                  placeholder="email or name"
-                  className="pl-7"
-                />
-              </div>
-            </div>
-            <div className="space-y-1.5">
-              <Label className="text-xs">Org ID</Label>
-              <Input
-                value={orgFilter}
-                onChange={(e) => setOrgFilter(e.target.value)}
-                placeholder="UUID — blank = all"
-                className="font-mono text-xs"
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label className="text-xs">Status</Label>
-              <Select
-                value={statusFilter || "all"}
-                onValueChange={(v) => setStatusFilter(v === "all" ? "" : v)}
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">Any status</SelectItem>
-                  <SelectItem value="active">Active</SelectItem>
-                  <SelectItem value="locked">Locked</SelectItem>
-                  <SelectItem value="no_mfa">No MFA</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="space-y-1.5">
-              <Label className="text-xs">Role</Label>
-              <Select
-                value={roleFilter || "all"}
-                onValueChange={(v) => setRoleFilter(v === "all" ? "" : v)}
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">Any role</SelectItem>
-                  <SelectItem value="admin">Admin</SelectItem>
-                  <SelectItem value="editor">Editor</SelectItem>
-                  <SelectItem value="viewer">Viewer</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-          <div className="mt-3 flex items-center gap-2">
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={load}
-              disabled={refreshing}
-            >
-              <RefreshCcw className="h-3.5 w-3.5" />
-              Refresh
-            </Button>
-            <span className="text-xs text-muted-foreground">
-              {rows?.length ?? 0} users
-            </span>
-          </div>
-        </CardContent>
-      </Card>
+      {/* Compact filter toolbar. */}
+      <div className="flex flex-wrap items-center gap-2 rounded-md border bg-card p-2">
+        <div className="relative min-w-[200px] flex-1">
+          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="Search email or name…"
+            className="h-8 pl-8"
+          />
+        </div>
+        <Input
+          value={orgFilter}
+          onChange={(e) => setOrgFilter(e.target.value)}
+          placeholder="Org UUID"
+          className="h-8 w-[160px] font-mono text-xs"
+        />
+        <Select
+          value={statusFilter || "all"}
+          onValueChange={(v) => setStatusFilter(v === "all" ? "" : v)}
+        >
+          <SelectTrigger className="h-8 w-[130px]">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">Any status</SelectItem>
+            <SelectItem value="active">Active</SelectItem>
+            <SelectItem value="locked">Locked</SelectItem>
+            <SelectItem value="no_mfa">No MFA</SelectItem>
+          </SelectContent>
+        </Select>
+        <Select
+          value={roleFilter || "all"}
+          onValueChange={(v) => setRoleFilter(v === "all" ? "" : v)}
+        >
+          <SelectTrigger className="h-8 w-[120px]">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">Any role</SelectItem>
+            <SelectItem value="admin">Admin</SelectItem>
+            <SelectItem value="editor">Editor</SelectItem>
+            <SelectItem value="viewer">Viewer</SelectItem>
+          </SelectContent>
+        </Select>
+        {(q || orgFilter || statusFilter || roleFilter) && (
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-8"
+            onClick={() => {
+              setQ("");
+              setOrgFilter("");
+              setStatusFilter("");
+              setRoleFilter("");
+            }}
+          >
+            Clear
+          </Button>
+        )}
+        <div className="ml-auto flex items-center gap-2">
+          <span className="text-xs text-muted-foreground">
+            {rows?.length ?? 0} users
+          </span>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-8"
+            onClick={load}
+            disabled={refreshing}
+          >
+            <RefreshCcw className="h-3.5 w-3.5" />
+            Refresh
+          </Button>
+        </div>
+      </div>
 
       <Card>
         <CardHeader>
@@ -434,12 +429,12 @@ export default function AdminUsersPage() {
         </CardContent>
       </Card>
 
-      {/* Detail drawer */}
-      <Sheet
+      {/* Detail modal */}
+      <Dialog
         open={!!openId}
         onOpenChange={(o) => !o && setOpenId(null)}
       >
-        <SheetContent className="w-full sm:max-w-xl overflow-y-auto">
+        <DialogContent className="sm:max-w-2xl max-h-[85vh] overflow-y-auto">
           {detailLoading || !detail ? (
             <div className="space-y-3">
               <Skeleton className="h-8 w-2/3" />
@@ -470,8 +465,8 @@ export default function AdminUsersPage() {
               }}
             />
           )}
-        </SheetContent>
-      </Sheet>
+        </DialogContent>
+      </Dialog>
 
       {/* Lock dialog */}
       <Dialog
@@ -640,15 +635,15 @@ function DetailPanel({
 
   return (
     <>
-      <SheetHeader>
-        <SheetTitle className="flex items-center gap-2">
+      <DialogHeader>
+        <DialogTitle className="flex items-center gap-2">
           <UserCog className="h-5 w-5" />
           {detail.name || detail.email}
-        </SheetTitle>
-        <SheetDescription>
+        </DialogTitle>
+        <DialogDescription>
           {detail.email} · {detail.orgName || detail.orgId.slice(0, 8) + "…"}
-        </SheetDescription>
-      </SheetHeader>
+        </DialogDescription>
+      </DialogHeader>
 
       <div className="mt-4 flex gap-1 border-b">
         {(["overview", "memberships", "security", "audit"] as const).map((t) => (

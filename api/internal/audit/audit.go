@@ -8,7 +8,10 @@ package audit
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -51,19 +54,9 @@ func Log(ctx context.Context, db *pgxpool.Pool, e Event) {
 	}
 	metaJSON, _ := json.Marshal(e.Meta)
 
-	// Normalise IP (strip port if present).
-	ip := e.IP
-	if i := strings.LastIndex(ip, ":"); i > 0 && !strings.Contains(ip, "]") {
-		ip = ip[:i]
-	}
-	if ip == "" {
-		ip = "0.0.0.0"
-	}
+	ip := normalizeIP(e.IP)
 
-	// Use a short-lived background-parent context so we can record late events
-	// even when the caller's context is cancelled (e.g. after the response
-	// flush on a terminal action).
-	_, _ = db.Exec(ctx, `
+	_, err := db.Exec(ctx, `
 		INSERT INTO audit_log
 		  (org_id, actor_id, actor_email, action, resource_type, resource_id,
 		   ip_addr, user_agent, meta)
@@ -72,6 +65,32 @@ func Log(ctx context.Context, db *pgxpool.Pool, e Event) {
 		   NULLIF($5,''), NULLIF($6,''), $7::inet, NULLIF($8,''), $9::jsonb)
 	`, e.OrgID, e.ActorID, e.ActorEmail, e.Action, e.ResourceType,
 		e.ResourceID, ip, e.UserAgent, string(metaJSON))
+	if err != nil {
+		// Don't bubble up — audit failures must never break the business
+		// action — but make them visible in stderr so silent drops (like
+		// the inet-cast bug for [::1]:port) get caught early.
+		fmt.Fprintf(os.Stderr, "audit: insert failed action=%s ip=%s err=%v\n", e.Action, ip, err)
+	}
+}
+
+// normalizeIP turns whatever Go gave us in r.RemoteAddr / X-Forwarded-For
+// into a value Postgres `inet` will accept. Handles "1.2.3.4:5678",
+// "[::1]:5678", "::1", and falls back to 0.0.0.0 when nothing parses.
+func normalizeIP(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "0.0.0.0"
+	}
+	// SplitHostPort handles both IPv4:port and [IPv6]:port.
+	if host, _, err := net.SplitHostPort(raw); err == nil && host != "" {
+		raw = host
+	}
+	// Strip surrounding brackets if SplitHostPort didn't run (bare "[::1]").
+	raw = strings.Trim(raw, "[]")
+	if net.ParseIP(raw) == nil {
+		return "0.0.0.0"
+	}
+	return raw
 }
 
 // FromRequest pulls the authenticated user and request metadata and returns a

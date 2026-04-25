@@ -26,6 +26,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { useConfirm } from "@/components/ui/confirm";
+import { OrgSwitcher } from "@/components/org-switcher";
 
 type Props = {
   children: React.ReactNode;
@@ -150,6 +151,7 @@ export function AppShell({ children, search, headerRight }: Props) {
 
             <div className="ml-auto flex items-center gap-1">
               {headerRight}
+              <OrgSwitcher />
               <ThemeToggle />
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>

@@ -9,10 +9,21 @@ import (
 	"strings"
 	"time"
 
+	"github.com/docforge/api/internal/clientinfo"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
 )
+
+// PostRegisterDB is the slim pgx interface that OnRegister hooks
+// receive — pool or tx both satisfy it. Kept here to avoid an import
+// cycle (billing imports nothing, but auth shouldn't import billing).
+type PostRegisterDB interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
 
 type ctxKey string
 
@@ -38,6 +49,34 @@ const (
 // claims attached to the request context.
 func (c *Claims) IsAdmin() bool { return c != nil && c.Role == RoleAdmin }
 
+// IsSuperAdmin reports whether (role, orgID) qualifies as a platform
+// operator. The model is intentionally simple: there's no super_admin
+// role column. Instead, super-admin = "admin of the designated platform
+// root org", configured via PLATFORM_ROOT_ORG_ID. When that env var is
+// unset (typical in dev / single-tenant) any admin qualifies, so a
+// solo operator can wear both hats without provisioning a separate org.
+//
+// Use this in API handlers when you need the boolean (e.g. to decorate
+// the /v1/me response so the web client can hide platform-only nav).
+// HTTP-level enforcement still flows through requireSuperAdmin in
+// cmd/api so the rule is centralized.
+func IsSuperAdmin(role, orgID string) bool {
+	if role != RoleAdmin {
+		return false
+	}
+	rootOrg := strings.TrimSpace(os.Getenv("PLATFORM_ROOT_ORG_ID"))
+	if rootOrg == "" {
+		return true
+	}
+	return orgID == rootOrg
+}
+
+// IsSuperAdmin on Claims is the convenience method that the same value
+// can be derived directly from a request's claims.
+func (c *Claims) IsSuperAdmin() bool {
+	return c != nil && IsSuperAdmin(c.Role, c.OrgID)
+}
+
 type Handler struct {
 	DB     *pgxpool.Pool
 	Secret []byte
@@ -51,6 +90,11 @@ type Handler struct {
 	OnLogout             func(ctx context.Context, token string)
 	SessionRevokedCheck  func(ctx context.Context, token string) bool
 	AuditFn              func(ctx context.Context, action, userID, orgID, email, ip, ua string, meta map[string]any)
+	// OnRegister fires inside the registration transaction once the
+	// org + user rows have been created. Use this to provision
+	// per-org defaults (subscription trial, default folders, etc.).
+	// Returning an error rolls back the registration.
+	OnRegister func(ctx context.Context, q PostRegisterDB, orgID string) error
 }
 
 func New(db *pgxpool.Pool) *Handler {
@@ -83,6 +127,10 @@ type user struct {
 	Name  string `json:"name"`
 	OrgID string `json:"orgId"`
 	Role  string `json:"role,omitempty"`
+	// IsSuperAdmin is derived from (role, orgID) at response time — see
+	// IsSuperAdmin(). It's surfaced so the web client can gate platform-
+	// only UI without re-implementing the env-var rule.
+	IsSuperAdmin bool `json:"isSuperAdmin,omitempty"`
 }
 
 func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
@@ -123,6 +171,12 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "user_create", err.Error())
 		return
 	}
+	if h.OnRegister != nil {
+		if err := h.OnRegister(ctx, tx, orgID); err != nil {
+			writeErr(w, 500, "post_register", err.Error())
+			return
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		writeErr(w, 500, "commit", err.Error())
 		return
@@ -130,6 +184,7 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 	token, _ := h.issueToken(userID, orgID, req.Email, RoleAdmin)
 	writeJSON(w, 200, authResp{Token: token, User: user{
 		ID: userID, Email: req.Email, Name: req.Name, OrgID: orgID, Role: RoleAdmin,
+		IsSuperAdmin: IsSuperAdmin(RoleAdmin, orgID),
 	}})
 }
 
@@ -137,6 +192,12 @@ type loginReq struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
 	MFACode  string `json:"mfaCode"` // optional; supplied after a mfa_required challenge
+
+	// Optional browser-supplied geolocation. The web client asks for
+	// `navigator.geolocation` permission on the login form and forwards
+	// the result here. Server falls back to IP-based lookup when this
+	// is missing or the user denied permission.
+	ClientGeo *clientinfo.BrowserGeo `json:"clientGeo,omitempty"`
 }
 
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
@@ -145,25 +206,51 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "invalid_body", err.Error())
 		return
 	}
+	// Enrich every auth audit row from this call with parsed UA + best-
+	// effort geo. Built once per login attempt; merged into each emit
+	// (failure, lock, mfa_failed, success) via withClient(...).
+	ci := clientinfo.FromRequest(r.Context(), r, req.ClientGeo)
+	withClient := func(extra map[string]any) map[string]any {
+		m := ci.ToMeta()
+		for k, v := range extra {
+			m[k] = v
+		}
+		return m
+	}
+
 	var (
 		id, orgID, name, hash, role string
 		lockedAt                    *time.Time
 		lockedReason                *string
 		forcePwReset                bool
+		orgDeletedAt                *time.Time
 	)
 	err := h.DB.QueryRow(r.Context(),
-		`SELECT id, org_id, name, password_hash, COALESCE(role,'editor'),
-		        locked_at, locked_reason, force_pw_reset
-		   FROM users WHERE email=$1`, req.Email,
-	).Scan(&id, &orgID, &name, &hash, &role, &lockedAt, &lockedReason, &forcePwReset)
+		`SELECT u.id, u.org_id, u.name, u.password_hash, COALESCE(u.role,'editor'),
+		        u.locked_at, u.locked_reason, u.force_pw_reset,
+		        o.deleted_at
+		   FROM users u
+		   LEFT JOIN organizations o ON o.id = u.org_id
+		  WHERE u.email=$1`, req.Email,
+	).Scan(&id, &orgID, &name, &hash, &role, &lockedAt, &lockedReason,
+		&forcePwReset, &orgDeletedAt)
 	if err != nil {
 		writeErr(w, 401, "invalid_credentials", "bad email or password")
 		return
 	}
 	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)) != nil {
 		h.audit(r, "auth.login.failed", "", "", req.Email,
-			map[string]any{"reason": "bad_password"})
+			withClient(map[string]any{"reason": "bad_password"}))
 		writeErr(w, 401, "invalid_credentials", "bad email or password")
+		return
+	}
+	// Org soft-delete (Phase 3): refuse to mint a session for a user
+	// whose home org has been tombstoned. Existing sessions are killed
+	// at delete time; this catches any stale-credential login attempt.
+	if orgDeletedAt != nil {
+		h.audit(r, "auth.login.org_deleted", id, orgID, req.Email, withClient(nil))
+		writeErr(w, 410, "org_deleted",
+			"this workspace has been deleted — contact support")
 		return
 	}
 	// Lock check happens AFTER password verification so an attacker
@@ -176,7 +263,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 			reason = *lockedReason
 		}
 		h.audit(r, "auth.login.locked", id, orgID, req.Email,
-			map[string]any{"reason": reason})
+			withClient(map[string]any{"reason": reason}))
 		writeErr(w, 403, "account_locked",
 			"this account is temporarily locked — contact support")
 		return
@@ -194,7 +281,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if h.MFAVerifyChallenge == nil || !h.MFAVerifyChallenge(r.Context(), id, req.MFACode) {
-				h.audit(r, "auth.login.mfa_failed", id, orgID, req.Email, nil)
+				h.audit(r, "auth.login.mfa_failed", id, orgID, req.Email, withClient(nil))
 				writeErr(w, 401, "invalid_mfa", "invalid MFA code")
 				return
 			}
@@ -206,11 +293,12 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		h.OnLogin(r.Context(), id, orgID, token, clientIP(r), r.UserAgent())
 	}
 	h.audit(r, "auth.login", id, orgID, req.Email,
-		map[string]any{"forcePasswordReset": forcePwReset})
+		withClient(map[string]any{"forcePasswordReset": forcePwReset}))
 	writeJSON(w, 200, authResp{
 		Token: token,
 		User: user{
 			ID: id, Email: req.Email, Name: name, OrgID: orgID, Role: role,
+			IsSuperAdmin: IsSuperAdmin(role, orgID),
 		},
 		ForcePasswordReset: forcePwReset,
 	})
@@ -294,7 +382,8 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 		h.OnLogout(r.Context(), token)
 	}
 	if c != nil {
-		h.audit(r, "auth.logout", c.UserID, c.OrgID, c.Email, nil)
+		ci := clientinfo.FromRequest(r.Context(), r, nil)
+		h.audit(r, "auth.logout", c.UserID, c.OrgID, c.Email, ci.ToMeta())
 	}
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
@@ -321,7 +410,10 @@ func clientIP(r *http.Request) string {
 
 func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
 	c, _ := r.Context().Value(UserCtxKey).(*Claims)
-	writeJSON(w, 200, user{ID: c.UserID, Email: c.Email, OrgID: c.OrgID, Role: c.Role})
+	writeJSON(w, 200, user{
+		ID: c.UserID, Email: c.Email, OrgID: c.OrgID, Role: c.Role,
+		IsSuperAdmin: c.IsSuperAdmin(),
+	})
 }
 
 func (h *Handler) issueToken(uid, oid, email, role string) (string, error) {

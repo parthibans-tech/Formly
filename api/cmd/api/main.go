@@ -7,12 +7,12 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/docforge/api/internal/apikeys"
 	"github.com/docforge/api/internal/audit"
 	"github.com/docforge/api/internal/auth"
+	"github.com/docforge/api/internal/billing"
 	"github.com/docforge/api/internal/comments"
 	"github.com/docforge/api/internal/compliance"
 	"github.com/docforge/api/internal/db"
@@ -26,7 +26,14 @@ import (
 	"github.com/docforge/api/internal/mfa"
 	"github.com/docforge/api/internal/mockdata"
 	"github.com/docforge/api/internal/observability"
+	"github.com/docforge/api/internal/memberships"
+	"github.com/docforge/api/internal/orggate"
 	"github.com/docforge/api/internal/platform"
+	"github.com/docforge/api/internal/platformaudit"
+	"github.com/docforge/api/internal/me"
+	"github.com/docforge/api/internal/orgdashboard"
+	"github.com/docforge/api/internal/platformdashboard"
+	"github.com/docforge/api/internal/platformorgs"
 	"github.com/docforge/api/internal/platformusers"
 	"github.com/docforge/api/internal/presence"
 	"github.com/docforge/api/internal/queue"
@@ -118,6 +125,33 @@ func main() {
 	// middleware below; the handler trusts that gate and only writes
 	// audit rows for state-changing actions.
 	pu := platformusers.New(pool)
+	// Phase 3: org-level controls + cross-org audit + memberships.
+	po := platformorgs.New(pool)
+	pa := platformaudit.New(pool)
+	pd := platformdashboard.New(pool)
+	od := orgdashboard.New(pool)
+	meh := me.New(pool)
+	mb := memberships.New(pool, a)
+	// Phase 4a: subscription module (read-only catalog + manual provider).
+	// Phase 4b: live providers — Razorpay (INR) and Stripe (USD/other).
+	// Either driver may be unconfigured; in that case the handler returns
+	// 501 to nudge the operator to set credentials in .env.
+	bl := billing.New(pool)
+	bl.AttachDrivers(billing.Drivers{
+		Razorpay: billing.NewRazorpayDriver(pool,
+			os.Getenv("RAZORPAY_KEY_ID"),
+			os.Getenv("RAZORPAY_KEY_SECRET"),
+			os.Getenv("RAZORPAY_WEBHOOK_SECRET")),
+		Stripe: billing.NewStripeDriver(pool,
+			os.Getenv("STRIPE_SECRET_KEY"),
+			os.Getenv("STRIPE_WEBHOOK_SECRET")),
+	})
+	bl.AttachMailer(mh.Mailer)
+	bl.WireNotifier(ctx)
+	bl.StartDunningLoop(ctx, time.Hour)
+	a.OnRegister = func(ctx context.Context, q auth.PostRegisterDB, orgID string) error {
+		return billing.StartTrial(ctx, q, orgID)
+	}
 
 	// Observability: request metrics aggregator + health checker + error
 	// recorder. The aggregator is middleware-scoped; health probes run in the
@@ -225,9 +259,19 @@ func main() {
 	r.Get("/v1/public/reviews/{token}/comments", rl.PublicListComments)
 	r.Post("/v1/public/reviews/{token}/comments", rl.PublicCreateComment)
 	r.Post("/v1/public/reviews/{token}/decision", rl.PublicDecide)
+	// Phase 4b: provider webhooks. Public — providers don't carry our
+	// JWT — but each handler verifies a provider-specific signature and
+	// rejects unsigned bodies when the secret is configured.
+	r.Post("/v1/webhooks/razorpay", bl.RazorpayWebhook)
+	r.Post("/v1/webhooks/stripe", bl.StripeWebhook)
 
 	r.Group(func(r chi.Router) {
 		r.Use(a.Middleware)
+		// Org gate (Phase 3): enforce frozen / deleted flags before any
+		// business logic runs. Mounted right after the auth middleware
+		// so claims are available; before scope/rate/logging so a
+		// frozen org's writes never reach the per-key request log.
+		r.Use(orggate.Middleware(pool))
 		// Platform: scope enforcement + rate-limit headers + per-key request
 		// log. All three are cheap and safely chain after the auth middleware
 		// (which attaches the API-key info to ctx). Scope guard only applies
@@ -236,6 +280,12 @@ func main() {
 		r.Use(platform.RateLimitHeaders(600, time.Minute))
 		r.Use(platform.RequestLogger(pool))
 		r.Get("/v1/me", a.Me)
+
+		// Enriched profile + edit. Lives next to the JWT-claims-only /v1/me
+		// so the existing endpoint stays cheap; the Settings → Profile page
+		// hits /v1/me/profile to get the richer view.
+		r.Get("/v1/me/profile", meh.Get)
+		r.Patch("/v1/me/profile", meh.Patch)
 		r.Post("/v1/auth/logout", a.Logout)
 		r.Post("/v1/auth/set-password", a.SetPassword)
 
@@ -397,7 +447,64 @@ func main() {
 			r.Post("/{id}/reset-mfa", pu.ResetMFA)
 			r.Post("/{id}/force-password-reset", pu.ForcePasswordReset)
 			r.Delete("/{id}/sessions", pu.RevokeSessions)
+			r.Post("/{id}/memberships", pu.AddMembership)
+			r.Delete("/{id}/memberships/{orgId}", pu.RemoveMembership)
 		})
+
+		// Phase 3: super-admin org management.
+		r.Route("/v1/admin/orgs", func(r chi.Router) {
+			r.Use(requireSuperAdmin)
+			r.Get("/", po.List)
+			r.Get("/{id}", po.Detail)
+			r.Post("/{id}/freeze", po.Freeze)
+			r.Post("/{id}/unfreeze", po.Unfreeze)
+			r.Delete("/{id}", po.SoftDelete)
+			r.Post("/{id}/restore", po.Restore)
+			r.Patch("/{id}/quotas", po.SetQuotas)
+		})
+
+		// Phase 3: platform-wide audit log viewer.
+		r.With(requireSuperAdmin).Get("/v1/admin/audit", pa.List)
+
+		// Super-admin dashboard: one-shot aggregator with org/user/sub
+		// counts, 30-day revenue, recent signups, paid + open invoices,
+		// and recent audit events. The console page hits this on load.
+		r.With(requireSuperAdmin).Get("/v1/admin/dashboard", pd.Get)
+
+		// Org-scoped admin dashboard. Handler self-checks role=admin and
+		// scopes every query to the caller's org. Powers the /dashboard
+		// landing page that admins see right after login.
+		r.Get("/v1/dashboard/admin", od.Get)
+
+		// Phase 3: per-user memberships (multi-org).
+		r.Get("/v1/me/memberships", mb.List)
+		r.Post("/v1/me/switch-org", mb.Switch)
+
+		// Phase 4a: subscription module. Read-only for all callers; the
+		// super-admin assignment endpoint mounts under /v1/admin/orgs.
+		r.Get("/v1/billing/plans", bl.ListPlans)
+		r.Get("/v1/billing/subscription", bl.Subscription)
+		r.Get("/v1/billing/invoices", bl.ListInvoices)
+		r.Get("/v1/billing/profile", bl.GetProfile)
+		r.Put("/v1/billing/profile", bl.PutProfile)
+		// Phase 4b: live checkout + cancel. Webhooks mount publicly
+		// outside this auth-protected group below.
+		r.Post("/v1/billing/checkout", bl.Checkout)
+		r.Post("/v1/billing/cancel", bl.CancelSubscription)
+		// Phase 4c: reactivate, plan switching, customer portal, coupons.
+		r.Post("/v1/billing/reactivate", bl.Reactivate)
+		r.Post("/v1/billing/change-plan", bl.ChangePlan)
+		r.Post("/v1/billing/portal", bl.CustomerPortalSession)
+		r.Get("/v1/billing/coupons/preview", bl.PreviewCoupon)
+		r.With(requireSuperAdmin).Get("/v1/admin/orgs/{id}/subscription", bl.AdminGet)
+		r.With(requireSuperAdmin).Post("/v1/admin/orgs/{id}/subscription", bl.AdminAssign)
+		// Plan catalog CRUD — only super-admin manages what plans exist.
+		// Org admins still GET /v1/billing/plans to see the storefront.
+		r.With(requireSuperAdmin).Get("/v1/admin/plans", bl.AdminListPlans)
+		r.With(requireSuperAdmin).Get("/v1/admin/plans/{id}", bl.AdminGetPlan)
+		r.With(requireSuperAdmin).Post("/v1/admin/plans", bl.AdminUpsertPlan)
+		r.With(requireSuperAdmin).Put("/v1/admin/plans/{id}", bl.AdminUpsertPlan)
+		r.With(requireSuperAdmin).Delete("/v1/admin/plans/{id}", bl.AdminDeletePlan)
 		r.Post("/v1/templates/{id}/send", mh.SendTemplate)
 
 		// Scheduled generation jobs.
@@ -566,14 +673,13 @@ func (a teamMailerAdapter) Send(ctx context.Context, opts team.NotifyOptions) (s
 // The middleware writes nothing — handlers do their own audit logging
 // once they know the action succeeded.
 func requireSuperAdmin(next http.Handler) http.Handler {
-	rootOrg := strings.TrimSpace(os.Getenv("PLATFORM_ROOT_ORG_ID"))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, _ := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
 		if c == nil || !c.IsAdmin() {
 			http.Error(w, `{"error":{"code":"forbidden","message":"admin role required"}}`, http.StatusForbidden)
 			return
 		}
-		if rootOrg != "" && c.OrgID != rootOrg {
+		if !c.IsSuperAdmin() {
 			http.Error(w, `{"error":{"code":"forbidden","message":"super-admin only"}}`, http.StatusForbidden)
 			return
 		}

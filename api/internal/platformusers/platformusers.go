@@ -274,8 +274,30 @@ func (h *Handler) Detail(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	memberships := []membership{
-		{OrgID: u.OrgID, OrgName: u.OrgName, Role: u.Role, Source: "primary"},
+	memberships := []membership{}
+	mrows, merr := h.DB.Query(r.Context(), `
+		SELECT m.org_id, COALESCE(o.name,''), m.role, m.source
+		  FROM org_memberships m
+		  LEFT JOIN organizations o ON o.id = m.org_id
+		 WHERE m.user_id = $1
+		 ORDER BY (m.org_id = $2) DESC, o.name ASC`, id, u.OrgID)
+	if merr == nil {
+		defer mrows.Close()
+		for mrows.Next() {
+			var m membership
+			if err := mrows.Scan(&m.OrgID, &m.OrgName, &m.Role, &m.Source); err == nil {
+				memberships = append(memberships, m)
+			}
+		}
+	}
+	if len(memberships) == 0 {
+		// Defensive fallback — every user should have a primary row from
+		// the migration backfill, but handle the empty case so the
+		// drawer never renders a confusing "no memberships" for a user
+		// who clearly belongs to one org.
+		memberships = append(memberships, membership{
+			OrgID: u.OrgID, OrgName: u.OrgName, Role: u.Role, Source: "primary",
+		})
 	}
 
 	writeJSON(w, 200, userDetail{
@@ -398,6 +420,77 @@ func (h *Handler) ForcePasswordReset(w http.ResponseWriter, r *http.Request) {
 
 	audit.LogHTTP(r, h.DB, "super_admin.user_force_pw_reset", "user", id,
 		map[string]any{"targetUserId": id})
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+// -- memberships (super-admin only) --------------------------------------
+
+type addMembershipReq struct {
+	OrgID string `json:"orgId"`
+	Role  string `json:"role"` // admin / editor / viewer; defaults to editor
+}
+
+// AddMembership grants a user access to another org. Idempotent — if
+// the row already exists we update the role + source so the operator
+// can fix a typo without first deleting.
+func (h *Handler) AddMembership(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var req addMembershipReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, "invalid_body", err.Error())
+		return
+	}
+	if req.OrgID == "" {
+		writeErr(w, 400, "missing_org", "orgId is required")
+		return
+	}
+	role := strings.TrimSpace(req.Role)
+	if role == "" {
+		role = "editor"
+	}
+	_, err := h.DB.Exec(r.Context(), `
+		INSERT INTO org_memberships (user_id, org_id, role, source)
+		VALUES ($1::uuid, $2::uuid, $3, 'admin')
+		ON CONFLICT (user_id, org_id)
+		DO UPDATE SET role = EXCLUDED.role, source = 'admin'`,
+		id, req.OrgID, role)
+	if err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+	audit.LogHTTP(r, h.DB, "super_admin.user_membership_added", "user", id,
+		map[string]any{"targetUserId": id, "orgId": req.OrgID, "role": role})
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+// RemoveMembership revokes a user's access to a specific org. Refuses
+// to remove the user's primary org (users.org_id) — that has to be
+// changed first via a separate "set primary" flow (not in this phase).
+func (h *Handler) RemoveMembership(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	orgID := chi.URLParam(r, "orgId")
+	var primary string
+	if err := h.DB.QueryRow(r.Context(),
+		`SELECT org_id FROM users WHERE id=$1`, id).Scan(&primary); err == nil {
+		if primary == orgID {
+			writeErr(w, 400, "cannot_remove_primary",
+				"this is the user's primary org — change their primary first")
+			return
+		}
+	}
+	tag, err := h.DB.Exec(r.Context(),
+		`DELETE FROM org_memberships WHERE user_id=$1 AND org_id=$2`,
+		id, orgID)
+	if err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		writeErr(w, 404, "not_found", "no such membership")
+		return
+	}
+	audit.LogHTTP(r, h.DB, "super_admin.user_membership_removed", "user", id,
+		map[string]any{"targetUserId": id, "orgId": orgID})
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/docforge/api/internal/auth"
+	"github.com/docforge/api/internal/billing"
 	"github.com/docforge/api/internal/events"
 	"github.com/docforge/api/internal/sharing"
 	"github.com/docforge/api/internal/storage"
@@ -358,6 +359,21 @@ func (h *Handler) Complete(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, 400, "not_uploaded", "object missing from storage")
 		return
+	}
+
+	// Storage quota enforcement. The blob is already uploaded, but we
+	// refuse to mark it active when accepting it would push the org
+	// over its plan ceiling. The dangling object is cleaned up by the
+	// orphan-blob janitor; the user gets a clear 402 with an upgrade
+	// hint instead of a silent fail.
+	if err := billing.EnsureStorageAvailable(r.Context(), h.DB, c.OrgID, info.Size); err != nil {
+		if le, ok := billing.IsLimitError(err); ok {
+			_, _ = h.DB.Exec(r.Context(),
+				`UPDATE files SET status='quota_blocked', size=$1, updated_at=now()
+				   WHERE id=$2`, info.Size, id)
+			writeErr(w, le.Status, le.Code, le.Message)
+			return
+		}
 	}
 
 	if _, err := h.DB.Exec(r.Context(),

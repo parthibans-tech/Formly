@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/docforge/api/internal/auth"
+	"github.com/docforge/api/internal/billing"
 	"github.com/docforge/api/internal/events"
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
@@ -324,6 +325,17 @@ func (h *Handler) CreateInvite(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, "already_member", "this email is already a team member")
 		return
 	}
+	// Plan seat enforcement. We count active members + pending invites
+	// against MaxUsers; the 402 response carries a hint the UI surfaces
+	// in the toast so the admin knows to upgrade.
+	if err := billing.EnsureSeatAvailable(r.Context(), h.DB, c.OrgID, 1); err != nil {
+		if le, ok := billing.IsLimitError(err); ok {
+			writeErr(w, le.Status, le.Code, le.Message)
+			return
+		}
+		writeErr(w, 500, "limit_check", err.Error())
+		return
+	}
 	role := normalizeRole(req.Role)
 	token, err := randomToken()
 	if err != nil {
@@ -547,6 +559,15 @@ func (h *Handler) Accept(w http.ResponseWriter, r *http.Request) {
 	if revokedAt != nil {
 		writeErr(w, 410, "revoked", "this invitation was revoked")
 		return
+	}
+	// Re-check the seat limit at acceptance time. The org may have
+	// downgraded between sending and accepting the invite, in which
+	// case we let the admin (not the new joiner) upgrade.
+	if err := billing.EnsureSeatAvailable(ctx, h.DB, orgID, 1); err != nil {
+		if le, ok := billing.IsLimitError(err); ok {
+			writeErr(w, le.Status, le.Code, le.Message)
+			return
+		}
 	}
 	if expiresAt != nil && expiresAt.Before(time.Now()) {
 		writeErr(w, 410, "expired", "this invitation has expired")

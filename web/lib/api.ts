@@ -21,6 +21,13 @@ export function getUser() {
   return raw ? JSON.parse(raw) : null;
 }
 
+// Merges patch into the cached user blob so UI components reading getUser()
+// see the new value on their next render. Token is left untouched.
+export function updateUser(patch: Record<string, any>) {
+  const u = getUser() || {};
+  localStorage.setItem("df_user", JSON.stringify({ ...u, ...patch }));
+}
+
 // ApiError preserves the server's structured error envelope so callers
 // can branch on `code` / inspect `fields` (used by the AcroForm 422
 // validation response) instead of trying to parse a concatenated

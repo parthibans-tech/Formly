@@ -46,12 +46,46 @@ export default function LoginPage() {
     defaultValues: { email: "", password: "" },
   });
 
+  // Best-effort geolocation capture. Resolves to a lat/lng if the user
+  // grants permission within ~2s; resolves to null on denial, error, or
+  // timeout. Login proceeds either way — server falls back to IP-based
+  // geolocation when this is missing.
+  async function captureGeo(): Promise<{
+    lat: number;
+    lng: number;
+    accuracy: number;
+    tz: string;
+  } | null> {
+    if (typeof navigator === "undefined" || !navigator.geolocation) return null;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(null), 2000);
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          clearTimeout(timer);
+          resolve({
+            lat: pos.coords.latitude,
+            lng: pos.coords.longitude,
+            accuracy: pos.coords.accuracy,
+            tz: Intl.DateTimeFormat().resolvedOptions().timeZone || "",
+          });
+        },
+        () => {
+          clearTimeout(timer);
+          resolve(null);
+        },
+        { enableHighAccuracy: false, maximumAge: 60_000, timeout: 1500 }
+      );
+    });
+  }
+
   async function attempt(values: FormValues, code?: string) {
     setFormError(null);
     setSubmitting(true);
     try {
       const body: any = { ...values };
       if (code) body.mfaCode = code;
+      const geo = await captureGeo();
+      if (geo) body.clientGeo = geo;
       const res = await api<{
         token?: string;
         user?: any;
@@ -75,7 +109,11 @@ export default function LoginPage() {
         return;
       }
       toast.show("success", "Welcome back");
-      router.replace("/drive");
+      // Super-admins land on the platform dashboard (cross-org operator
+      // console). Everyone else — including org admins — goes straight to
+      // their workspace; org admins can navigate to /dashboard from the
+      // sidebar when they want the org overview.
+      router.replace(res.user?.isSuperAdmin ? "/settings/admin" : "/drive");
     } catch (e: any) {
       setFormError(e.message || "Unable to sign in");
       toast.show("error", "Unable to sign in", { description: e.message });
