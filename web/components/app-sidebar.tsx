@@ -24,6 +24,7 @@ import {
   KeyRound,
   Layers,
   LayoutDashboard,
+  Lock,
   Mail,
   Pin,
   PinOff,
@@ -142,6 +143,13 @@ const SECTIONS: Section[] = [
         hint: "Activity & email",
       },
       {
+        href: "/settings/upload-policy",
+        label: "Upload policy",
+        icon: Lock,
+        roles: ["admin"],
+        hint: "File security",
+      },
+      {
         href: "/settings/ops",
         label: "Operations",
         icon: Gauge,
@@ -229,6 +237,13 @@ const SECTIONS: Section[] = [
         icon: CreditCard,
         superAdmin: true,
         hint: "Plan catalog",
+      },
+      {
+        href: "/settings/admin/product-config",
+        label: "Product config",
+        icon: Lock,
+        superAdmin: true,
+        hint: "Upload defaults",
       },
       {
         href: "/settings/audit",

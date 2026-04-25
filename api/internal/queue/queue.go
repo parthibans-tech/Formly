@@ -32,6 +32,12 @@ const (
 	//   4. Stitches via pdfmerge.AssembleInline.
 	//   5. Persists the output file and updates merge_recipe_jobs.
 	TaskRunMergeRecipe = "merge:recipe:run"
+	// Antivirus / malware scan. Enqueued from files.Complete when the
+	// org's upload policy has scanning enabled. Worker streams the blob
+	// to the configured Scanner (ClamAV in prod, Noop in dev/CI),
+	// stamps the verdict back on the files row, and updates the
+	// scan_jobs audit row. See internal/scanner + cmd/worker.
+	TaskScanFile = "scan:file"
 )
 
 // RedisAddr returns the Redis connection string (from env, default to localhost).
@@ -176,6 +182,42 @@ func NewRunMergeRecipe(p RunMergeRecipePayload) (*asynq.Task, error) {
 		return nil, err
 	}
 	return asynq.NewTask(TaskRunMergeRecipe, b, asynq.MaxRetry(2)), nil
+}
+
+// ScanFilePayload is consumed by the worker registered for TaskScanFile.
+// The worker:
+//
+//  1. SELECTs scan_jobs by JobID, marks status='running' + attempts++.
+//  2. Fetches the blob bytes from object storage by StorageKey.
+//  3. Calls Scanner.Scan with the body reader.
+//  4. UPDATEs files.scan_status / scan_signature / scan_engine /
+//     scanned_at, and on Clean/Skipped flips files.status to 'active'
+//     so the gate releases the file for download.
+//  5. UPDATEs scan_jobs.status='done' (or 'error') with the verdict
+//     payload and finished_at.
+//
+// Why we duplicate StorageKey + OrgID into the payload (when the worker
+// could SELECT them from scan_jobs): keeps the worker's hot path one
+// query lighter, and lets us re-issue scans against an arbitrary key
+// (e.g. re-scan after engine update) without inserting a new row.
+type ScanFilePayload struct {
+	JobID      string `json:"jobId"`
+	OrgID      string `json:"orgId"`
+	FileID     string `json:"fileId"`
+	StorageKey string `json:"storageKey"`
+}
+
+func NewScanFile(p ScanFilePayload) (*asynq.Task, error) {
+	b, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	// 3 retries — clamd restarts and TCP blips are the dominant failure
+	// mode and recover within seconds. Genuine engine errors (corrupt
+	// archive, unsupported container) do not recover with retries; the
+	// scan_jobs.last_error captures the reason and the gate stays
+	// fail-closed so a retry-storm doesn't matter for safety.
+	return asynq.NewTask(TaskScanFile, b, asynq.MaxRetry(3)), nil
 }
 
 func NewWebhookDeliver(p WebhookDeliverPayload) (*asynq.Task, error) {

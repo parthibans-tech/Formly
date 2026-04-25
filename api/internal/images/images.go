@@ -39,6 +39,7 @@ import (
 	"github.com/docforge/api/internal/auth"
 	"github.com/docforge/api/internal/sharing"
 	"github.com/docforge/api/internal/storage"
+	"github.com/docforge/api/internal/uploadpolicy"
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -220,7 +221,7 @@ func (h *Handler) Transform(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 500, "db_error", err.Error())
 			return
 		}
-		dl, _ := h.Storage.PresignGet(r.Context(), storageKey, "", 10*time.Minute)
+		dl, _ := h.Storage.PresignGet(r.Context(), storageKey, mime, "", 10*time.Minute)
 		writeJSON(w, 200, saveResp{
 			FileID: fileID, TemplateID: tplID, Name: srcName, Mime: mime,
 			Width: out.Bounds().Dx(), Height: out.Bounds().Dy(),
@@ -245,7 +246,7 @@ func (h *Handler) Transform(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "db_error", err.Error())
 		return
 	}
-	dl, _ := h.Storage.PresignGet(r.Context(), newKey, "", 10*time.Minute)
+	dl, _ := h.Storage.PresignGet(r.Context(), newKey, mime, "", 10*time.Minute)
 	writeJSON(w, 200, saveResp{
 		FileID: newFileID, Name: name, Mime: mime,
 		Width: out.Bounds().Dx(), Height: out.Bounds().Dy(),
@@ -271,7 +272,8 @@ func (h *Handler) createSiblingFile(ctx context.Context, c *auth.Claims, srcID, 
 	).Scan(&newID); err != nil {
 		return "", "", err
 	}
-	key := fmt.Sprintf("orgs/%s/files/%s/%s", c.OrgID, newID, name)
+	key := fmt.Sprintf("orgs/%s/files/%s/%s",
+		c.OrgID, newID, uploadpolicy.SafeStorageSlug(name))
 	if _, err := h.DB.Exec(ctx,
 		`UPDATE files SET storage_key=$1 WHERE id=$2`, key, newID,
 	); err != nil {

@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import {
+  Download,
   Folder as FolderIcon,
   Lock,
   LockOpen,
@@ -38,6 +39,14 @@ type Props = {
   onDelete: () => void;
   onShare?: () => void;
   onToggleLock?: () => void;
+  /**
+   * Optional handler for "Download as ZIP". When provided, the menu
+   * shows a Download entry that triggers a server-side recursive
+   * ZIP build via `/v1/files/zip`. Left optional so non-Drive
+   * surfaces (if any future page renders FolderGridCard) can opt
+   * out without forcing them to no-op the prop.
+   */
+  onDownload?: () => void;
 };
 
 export function FolderGridCard({
@@ -50,6 +59,7 @@ export function FolderGridCard({
   onDelete,
   onShare,
   onToggleLock,
+  onDownload,
 }: Props) {
   return (
     <div
@@ -110,6 +120,12 @@ export function FolderGridCard({
             <PencilLine className="h-4 w-4" />
             Rename
           </DropdownMenuItem>
+          {onDownload && (
+            <DropdownMenuItem onClick={onDownload}>
+              <Download className="h-4 w-4" />
+              Download as ZIP
+            </DropdownMenuItem>
+          )}
           {onShare && (
             <DropdownMenuItem onClick={onShare}>
               <Users className="h-4 w-4" />

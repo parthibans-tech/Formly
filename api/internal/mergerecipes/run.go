@@ -40,6 +40,7 @@ import (
 	"github.com/docforge/api/internal/docconvert"
 	"github.com/docforge/api/internal/pdfmerge"
 	"github.com/docforge/api/internal/queue"
+	"github.com/docforge/api/internal/uploadpolicy"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -296,7 +297,8 @@ func (h *Handler) persistOutput(ctx context.Context, orgID, userID, name, folder
 	).Scan(&id); err != nil {
 		return "", err
 	}
-	key := fmt.Sprintf("orgs/%s/files/%s/%s", orgID, id, name)
+	key := fmt.Sprintf("orgs/%s/files/%s/%s",
+		orgID, id, uploadpolicy.SafeStorageSlug(name))
 	if _, err := h.DB.Exec(ctx, `UPDATE files SET storage_key=$1 WHERE id=$2`, key, id); err != nil {
 		return "", err
 	}

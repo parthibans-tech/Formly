@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "_comment_postinstall": "Self-host the PDF.js worker so we don't depend on unpkg.com (CSP-blocked, occasional outages). Re-runs on every `npm install` to keep the public copy in lockstep with the pinned pdfjs-dist version.",
+    "postinstall": "node -e \"require('fs').mkdirSync('public/pdf-worker',{recursive:true}); require('fs').copyFileSync(require.resolve('pdfjs-dist/build/pdf.worker.min.js'),'public/pdf-worker/pdf.worker.min.js'); console.log('Copied pdf.worker.min.js → public/pdf-worker/');\""
   },
   "dependencies": {
     "@blocknote/core": "^0.48.1",

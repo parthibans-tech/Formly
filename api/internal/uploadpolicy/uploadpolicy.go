@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -47,6 +48,57 @@ type Policy struct {
 	ScanEnabled             bool
 	MaxFilenameLen          int
 	ForceAttachmentForRisky bool
+
+	// PreviewCSP is the literal Content-Security-Policy header value the
+	// API attaches to inline-preview responses (the InlinePreview proxy
+	// streams blob bytes with this header set). Defense-in-depth against
+	// stored-XSS: even if a forged text/html or weaponised SVG slips past
+	// the upload sniffer, this CSP keeps it from doing anything in the
+	// designer's iframe context. Default is "no JS, no network, sandbox".
+	PreviewCSP string
+
+	// PreviewIframeSandbox is the literal value the frontend should set on
+	// the <iframe sandbox="..."> that hosts a preview. "" = maximum
+	// isolation (no scripts, no forms, no same-origin). Orgs that need
+	// to relax this for trusted content (e.g. their own marketing HTML)
+	// can list tokens like "allow-scripts allow-forms allow-same-origin".
+	// Surfaced in the preview-URL response shape so the frontend stays
+	// in lockstep with the active policy.
+	PreviewIframeSandbox string
+
+	// PdfHardenEnabled gates the synchronous PDF structural scan
+	// (internal/pdfsec) that runs at upload Complete. When true, every
+	// uploaded application/pdf is inspected for active-content features
+	// (JavaScript, Launch actions, embedded files, external file refs)
+	// and rejected if the resolved PdfBlockedFeatures matches. Runs
+	// independently of ScanEnabled — does not require a ClamAV daemon.
+	PdfHardenEnabled bool
+
+	// PdfBlockedFeatures is the list of pdfsec.Threat constants the
+	// policy refuses on detection. nil/empty = scan-but-don't-block
+	// (report-only, useful for audit visibility before turning on
+	// enforcement). Default — when PdfHardenEnabled is true and this
+	// list is empty — applies pdfsec.DefaultBlockedFeatures.
+	PdfBlockedFeatures []string
+
+	// EmbedAllowedOrigins is the per-org allowlist of HTTP origins
+	// (scheme + host + optional port; one entry per origin) that may
+	// embed this org's public form/share/review pages in an iframe.
+	// Merged into the response's Content-Security-Policy
+	// `frame-ancestors` directive — and the matching Next.js middleware
+	// strips the inherited `X-Frame-Options: SAMEORIGIN` so modern
+	// browsers actually honour the wider list.
+	//
+	// Empty (the safe default) = lock-down, only same-origin embedding
+	// permitted (today's behaviour). Populated = those origins, plus
+	// 'self', may iframe the embed routes. The product-level default is
+	// also empty — we do NOT ship a cross-tenant default origin list
+	// because that would silently let one customer iframe another
+	// customer's branded form.
+	//
+	// Validation: each entry must parse as a valid URL with scheme +
+	// host, no path. See ValidateEmbedOrigin.
+	EmbedAllowedOrigins []string
 }
 
 // Overrides is the raw row from org_upload_config — NULLs preserved so
@@ -61,6 +113,11 @@ type Overrides struct {
 	ScanEnabled             *bool
 	MaxFilenameLen          *int
 	ForceAttachmentForRisky *bool
+	PreviewCSP              *string
+	PreviewIframeSandbox    *string
+	PdfHardenEnabled        *bool
+	PdfBlockedFeatures      []string // nil = inherit; empty slice = report-only
+	EmbedAllowedOrigins     []string // nil = inherit; empty slice = explicit lock-down
 }
 
 // ProductPolicy is the singleton platform-default record. Same shape as
@@ -144,8 +201,13 @@ func (s *Service) UpdateProduct(ctx context.Context, userID string, p Policy) er
 		   scan_enabled=$5,
 		   max_filename_len=$6,
 		   force_attachment_for_risky=$7,
+		   preview_csp=$8,
+		   preview_iframe_sandbox=$9,
+		   pdf_harden_enabled=$10,
+		   pdf_blocked_features=$11,
+		   embed_allowed_origins=$12,
 		   updated_at=now(),
-		   updated_by=$8
+		   updated_by=$13
 		 WHERE id='default'`,
 		p.MaxUploadBytes,
 		p.AllowedMimeTypes,
@@ -154,6 +216,11 @@ func (s *Service) UpdateProduct(ctx context.Context, userID string, p Policy) er
 		p.ScanEnabled,
 		p.MaxFilenameLen,
 		p.ForceAttachmentForRisky,
+		p.PreviewCSP,
+		p.PreviewIframeSandbox,
+		p.PdfHardenEnabled,
+		p.PdfBlockedFeatures,
+		p.EmbedAllowedOrigins,
 		userID,
 	)
 	if err != nil {
@@ -176,8 +243,10 @@ func (s *Service) UpdateOrg(ctx context.Context, userID, orgID string, ov Overri
 		`INSERT INTO org_upload_config
 		   (org_id, max_upload_bytes, allowed_mime_types, blocked_extensions,
 		    mime_sniff_enabled, scan_enabled, max_filename_len,
-		    force_attachment_for_risky, updated_at, updated_by)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now(), $9)
+		    force_attachment_for_risky, preview_csp, preview_iframe_sandbox,
+		    pdf_harden_enabled, pdf_blocked_features, embed_allowed_origins,
+		    updated_at, updated_by)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13, now(), $14)
 		 ON CONFLICT (org_id) DO UPDATE SET
 		   max_upload_bytes=EXCLUDED.max_upload_bytes,
 		   allowed_mime_types=EXCLUDED.allowed_mime_types,
@@ -186,6 +255,11 @@ func (s *Service) UpdateOrg(ctx context.Context, userID, orgID string, ov Overri
 		   scan_enabled=EXCLUDED.scan_enabled,
 		   max_filename_len=EXCLUDED.max_filename_len,
 		   force_attachment_for_risky=EXCLUDED.force_attachment_for_risky,
+		   preview_csp=EXCLUDED.preview_csp,
+		   preview_iframe_sandbox=EXCLUDED.preview_iframe_sandbox,
+		   pdf_harden_enabled=EXCLUDED.pdf_harden_enabled,
+		   pdf_blocked_features=EXCLUDED.pdf_blocked_features,
+		   embed_allowed_origins=EXCLUDED.embed_allowed_origins,
 		   updated_at=now(),
 		   updated_by=EXCLUDED.updated_by`,
 		orgID,
@@ -196,6 +270,11 @@ func (s *Service) UpdateOrg(ctx context.Context, userID, orgID string, ov Overri
 		ov.ScanEnabled,
 		ov.MaxFilenameLen,
 		ov.ForceAttachmentForRisky,
+		ov.PreviewCSP,
+		ov.PreviewIframeSandbox,
+		ov.PdfHardenEnabled,
+		ov.PdfBlockedFeatures,
+		ov.EmbedAllowedOrigins,
 		userID,
 	)
 	if err != nil {
@@ -329,13 +408,69 @@ func SniffMime(headBytes []byte, declared string) (detected string, mismatch boo
 	return detected, d1 != d2
 }
 
+// CanonicalMime decides which MIME to PERSIST after a successful upload.
+// The client's declaration is often more specific than what
+// http.DetectContentType can tell us — DOCX detects as application/zip
+// because DOCX is a ZIP, but downstream code keys on the precise office
+// MIME — so we keep the declaration whenever it's plausibly consistent
+// with the detected family. When they conflict at the family level
+// (e.g. declared image/png, detected text/plain) we trust the bytes
+// over the claim, because the alternative is letting a forged MIME ride
+// into files.mime and skew every downstream branch (Detector, download
+// disposition, IsRiskyMime).
+//
+// This runs alongside SniffMime: if the policy toggle is on, mismatched
+// uploads are rejected before this is consulted, so the "trust bytes"
+// branch only fires when an org admin opted out of strict mode.
+func CanonicalMime(declared, detected string) string {
+	d := strings.ToLower(strings.TrimSpace(declared))
+	// Strip parameters from detected — http.DetectContentType returns
+	// values like "text/html; charset=utf-8", and we don't want the
+	// charset noise leaking into files.mime where downstream code does
+	// exact-string equality.
+	x := strings.ToLower(strings.TrimSpace(detected))
+	if i := strings.Index(x, ";"); i >= 0 {
+		x = strings.TrimSpace(x[:i])
+	}
+
+	// Detection is the "I don't know" sentinel — fall back to whatever
+	// the client said (or octet-stream if they said nothing either).
+	if x == "" || x == "application/octet-stream" {
+		if d == "" {
+			return "application/octet-stream"
+		}
+		return d
+	}
+	// Declaration is empty / generic — bytes win.
+	if d == "" || d == "application/octet-stream" {
+		return x
+	}
+	// Same family (modulo +xml suffix and content-type parameters):
+	// keep the more specific declaration.
+	if family(d) == family(x) {
+		return d
+	}
+	// text/* vs text/* is noisy (text/plain detection often shadows
+	// text/html, text/csv, etc.); keep the declaration. SniffMime
+	// applies the same exemption.
+	if strings.HasPrefix(family(d), "text/") && strings.HasPrefix(family(x), "text/") {
+		return d
+	}
+	// Family mismatch and we got here — declared lied. Trust bytes.
+	return x
+}
+
 // IsRiskyMime returns true when serving this MIME inline could enable a
 // stored-XSS attack (HTML, SVG, XHTML). Used by the download presign to
 // force Content-Disposition: attachment per policy.
 func IsRiskyMime(mime string) bool {
-	m := strings.ToLower(strings.TrimSpace(mime))
+	// Strip parameters and +xml suffix so "text/html; charset=utf-8"
+	// and "application/xhtml+xml" both reduce to their family form.
+	// http.DetectContentType emits parameters by default (charset),
+	// and storing them shouldn't bypass the XSS check.
+	m := family(mime)
 	switch {
-	case m == "text/html", m == "application/xhtml+xml":
+	case m == "text/html", m == "application/xhtml":
 		return true
 	case strings.HasPrefix(m, "image/svg"):
 		return true
@@ -347,7 +482,9 @@ func IsRiskyMime(mime string) bool {
 
 // SanitizeFilename strips path separators and control characters. Returns
 // the cleaned name; never empty if input wasn't all-whitespace (falls back
-// to "untitled").
+// to "untitled"). Caps total length at AbsMaxFilenameLen (255) — that's
+// the POSIX/NTFS ceiling and beyond it nothing downstream copes well
+// (Content-Disposition headers, presigned-URL paths, FS round-trips).
 func SanitizeFilename(name string) string {
 	name = strings.TrimSpace(name)
 	// Strip path components: only the basename ever ends up in the object
@@ -369,7 +506,114 @@ func SanitizeFilename(name string) string {
 	if out == "" {
 		out = "untitled"
 	}
+	// Hard ceiling regardless of org policy. The policy's MaxFilenameLen
+	// gates the *upload request* with a 4xx; this is the last-line
+	// defense for code paths that don't run policy (legacy clients,
+	// internal-derived names, mis-wired handlers). We preserve the
+	// extension so downstream MIME hints stay intact.
+	return capFilenameLen(out, AbsMaxFilenameLen)
+}
+
+// AbsMaxFilenameLen is the absolute upper bound on stored filenames,
+// independent of org policy. POSIX NAME_MAX is 255 bytes; we keep parity
+// so a downloaded file always round-trips through the local filesystem.
+const AbsMaxFilenameLen = 255
+
+// capFilenameLen truncates `name` to at most n bytes while preserving
+// the extension (so "long-resume.pdf" stays a .pdf). If the extension
+// itself is pathological (>16 bytes — almost certainly a fake), we
+// fall back to a plain right-trim.
+func capFilenameLen(name string, n int) string {
+	if n <= 0 || len(name) <= n {
+		return name
+	}
+	ext := filepath.Ext(name)
+	if len(ext) == 0 || len(ext) > 16 {
+		return name[:n]
+	}
+	stem := name[:len(name)-len(ext)]
+	keep := n - len(ext)
+	if keep <= 0 {
+		return name[:n]
+	}
+	return stem[:keep] + ext
+}
+
+// SafeStorageSlug returns an opaque, ASCII-only, URL-safe form of `name`
+// suitable for embedding in an object-storage key. Use this — never the
+// raw user-supplied filename — when constructing keys like
+// `orgs/<id>/files/<id>/<slug>`.
+//
+// Why a separate function (vs. just using SanitizeFilename for both):
+//
+//   - Object-storage keys end up in presigned URLs that pass through
+//     ASCII-aware tooling (CDNs, log scrapers, webhook payloads, replay
+//     attackers reusing the path). Keeping keys pure ASCII avoids
+//     surprises with mojibake, RTL-override exploits, NULs, quotes,
+//     and combining marks.
+//   - Storage keys are never shown to the user — files.name is the
+//     display field — so we can be aggressive without UX cost.
+//   - Caps at SafeStorageSlugMaxLen so a 4 KB filename can't blow past
+//     S3's 1024-byte key ceiling once concatenated with org/file UUIDs.
+//
+// Output charset: [a-z0-9._-]. Runs of disallowed characters collapse
+// to a single dash. Always returns a non-empty value (falls back to
+// "file" if input sanitises to nothing).
+func SafeStorageSlug(name string) string {
+	name = filepath.Base(strings.TrimSpace(name))
+	if name == "." || name == "/" || name == "\\" || name == "" {
+		return "file"
+	}
+	// Split off the extension so we slug stem + ext separately and
+	// don't collapse the dot.
+	ext := filepath.Ext(name)
+	stem := name[:len(name)-len(ext)]
+
+	stem = slugifyASCII(stem)
+	ext = slugifyASCII(ext) // strips weird chars from `.foo bar` etc.
+
+	if stem == "" {
+		stem = "file"
+	}
+	out := stem + ext
+	out = capFilenameLen(out, SafeStorageSlugMaxLen)
+	// Final paranoia: if cap or slugify left an empty string somehow,
+	// don't return "" (would produce keys ending in a slash).
+	if out == "" || out == "." || out == "-" {
+		return "file"
+	}
 	return out
+}
+
+// SafeStorageSlugMaxLen bounds the slug at 80 bytes — comfortably under
+// S3's 1024-byte key max even after concatenation with the
+// `orgs/<uuid>/files/<uuid>/` prefix (~85 bytes for two UUIDs +
+// boilerplate).
+const SafeStorageSlugMaxLen = 80
+
+// slugifyASCII lowercases and reduces input to [a-z0-9._-], collapsing
+// runs of disallowed chars into a single '-'. Trims leading/trailing
+// dashes so we don't produce keys like `orgs/.../files/.../-thing`.
+func slugifyASCII(s string) string {
+	s = strings.ToLower(s)
+	var b strings.Builder
+	b.Grow(len(s))
+	prevDash := false
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= '0' && r <= '9',
+			r == '.' || r == '_' || r == '-':
+			b.WriteRune(r)
+			prevDash = false
+		default:
+			if !prevDash {
+				b.WriteByte('-')
+				prevDash = true
+			}
+		}
+	}
+	return strings.Trim(b.String(), "-")
 }
 
 // ---------------------------------------------------------------------
@@ -412,7 +656,10 @@ func (s *Service) loadProduct(ctx context.Context) (ProductPolicy, error) {
 	err := s.db.QueryRow(ctx,
 		`SELECT max_upload_bytes, allowed_mime_types, blocked_extensions,
 		        mime_sniff_enabled, scan_enabled, max_filename_len,
-		        force_attachment_for_risky, updated_at, updated_by
+		        force_attachment_for_risky, preview_csp,
+		        preview_iframe_sandbox, pdf_harden_enabled,
+		        pdf_blocked_features, embed_allowed_origins,
+		        updated_at, updated_by
 		   FROM product_config WHERE id='default'`,
 	).Scan(
 		&pp.MaxUploadBytes,
@@ -422,6 +669,11 @@ func (s *Service) loadProduct(ctx context.Context) (ProductPolicy, error) {
 		&pp.ScanEnabled,
 		&pp.MaxFilenameLen,
 		&pp.ForceAttachmentForRisky,
+		&pp.PreviewCSP,
+		&pp.PreviewIframeSandbox,
+		&pp.PdfHardenEnabled,
+		&pp.PdfBlockedFeatures,
+		&pp.EmbedAllowedOrigins,
 		&pp.UpdatedAt,
 		&updatedBy,
 	)
@@ -442,7 +694,8 @@ func (s *Service) loadOrgOverrides(ctx context.Context, orgID string) (Overrides
 	err := s.db.QueryRow(ctx,
 		`SELECT max_upload_bytes, allowed_mime_types, blocked_extensions,
 		        mime_sniff_enabled, scan_enabled, max_filename_len,
-		        force_attachment_for_risky
+		        force_attachment_for_risky, preview_csp, preview_iframe_sandbox,
+		        pdf_harden_enabled, pdf_blocked_features, embed_allowed_origins
 		   FROM org_upload_config WHERE org_id=$1`,
 		orgID,
 	).Scan(
@@ -453,6 +706,11 @@ func (s *Service) loadOrgOverrides(ctx context.Context, orgID string) (Overrides
 		&ov.ScanEnabled,
 		&ov.MaxFilenameLen,
 		&ov.ForceAttachmentForRisky,
+		&ov.PreviewCSP,
+		&ov.PreviewIframeSandbox,
+		&ov.PdfHardenEnabled,
+		&ov.PdfBlockedFeatures,
+		&ov.EmbedAllowedOrigins,
 	)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return Overrides{}, err
@@ -483,6 +741,29 @@ func mergeProductOrg(prod Policy, ov Overrides) Policy {
 	if ov.ForceAttachmentForRisky != nil {
 		out.ForceAttachmentForRisky = *ov.ForceAttachmentForRisky
 	}
+	if ov.PreviewCSP != nil {
+		out.PreviewCSP = *ov.PreviewCSP
+	}
+	if ov.PreviewIframeSandbox != nil {
+		out.PreviewIframeSandbox = *ov.PreviewIframeSandbox
+	}
+	if ov.PdfHardenEnabled != nil {
+		out.PdfHardenEnabled = *ov.PdfHardenEnabled
+	}
+	if ov.PdfBlockedFeatures != nil {
+		// Override semantics: any non-nil slice replaces wholesale,
+		// even an explicit empty list (= "report-only" mode). nil
+		// means inherit, matching the AllowedMimeTypes convention.
+		out.PdfBlockedFeatures = ov.PdfBlockedFeatures
+	}
+	if ov.EmbedAllowedOrigins != nil {
+		// Same tri-state as PdfBlockedFeatures: nil = inherit,
+		// []string{} = explicit empty (lock-down — overrides a wider
+		// product-level default), populated = replace wholesale. The
+		// product default itself is empty, so this knob is almost
+		// always set per-org.
+		out.EmbedAllowedOrigins = ov.EmbedAllowedOrigins
+	}
 	return out
 }
 
@@ -497,8 +778,51 @@ func defaultPolicy() Policy {
 		ScanEnabled:             false,
 		MaxFilenameLen:          255,
 		ForceAttachmentForRisky: true,
+		PreviewCSP:              DefaultPreviewCSP,
+		PreviewIframeSandbox:    DefaultPreviewIframeSandbox,
+		PdfHardenEnabled:        true,
+		PdfBlockedFeatures:      DefaultPdfBlockedFeatures(),
+		// EmbedAllowedOrigins intentionally empty by default —
+		// shipping any cross-tenant default origin would silently let
+		// one customer iframe another customer's branded form. Org
+		// admins opt in explicitly per-origin.
+		EmbedAllowedOrigins: nil,
 	}
 }
+
+// DefaultPdfBlockedFeatures returns a fresh slice mirroring
+// pdfsec.DefaultBlockedFeatures. Returned by value (not the package
+// constant) so a caller mutating the slice can't poison every future
+// defaultPolicy() call. Kept here, not in pdfsec, to avoid a hard
+// import cycle between uploadpolicy and pdfsec — the policy layer
+// shouldn't depend on the scanner implementation.
+func DefaultPdfBlockedFeatures() []string {
+	return []string{"javascript", "launch", "embedded_file", "external_xobject"}
+}
+
+// DefaultPreviewCSP is the maximally restrictive Content-Security-Policy
+// the API attaches to inline previews when no org/product override is
+// active. It mirrors the SQL default in migrations/042_preview_csp.sql so
+// in-process fallbacks (when the migration hasn't seeded yet) match what
+// the DB would have served. Knobs:
+//
+//   - default-src 'none'        — deny everything by default.
+//   - img-src 'self' data: blob:— allow images from same-origin and
+//                                  inline-encoded only.
+//   - style-src 'unsafe-inline' — allow inline CSS so HTML mocks render.
+//                                  Inline JS is still blocked (no
+//                                  script-src directive).
+//   - font-src 'self' data:     — allow web fonts where useful.
+//   - sandbox                   — apply the sandbox flag at the response
+//                                  level even if the iframe forgets to.
+const DefaultPreviewCSP = "default-src 'none'; img-src 'self' data: blob:; style-src 'unsafe-inline'; font-src 'self' data:; sandbox"
+
+// DefaultPreviewIframeSandbox is the literal `<iframe sandbox="...">`
+// value the frontend should apply when no override is active. Empty
+// string = the most restrictive sandbox (no scripts, no forms, no
+// same-origin, no top-level navigation). Orgs that need to relax this
+// for trusted internal content list tokens explicitly.
+const DefaultPreviewIframeSandbox = ""
 
 func mimeAllowed(mime string, allowed []string) bool {
 	m := strings.ToLower(strings.TrimSpace(mime))
@@ -540,12 +864,22 @@ func validateInputs(p Policy) error {
 	if p.MaxFilenameLen <= 0 || p.MaxFilenameLen > 4096 {
 		return &Error{Status: 400, Code: "invalid_filename_len", Message: "max_filename_len must be between 1 and 4096"}
 	}
+	for _, o := range p.EmbedAllowedOrigins {
+		if err := ValidateEmbedOrigin(o); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
 func validateOverrides(ov Overrides) error {
 	if ov.MaxUploadBytes != nil && *ov.MaxUploadBytes <= 0 {
 		return &Error{Status: 400, Code: "invalid_max_bytes", Message: "max_upload_bytes must be positive"}
+	}
+	for _, o := range ov.EmbedAllowedOrigins {
+		if err := ValidateEmbedOrigin(o); err != nil {
+			return err
+		}
 	}
 	if ov.MaxFilenameLen != nil && (*ov.MaxFilenameLen <= 0 || *ov.MaxFilenameLen > 4096) {
 		return &Error{Status: 400, Code: "invalid_filename_len", Message: "max_filename_len must be between 1 and 4096"}
@@ -564,4 +898,107 @@ func humanBytes(b int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %sB", float64(b)/float64(div), "KMGTPE"[exp:exp+1])
+}
+
+// ---------------------------------------------------------------------
+// Embed-origin allowlist helpers
+// ---------------------------------------------------------------------
+
+// ValidateEmbedOrigin enforces that a stored entry of EmbedAllowedOrigins
+// is a literal HTTP origin: scheme + host (+ optional port), no path,
+// no query, no fragment, no userinfo. The frame-ancestors CSP directive
+// is parsed strictly by browsers — a bogus entry like "customer.com"
+// (no scheme) or "https://customer.com/embed" (path) silently invalidates
+// the WHOLE directive in some engines, dropping back to default-src and
+// blocking the legitimate origins we did get right. The validator runs
+// at write time so a typo is rejected by the admin API rather than
+// landing in production and degrading every embed.
+//
+// Wildcards are NOT permitted: "*" or "https://*.customer.com" would let
+// any subdomain phish the customer's brand by registering a sibling.
+// Customers wanting subdomain coverage must list each subdomain
+// explicitly.
+func ValidateEmbedOrigin(raw string) error {
+	o := strings.TrimSpace(raw)
+	if o == "" {
+		return &Error{
+			Status: 400, Code: "invalid_embed_origin",
+			Message: "embed origin must not be empty",
+		}
+	}
+	u, err := url.Parse(o)
+	if err != nil {
+		return &Error{
+			Status: 400, Code: "invalid_embed_origin",
+			Message: fmt.Sprintf("embed origin %q is not a valid URL: %v", raw, err),
+		}
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return &Error{
+			Status: 400, Code: "invalid_embed_origin",
+			Message: fmt.Sprintf("embed origin %q must use http:// or https://", raw),
+		}
+	}
+	if u.Host == "" {
+		return &Error{
+			Status: 400, Code: "invalid_embed_origin",
+			Message: fmt.Sprintf("embed origin %q is missing a host", raw),
+		}
+	}
+	if u.Path != "" && u.Path != "/" {
+		return &Error{
+			Status: 400, Code: "invalid_embed_origin",
+			Message: fmt.Sprintf("embed origin %q must not include a path", raw),
+		}
+	}
+	if u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return &Error{
+			Status: 400, Code: "invalid_embed_origin",
+			Message: fmt.Sprintf("embed origin %q must not include query, fragment, or userinfo", raw),
+		}
+	}
+	if strings.Contains(u.Host, "*") {
+		return &Error{
+			Status: 400, Code: "invalid_embed_origin",
+			Message: fmt.Sprintf("embed origin %q must not contain wildcards; list each subdomain explicitly", raw),
+		}
+	}
+	return nil
+}
+
+// NormalizeEmbedOrigin returns the canonical "scheme://host[:port]" form
+// of a previously-validated origin, lower-cased so duplicate entries
+// (Https://Customer.com vs https://customer.com) collapse on save.
+func NormalizeEmbedOrigin(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return strings.TrimSpace(raw)
+	}
+	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host)
+}
+
+// BuildFrameAncestors returns the literal value for the CSP
+// `frame-ancestors` directive given an org's allowed-origins list. The
+// returned string includes the directive name so callers can splice it
+// into a wider CSP without re-implementing the formatting:
+//
+//	"frame-ancestors 'self'"                            // empty list
+//	"frame-ancestors 'self' https://customer.example"   // one entry
+//
+// 'self' is always included so the SPA's own pages can still iframe
+// each other (the designer previewing a form, etc.). Empty / nil list
+// produces "frame-ancestors 'self'", matching the pre-feature
+// `X-Frame-Options: SAMEORIGIN` posture.
+func BuildFrameAncestors(origins []string) string {
+	parts := []string{"'self'"}
+	seen := map[string]bool{"'self'": true}
+	for _, o := range origins {
+		n := NormalizeEmbedOrigin(o)
+		if n == "" || seen[n] {
+			continue
+		}
+		seen[n] = true
+		parts = append(parts, n)
+	}
+	return "frame-ancestors " + strings.Join(parts, " ")
 }

@@ -19,7 +19,9 @@ import (
 	"github.com/docforge/api/internal/mergerecipes"
 	"github.com/docforge/api/internal/pdfmerge"
 	"github.com/docforge/api/internal/queue"
+	"github.com/docforge/api/internal/scanner"
 	"github.com/docforge/api/internal/storage"
+	"github.com/docforge/api/internal/uploadpolicy"
 	"github.com/hibiken/asynq"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -38,6 +40,10 @@ type Handlers struct {
 	// recipe runs. Same handler the HTTP layer uses; the worker just
 	// invokes RunForJob instead of the HTTP entry.
 	MergeRecipes *mergerecipes.Handler
+	// Scanner powers TaskScanFile. Selected by scanner.FromEnv at
+	// startup so dev/CI default to Noop and prod attaches to ClamAV.
+	// Nil = scan handler refuses to run (fail-loud, not silent-pass).
+	Scanner scanner.Scanner
 }
 
 func (h *Handlers) Register(mux *asynq.ServeMux) {
@@ -46,6 +52,7 @@ func (h *Handlers) Register(mux *asynq.ServeMux) {
 	mux.HandleFunc(queue.TaskConvertToPDF, h.convertToPDF)
 	mux.HandleFunc(queue.TaskMergePDF, h.mergePDF)
 	mux.HandleFunc(queue.TaskRunMergeRecipe, h.runMergeRecipe)
+	mux.HandleFunc(queue.TaskScanFile, h.scanFile)
 }
 
 // runMergeRecipe is the asynq entry point for TaskRunMergeRecipe. The
@@ -157,7 +164,11 @@ func (h *Handlers) convertToPDF(ctx context.Context, t *asynq.Task) error {
 	// `previews/` namespace so it never collides with org/files/<id>
 	// (sources) or org/outputs/<id> (generated docs).
 	pdfName := strings.TrimSuffix(filepath.Base(name), filepath.Ext(name)) + ".pdf"
-	pdfKey := fmt.Sprintf("orgs/%s/previews/%s/%s", p.OrgID, p.FileID, pdfName)
+	// Slugify the source-derived name before it lands in a key — the
+	// stem traces back to whatever the user uploaded, so it carries
+	// the same risks as a fresh upload.
+	pdfKey := fmt.Sprintf("orgs/%s/previews/%s/%s",
+		p.OrgID, p.FileID, uploadpolicy.SafeStorageSlug(pdfName))
 	if err := h.Storage.PutBytes(ctx, pdfKey, "application/pdf", res.PDF); err != nil {
 		_ = h.markConvertFailed(ctx, p.FileID, "store pdf: "+err.Error())
 		return err

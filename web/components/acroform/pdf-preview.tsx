@@ -31,9 +31,14 @@ import {
   Plus,
 } from "lucide-react";
 
-// Point the PDF.js worker at the locally-bundled file.
-// The copy of pdfjs-dist shipped with react-pdf exposes the worker under /build/.
-pdfjs.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.js`;
+// Point the PDF.js worker at our self-hosted copy in /public/pdf-worker/.
+// The file is copied there by package.json's postinstall script from
+// node_modules/pdfjs-dist/build/pdf.worker.min.js, so it stays in lockstep
+// with the pinned pdfjs-dist version. Self-hosting matters because:
+//   1. The default Next.js CSP blocks //unpkg.com/* (cross-origin script).
+//   2. unpkg has had multi-hour outages in the past — we don't want PDF
+//      preview to depend on a third-party CDN's uptime.
+pdfjs.GlobalWorkerOptions.workerSrc = "/pdf-worker/pdf.worker.min.js";
 
 export type RenderedPage = {
   pageNum: number;

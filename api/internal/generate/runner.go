@@ -20,6 +20,7 @@ import (
 	"github.com/docforge/api/internal/i18n"
 	"github.com/docforge/api/internal/layout"
 	"github.com/docforge/api/internal/storage"
+	"github.com/docforge/api/internal/uploadpolicy"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -163,7 +164,8 @@ func (r *Runner) Run(ctx context.Context, orgID, userID, templateID string, data
 	if err != nil {
 		return nil, fmt.Errorf("create file row: %w", err)
 	}
-	outKey := fmt.Sprintf("orgs/%s/outputs/%s/%s", orgID, outFileID, outName)
+	outKey := fmt.Sprintf("orgs/%s/outputs/%s/%s",
+		orgID, outFileID, uploadpolicy.SafeStorageSlug(outName))
 	if _, err := r.DB.Exec(ctx, `UPDATE files SET storage_key=$1 WHERE id=$2`, outKey, outFileID); err != nil {
 		return nil, err
 	}
@@ -210,7 +212,10 @@ func (r *Runner) RunPreview(ctx context.Context, orgID, userID, templateID strin
 	if err := r.Storage.PutBytes(ctx, key, "application/pdf", output); err != nil {
 		return nil, fmt.Errorf("upload preview: %w", err)
 	}
-	url, err := r.Storage.PresignGetInline(ctx, key, 10*time.Minute)
+	// Always PDF for previews — server-generated, never user-supplied,
+	// safe to render inline. Pass the explicit MIME so the storage
+	// hardening logic doesn't have to second-guess.
+	url, err := r.Storage.PresignGetInline(ctx, key, "application/pdf", 10*time.Minute)
 	if err != nil {
 		return nil, fmt.Errorf("presign preview: %w", err)
 	}
@@ -228,7 +233,8 @@ func (r *Runner) PutRaw(ctx context.Context, orgID, userID, name, mime string, d
 	if err != nil {
 		return nil, err
 	}
-	key := fmt.Sprintf("orgs/%s/outputs/%s/%s", orgID, id, name)
+	key := fmt.Sprintf("orgs/%s/outputs/%s/%s",
+		orgID, id, uploadpolicy.SafeStorageSlug(name))
 	if _, err := r.DB.Exec(ctx, `UPDATE files SET storage_key=$1 WHERE id=$2`, key, id); err != nil {
 		return nil, err
 	}

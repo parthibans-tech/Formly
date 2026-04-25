@@ -1,20 +1,26 @@
 package files
 
 import (
+	"archive/zip"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/docforge/api/internal/audit"
 	"github.com/docforge/api/internal/auth"
 	"github.com/docforge/api/internal/billing"
 	"github.com/docforge/api/internal/docconvert"
 	"github.com/docforge/api/internal/events"
+	"github.com/docforge/api/internal/pdfsec"
 	"github.com/docforge/api/internal/queue"
+	"github.com/docforge/api/internal/scanner"
 	"github.com/docforge/api/internal/sharing"
 	"github.com/docforge/api/internal/storage"
 	"github.com/docforge/api/internal/uploadpolicy"
@@ -174,6 +180,52 @@ func (h *Handler) CreateUploadURL(w http.ResponseWriter, r *http.Request) {
 	if req.Mime == "" {
 		req.Mime = "application/octet-stream"
 	}
+
+	// Sanitise the display name UNCONDITIONALLY — the storage-key
+	// construction below depends on a clean name even when no per-org
+	// policy is wired. SanitizeFilename strips path separators, control
+	// chars, and caps at AbsMaxFilenameLen (255 bytes) so we never let
+	// a 4 KB filename through the door regardless of policy state.
+	req.Name = uploadpolicy.SanitizeFilename(req.Name)
+
+	// Resolve the layered upload policy (product → org overrides), then
+	// run every pre-presign check: extension blocklist, MIME allowlist,
+	// size cap, policy-specific filename length. Doing this before we
+	// touch the DB keeps obviously-bad uploads from creating a ghost
+	// row.
+	var policy uploadpolicy.Policy
+	if h.Policy != nil {
+		p, err := h.Policy.Effective(r.Context(), c.OrgID)
+		if err != nil {
+			writeErr(w, 500, "policy_error", err.Error())
+			return
+		}
+		policy = p
+		if err := uploadpolicy.CheckPresign(policy, req.Name, req.Mime, req.Size); err != nil {
+			if pe, ok := uploadpolicy.IsError(err); ok {
+				audit.LogHTTP(r, h.DB, "file.upload.rejected", "file", "", map[string]any{
+					"reason":      "policy_block",
+					"policyCode":  pe.Code,
+					"name":        req.Name,
+					"claimedMime": req.Mime,
+					"claimedSize": req.Size,
+					"folderId":    req.FolderID,
+				})
+				writeErr(w, pe.Status, pe.Code, pe.Message)
+				return
+			}
+			audit.LogHTTP(r, h.DB, "file.upload.rejected", "file", "", map[string]any{
+				"reason":      "policy_error",
+				"name":        req.Name,
+				"claimedMime": req.Mime,
+				"claimedSize": req.Size,
+				"folderId":    req.FolderID,
+				"detail":      err.Error(),
+			})
+			writeErr(w, 400, "policy_error", err.Error())
+			return
+		}
+	}
 	// Normalise empty folderId to a typed nil so the SQL below can use a
 	// single "folder_id IS NOT DISTINCT FROM $N" predicate without
 	// branching for NULL vs text casts.
@@ -239,6 +291,13 @@ func (h *Handler) CreateUploadURL(w http.ResponseWriter, r *http.Request) {
 		//      saved mapping. User must delete + re-create the template
 		//      on purpose.
 		if existingTemplateID != nil && *existingTemplateID != "" {
+			audit.LogHTTP(r, h.DB, "file.upload.rejected", "file", existingID, map[string]any{
+				"reason":      "replace_template",
+				"name":        req.Name,
+				"claimedMime": req.Mime,
+				"claimedSize": req.Size,
+				"folderId":    req.FolderID,
+			})
 			writeConflict(w, conflictErr{
 				Code:           "template_replace_not_supported",
 				Message:        "can't replace a template's source file — delete the template first, or upload with a different name",
@@ -249,6 +308,14 @@ func (h *Handler) CreateUploadURL(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if existingOwner != c.UserID && !c.IsAdmin() {
+			audit.LogHTTP(r, h.DB, "file.upload.rejected", "file", existingID, map[string]any{
+				"reason":      "replace_forbidden",
+				"name":        req.Name,
+				"claimedMime": req.Mime,
+				"claimedSize": req.Size,
+				"folderId":    req.FolderID,
+				"existingOwnerId": existingOwner,
+			})
 			writeErr(w, 403, "forbidden", "only the file's owner or an admin can replace it")
 			return
 		}
@@ -258,7 +325,12 @@ func (h *Handler) CreateUploadURL(w http.ResponseWriter, r *http.Request) {
 		// place at the same key.
 		key := existingStorageKey
 		if key == "" {
-			key = fmt.Sprintf("orgs/%s/files/%s/%s", c.OrgID, existingID, req.Name)
+			// Storage key takes a slugified form of the name — the
+			// human-readable `req.Name` only lives in files.name.
+			// Keeps S3 paths ASCII-only and bounded so presigned URLs
+			// stay well-behaved through CDNs and replay attempts.
+			key = fmt.Sprintf("orgs/%s/files/%s/%s",
+				c.OrgID, existingID, uploadpolicy.SafeStorageSlug(req.Name))
 			if _, err := h.DB.Exec(r.Context(),
 				`UPDATE files SET storage_key=$1, status='pending', updated_at=now() WHERE id=$2`,
 				key, existingID,
@@ -275,17 +347,22 @@ func (h *Handler) CreateUploadURL(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		url, err := h.Storage.PresignPut(r.Context(), key, 15*time.Minute)
+		resp, err := h.buildUploadResponse(r.Context(), key, req.Mime, policy)
 		if err != nil {
 			writeErr(w, 500, "presign", err.Error())
 			return
 		}
-		writeJSON(w, 200, uploadURLResp{
-			FileID:    existingID,
-			UploadURL: url,
-			Key:       key,
-			Replaced:  true,
+		resp.FileID = existingID
+		resp.Replaced = true
+		audit.LogHTTP(r, h.DB, "file.upload.intent", "file", existingID, map[string]any{
+			"name":        req.Name,
+			"claimedMime": req.Mime,
+			"claimedSize": req.Size,
+			"folderId":    req.FolderID,
+			"conflict":    "replace",
+			"replaced":    true,
 		})
+		writeJSON(w, 200, resp)
 		return
 
 	case hasCollision && req.Conflict == "keep":
@@ -312,23 +389,64 @@ func (h *Handler) CreateUploadURL(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "db_error", err.Error())
 		return
 	}
-	key := fmt.Sprintf("orgs/%s/files/%s/%s", c.OrgID, id, req.Name)
+	// Slugified key path — see the replace branch above for rationale.
+	key := fmt.Sprintf("orgs/%s/files/%s/%s",
+		c.OrgID, id, uploadpolicy.SafeStorageSlug(req.Name))
 	if _, err := h.DB.Exec(r.Context(), `UPDATE files SET storage_key=$1 WHERE id=$2`, key, id); err != nil {
 		writeErr(w, 500, "db_error", err.Error())
 		return
 	}
 
-	url, err := h.Storage.PresignPut(r.Context(), key, 15*time.Minute)
+	resp, err := h.buildUploadResponse(r.Context(), key, req.Mime, policy)
 	if err != nil {
 		writeErr(w, 500, "presign", err.Error())
 		return
 	}
-	writeJSON(w, 200, uploadURLResp{
-		FileID:       id,
-		UploadURL:    url,
-		Key:          key,
-		ResolvedName: resolvedName,
-	})
+	resp.FileID = id
+	resp.ResolvedName = resolvedName
+	intentMeta := map[string]any{
+		"name":        req.Name,
+		"claimedMime": req.Mime,
+		"claimedSize": req.Size,
+		"folderId":    req.FolderID,
+	}
+	if req.Conflict != "" {
+		intentMeta["conflict"] = req.Conflict
+	}
+	if resolvedName != "" {
+		intentMeta["resolvedName"] = resolvedName
+	}
+	audit.LogHTTP(r, h.DB, "file.upload.intent", "file", id, intentMeta)
+	writeJSON(w, 200, resp)
+}
+
+// buildUploadResponse generates BOTH the new presigned-POST descriptor and
+// the legacy presigned-PUT URL for the same object key. The web client
+// prefers the POST shape (storage-layer content-length-range enforcement);
+// older API integrators that already wired PUT keep working until they
+// migrate. The size cap is enforced server-side at Complete time
+// regardless, so the legacy path stays safe.
+func (h *Handler) buildUploadResponse(
+	ctx context.Context, key, mime string, policy uploadpolicy.Policy,
+) (uploadURLResp, error) {
+	maxBytes := policy.MaxUploadBytes
+	if maxBytes <= 0 {
+		maxBytes = 100 * 1024 * 1024 // safe default if policy not wired
+	}
+	post, err := h.Storage.PresignPost(ctx, key, mime, maxBytes, 15*time.Minute)
+	if err != nil {
+		return uploadURLResp{}, err
+	}
+	putURL, err := h.Storage.PresignPut(ctx, key, 15*time.Minute)
+	if err != nil {
+		return uploadURLResp{}, err
+	}
+	return uploadURLResp{
+		Key:       key,
+		Upload:    post,
+		UploadURL: putURL,
+		MaxBytes:  maxBytes,
+	}, nil
 }
 
 // nextAvailableName finds the first " (N)" suffix (starting at 2) that
@@ -480,6 +598,132 @@ func (h *Handler) Complete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Layered upload-policy enforcement, post-upload edition. The
+	// presigned-POST policy already capped size at the storage edge,
+	// but legacy PUT presigns and direct API integrators don't get that
+	// guarantee — re-check here and delete the offending blob so we
+	// don't pay for it.
+	//
+	// We ALSO always read the first 512 bytes and run
+	// http.DetectContentType, even when the org admin has the strict
+	// mismatch-rejects toggle off: the detected MIME replaces the
+	// client-declared one in files.mime when they disagree, so
+	// downstream consumers (Detector, download disposition,
+	// IsRiskyMime) operate on bytes-truth instead of a client claim.
+	// See uploadpolicy.CanonicalMime for the merge logic.
+	var effPolicy uploadpolicy.Policy
+	var havePolicy bool
+	if h.Policy != nil {
+		policy, perr := h.Policy.Effective(r.Context(), c.OrgID)
+		if perr == nil {
+			effPolicy, havePolicy = policy, true
+			if err := uploadpolicy.CheckCompletedSize(policy, info.Size); err != nil {
+				if pe, ok := uploadpolicy.IsError(err); ok {
+					_ = h.Storage.Remove(r.Context(), key)
+					_, _ = h.DB.Exec(r.Context(),
+						`UPDATE files SET status='rejected', updated_at=now() WHERE id=$1`, id)
+					audit.LogHTTP(r, h.DB, "file.upload.rejected", "file", id, map[string]any{
+						"reason":      "size_cap",
+						"policyCode":  pe.Code,
+						"name":        name,
+						"claimedMime": mime,
+						"actualSize":  info.Size,
+					})
+					writeErr(w, pe.Status, pe.Code, pe.Message)
+					return
+				}
+			}
+			// Single Range read covers both the strict mismatch check
+			// AND the canonical-mime computation. Range failures aren't
+			// fatal — some pathological backends 416 on tiny ranges; we
+			// just skip sniffing in that case (matches the prior
+			// "best-effort" behavior).
+			if head, herr := h.Storage.HeadBytes(r.Context(), key, 512); herr == nil && len(head) > 0 {
+				detected, mismatch := uploadpolicy.SniffMime(head, mime)
+				if mismatch && policy.MimeSniffEnabled {
+					_ = h.Storage.Remove(r.Context(), key)
+					_, _ = h.DB.Exec(r.Context(),
+						`UPDATE files SET status='rejected', updated_at=now() WHERE id=$1`, id)
+					audit.LogHTTP(r, h.DB, "file.upload.rejected", "file", id, map[string]any{
+						"reason":      "mime_mismatch",
+						"name":        name,
+						"claimedMime": mime,
+						"actualMime":  detected,
+						"actualSize":  info.Size,
+					})
+					writeErr(w, 415, "mime_mismatch",
+						"the file's actual content does not match its declared type")
+					return
+				}
+				// Replace `mime` with the canonical value. When sniff is
+				// strict this either keeps `mime` (matched) or we've
+				// already returned (rejected) above. When sniff is
+				// permissive, this is what closes the trust gap: the
+				// detected bytes win over the client's claim.
+				mime = uploadpolicy.CanonicalMime(mime, detected)
+			}
+		}
+	}
+
+	// PDF structural hardening. When the org's policy enables
+	// PdfHardenEnabled and the canonical MIME (post-sniff) is
+	// application/pdf, we run internal/pdfsec.Inspect over the bytes
+	// before letting the upload settle. Catches the structural threats
+	// the AV engine doesn't reason about: /JavaScript actions, /Launch
+	// targets, /EmbeddedFile attachments, external /Filespec refs.
+	//
+	// Runs synchronously (independent of ScanEnabled) so:
+	//   - deployments without ClamAV still get the protection,
+	//   - the user gets immediate feedback when their PDF is refused,
+	//   - quarantined bytes are deleted before any download path can
+	//     leak them (the AV worker's async path leaves the bytes in
+	//     storage with status='scanning' until the scan completes;
+	//     for structural threats we'd rather refuse on the spot).
+	if havePolicy && effPolicy.PdfHardenEnabled && isPDFMime(mime) {
+		blocked, sig, perr := h.runPDFInspection(r.Context(), key, effPolicy)
+		if perr != nil {
+			// Inspector itself failed — fail closed: refuse the upload
+			// and clean up the blob. A read failure here means we
+			// couldn't prove the PDF is safe; releasing it would defeat
+			// the purpose of having the gate.
+			_ = h.Storage.Remove(r.Context(), key)
+			_, _ = h.DB.Exec(r.Context(),
+				`UPDATE files SET status='rejected', updated_at=now() WHERE id=$1`, id)
+			audit.LogHTTP(r, h.DB, "file.upload.rejected", "file", id, map[string]any{
+				"reason":      "pdf_inspect_error",
+				"name":        name,
+				"claimedMime": mime,
+				"actualSize":  info.Size,
+				"detail":      perr.Error(),
+			})
+			writeErr(w, 500, "pdf_inspect_error", perr.Error())
+			return
+		}
+		if blocked {
+			_ = h.Storage.Remove(r.Context(), key)
+			_, _ = h.DB.Exec(r.Context(),
+				`UPDATE files
+				    SET status='rejected',
+				        scan_status='infected',
+				        scan_signature=$1,
+				        scan_engine='pdfsec',
+				        scanned_at=now(),
+				        updated_at=now()
+				  WHERE id=$2`,
+				"pdf:"+sig, id)
+			audit.LogHTTP(r, h.DB, "file.upload.rejected", "file", id, map[string]any{
+				"reason":      "pdf_blocked",
+				"signature":   "pdf:" + sig,
+				"name":        name,
+				"claimedMime": mime,
+				"actualSize":  info.Size,
+			})
+			writeErr(w, 415, "pdf_blocked",
+				"this PDF contains active content that is not permitted: "+sig)
+			return
+		}
+	}
+
 	// Storage quota enforcement. The blob is already uploaded, but we
 	// refuse to mark it active when accepting it would push the org
 	// over its plan ceiling. The dangling object is cleaned up by the
@@ -490,17 +734,89 @@ func (h *Handler) Complete(w http.ResponseWriter, r *http.Request) {
 			_, _ = h.DB.Exec(r.Context(),
 				`UPDATE files SET status='quota_blocked', size=$1, updated_at=now()
 				   WHERE id=$2`, info.Size, id)
+			audit.LogHTTP(r, h.DB, "file.upload.rejected", "file", id, map[string]any{
+				"reason":      "quota",
+				"policyCode":  le.Code,
+				"name":        name,
+				"claimedMime": mime,
+				"actualSize":  info.Size,
+			})
 			writeErr(w, le.Status, le.Code, le.Message)
 			return
 		}
 	}
 
-	if _, err := h.DB.Exec(r.Context(),
-		`UPDATE files SET status='active', size=$1, updated_at=now() WHERE id=$2`,
-		info.Size, id,
-	); err != nil {
-		writeErr(w, 500, "db_error", err.Error())
-		return
+	// AV-scan gate. When the org policy enables scanning, the file is
+	// NOT immediately released — we mark it status='scanning' (the
+	// download gate already refuses any non-active status) and
+	// scan_status='pending', then enqueue a TaskScanFile asynq job.
+	// The worker stamps the verdict back and flips status='active'
+	// only on a clean/skipped outcome. See internal/scanner +
+	// internal/worker.scanFile.
+	//
+	// When scanning is disabled (default in CI / dev), the file goes
+	// straight to active with scan_status='skipped' so the audit trail
+	// records "engine declined to run", not "engine ran and was happy."
+	scanEnabled := havePolicy && effPolicy.ScanEnabled
+	// Without a queue client, even a scan-enabled org can't get
+	// asynchronous scanning. Fall back to skipped + active so the
+	// upload doesn't get stuck in 'scanning' forever — the audit
+	// log + scan_engine='unconfigured' tells operators the gap.
+	if scanEnabled && h.Queue == nil {
+		scanEnabled = false
+	}
+
+	// `mime` here is the canonical post-sniff value (see the policy
+	// block above) — persist it so every later read uses bytes-truth
+	// instead of whatever the client originally claimed at presign time.
+	if scanEnabled {
+		if _, err := h.DB.Exec(r.Context(),
+			`UPDATE files
+			    SET status='scanning',
+			        scan_status='pending',
+			        size=$1, mime=$2, updated_at=now()
+			  WHERE id=$3`,
+			info.Size, mime, id,
+		); err != nil {
+			writeErr(w, 500, "db_error", err.Error())
+			return
+		}
+		// Insert the audit row first so the worker has a stable JobID
+		// to mutate. RETURNING id keeps this single-roundtrip. If the
+		// enqueue below fails we leave the row in 'queued' — a
+		// reconciler can re-enqueue without producing a duplicate row.
+		var scanJobID string
+		if err := h.DB.QueryRow(r.Context(), `
+			INSERT INTO scan_jobs (file_id, org_id, storage_key, status)
+			VALUES ($1, $2, $3, 'queued')
+			RETURNING id`,
+			id, c.OrgID, key,
+		).Scan(&scanJobID); err != nil {
+			writeErr(w, 500, "db_error", err.Error())
+			return
+		}
+		task, terr := queue.NewScanFile(queue.ScanFilePayload{
+			JobID:      scanJobID,
+			OrgID:      c.OrgID,
+			FileID:     id,
+			StorageKey: key,
+		})
+		if terr == nil {
+			_, _ = h.Queue.Enqueue(task)
+		}
+	} else {
+		if _, err := h.DB.Exec(r.Context(),
+			`UPDATE files
+			    SET status='active',
+			        scan_status='skipped',
+			        scan_engine=COALESCE(scan_engine, 'unconfigured'),
+			        size=$1, mime=$2, updated_at=now()
+			  WHERE id=$3`,
+			info.Size, mime, id,
+		); err != nil {
+			writeErr(w, 500, "db_error", err.Error())
+			return
+		}
 	}
 
 	resp := map[string]any{"ok": true, "size": info.Size}
@@ -523,6 +839,21 @@ func (h *Handler) Complete(w http.ResponseWriter, r *http.Request) {
 		"size":       info.Size,
 		"templateId": resp["templateId"],
 	})
+
+	// Forensic-grade upload audit row. The events.Publish above is for
+	// downstream subsystems (websocket fan-out, search indexer, etc.); it
+	// doesn't ship to the audit_log table and isn't filterable by the
+	// admin UI. This row is the canonical "user X uploaded file Y from IP
+	// Z at time T" record — it carries the actor's IP + UA via
+	// audit.LogHTTP so a forensic reviewer can reconstruct the event
+	// without joining against session tables. `actualSize` and
+	// `actualMime` are post-canonicalisation truth (the value we stored),
+	// not the client's original claim — the claim is what
+	// `file.upload.intent` already captured at presign time.
+	tpl, _ := resp["templateId"].(string)
+	audit.LogHTTP(r, h.DB, "file.upload.completed", "file", id,
+		buildUploadCompletedMeta(id, name, mime, info.Size, scanEnabled, tpl))
+
 	writeJSON(w, 200, resp)
 }
 
@@ -775,19 +1106,746 @@ func (h *Handler) Download(w http.ResponseWriter, r *http.Request) {
 	if !h.vaultGateFile(w, r, id, c.UserID) {
 		return
 	}
-	var key, name string
+	var key, name, mime, scanStatus, scanSig string
 	if err := h.DB.QueryRow(r.Context(),
-		`SELECT storage_key, name FROM files WHERE id=$1 AND org_id=$2 AND trashed_at IS NULL`, id, c.OrgID,
-	).Scan(&key, &name); err != nil {
+		`SELECT storage_key, name, COALESCE(mime, ''),
+		        COALESCE(scan_status, 'skipped'), COALESCE(scan_signature, '')
+		   FROM files WHERE id=$1 AND org_id=$2 AND trashed_at IS NULL`,
+		id, c.OrgID,
+	).Scan(&key, &name, &mime, &scanStatus, &scanSig); err != nil {
 		writeErr(w, 404, "not_found", "file not found")
 		return
 	}
-	url, err := h.Storage.PresignGet(r.Context(), key, name, 5*time.Minute)
+	// AV gate. Fail-closed: only 'clean' and 'skipped' are released.
+	// 'pending'/'scanning' → 423 (locked, scan in progress).
+	// 'infected'           → 451 (unavailable for legal reasons; the
+	//                              closest standard code for "we refuse
+	//                              to serve a known-bad payload").
+	// 'error'              → 503 (engine couldn't decide; treat as
+	//                              transient, surface the audit row).
+	if msg, status, code, blocked := scanner.GateBlock(scanStatus, scanSig); blocked {
+		writeErr(w, status, code, msg)
+		return
+	}
+	// Pass the stored MIME so PresignGet can force `attachment` for
+	// risky renderable types even if some future caller forgets the
+	// filename — defense in depth against stored-XSS.
+	url, err := h.Storage.PresignGet(r.Context(), key, mime, name, 5*time.Minute)
 	if err != nil {
 		writeErr(w, 500, "presign", err.Error())
 		return
 	}
 	writeJSON(w, 200, map[string]string{"downloadUrl": url})
+}
+
+// maxZipFiles caps the number of files the bulk-zip endpoint will accept
+// in a single request. Pre-flight cost is O(N) DB calls (auth + metadata
+// + scan-status) before the first byte streams, so an unbounded N would
+// let a malicious caller hold a request open for minutes. 500 covers
+// every realistic "select all + download" workflow we've seen.
+//
+// The cap also applies AFTER folder expansion — i.e. you can ask for
+// 1 folder and have it explode into 600 files, and the request will
+// be rejected. This protects against accidentally zipping a giant
+// shared folder when the user just wanted "this one folder I see."
+const maxZipFiles = 500
+
+// Zip streams a multi-file ZIP archive of every requested file the
+// caller is allowed to read. Used by the Drive page's bulk-download
+// action — replaces the previous client-side N-tabs loop, which got
+// silently neutered by every browser's popup blocker after the first
+// 1–2 files.
+//
+// All authorization, vault-unlock, and antivirus checks happen UP
+// FRONT, before any byte hits the wire. Once we send
+// `200 + Content-Type: application/zip`, there's no way to surface a
+// JSON error — the browser is already saving. So we either reject the
+// whole request with a clean error, or we commit to producing a zip.
+//
+// The one place we can't be transactional is per-file storage reader
+// failures mid-stream (e.g. a transient S3 GET error after we've
+// already written 2 MB into the zip entry). We log it, abandon the
+// partial entry, and continue — the user gets a zip with N-1 files,
+// which is better than a corrupt archive or a mid-save HTTP error
+// that leaves a half-written .crdownload behind.
+//
+// Filenames inside the archive are de-duped with a Drive-style
+// " (2)", " (3)" suffix before the extension so two files named
+// `Report.pdf` don't collapse onto each other on extraction.
+func (h *Handler) Zip(w http.ResponseWriter, r *http.Request) {
+	c := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
+
+	// Body shape: { "ids": ["<file-id>", ...], "folderIds": ["<folder-id>", ...] }.
+	// Either may be empty, but the union — after expanding folders into
+	// their descendant files — must be ≥1. POST (not GET) so the IDs
+	// travel in the body; a GET with 200+ UUIDs in the query string
+	// flirts with the 8 KB header limit some reverse proxies enforce.
+	var body struct {
+		Ids       []string `json:"ids"`
+		FolderIds []string `json:"folderIds"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, 400, "bad_request", "invalid JSON body")
+		return
+	}
+	if len(body.Ids) == 0 && len(body.FolderIds) == 0 {
+		writeErr(w, 400, "bad_request", "ids or folderIds must not be empty")
+		return
+	}
+
+	// De-dupe both ID lists before any work — a doubly-selected file
+	// would occupy two slots against the cap and produce two
+	// `Foo (2).pdf` entries; the same for folders.
+	ids := dedupeStrings(body.Ids)
+	folderIds := dedupeStrings(body.FolderIds)
+
+	// PRE-FLIGHT: walk every requested ID through the same auth /
+	// vault / scan gates the single-file Download handler enforces.
+	// Folders expand into their descendant files (recursive CTE),
+	// each of which goes through per-file authz and vault checks —
+	// a folder share that grants access at the root might still be
+	// gated by a locked sub-vault deeper in the tree.
+	//
+	// Any failure here aborts the whole request with a JSON error —
+	// the response body has not been touched yet.
+	entries := make([]zipEntry, 0, len(ids))
+
+	// (1) Standalone file IDs — same flow as the file-only original.
+	for _, id := range ids {
+		e, status, code, msg, wroteResp, ok := h.zipPreflightFile(w, r, c, id, "")
+		if !ok {
+			if wroteResp {
+				// vaultGateFile already wrote a 423 — just bail.
+				return
+			}
+			writeErr(w, status, code, msg)
+			return
+		}
+		entries = append(entries, e)
+	}
+
+	// (2) Folder IDs — expand each to its descendants and feed every
+	// file through the same per-file pre-flight as above.
+	//
+	// Folder root authz is enforced once via CanAccessFolder; per
+	// descendant, CanAccessFile catches any sub-tree where access
+	// was revoked (revokes propagate down lazily, so this matters).
+	folderArchiveName := "" // set when exactly one folder + no files; used as zip filename below
+	for _, fid := range folderIds {
+		ok, err := sharing.CanAccessFolder(r.Context(), h.DB, c, fid)
+		if err != nil {
+			writeErr(w, 500, "db_error", err.Error())
+			return
+		}
+		if !ok {
+			writeErr(w, 404, "not_found",
+				fmt.Sprintf("folder %s not found", fid))
+			return
+		}
+		// Walk the folder + every descendant. Each row gives us
+		// (file_id, dir_path) — dir_path is the slash-joined chain
+		// of folder names from the requested root down to (but not
+		// including) the file itself, so the zip preserves layout.
+		descendants, rootName, err := h.zipExpandFolder(r.Context(), c.OrgID, fid)
+		if err != nil {
+			writeErr(w, 500, "db_error", err.Error())
+			return
+		}
+		if len(folderIds) == 1 && len(ids) == 0 {
+			folderArchiveName = rootName
+		}
+		for _, d := range descendants {
+			if len(entries) >= maxZipFiles {
+				writeErr(w, 400, "too_many",
+					fmt.Sprintf("zip is limited to %d files per request", maxZipFiles))
+				return
+			}
+			e, status, code, msg, wroteResp, ok := h.zipPreflightFile(
+				w, r, c, d.id, d.dirPath,
+			)
+			if !ok {
+				if wroteResp {
+					return
+				}
+				writeErr(w, status, code, msg)
+				return
+			}
+			entries = append(entries, e)
+		}
+	}
+
+	if len(entries) == 0 {
+		writeErr(w, 400, "empty",
+			"no files to download (folders may be empty)")
+		return
+	}
+	if len(entries) > maxZipFiles {
+		writeErr(w, 400, "too_many",
+			fmt.Sprintf("zip is limited to %d files per request", maxZipFiles))
+		return
+	}
+
+	// Commit to streaming. After this point the body is locked in:
+	// any error becomes a connection close, never a JSON envelope.
+	//
+	// Filename heuristic: a single-folder request gets `<FolderName>.zip`
+	// because that matches the user's mental model ("download this
+	// folder"). Mixed selections fall back to the timestamped default.
+	var archiveName string
+	if folderArchiveName != "" {
+		archiveName = sanitizeForFilename(folderArchiveName) + ".zip"
+	} else {
+		archiveName = fmt.Sprintf("docforge-%s.zip",
+			time.Now().UTC().Format("20060102-150405"))
+	}
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition",
+		fmt.Sprintf(`attachment; filename=%q`, archiveName))
+	// nosniff on a zip mostly placates the linters — browsers don't
+	// MIME-sniff application/zip into anything dangerous — but the
+	// header is free and keeps the response shape consistent with
+	// the rest of the file-serving endpoints.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	// Deliberately no Content-Length — we're streaming, the
+	// compressed total isn't known ahead of time, and chunked
+	// transfer-encoding is what lets the browser start saving while
+	// the later entries are still being read from storage.
+	w.WriteHeader(http.StatusOK)
+
+	zw := zip.NewWriter(w)
+	used := make(map[string]int, len(entries))
+	for _, e := range entries {
+		name := dedupeArchiveName(e.name, used)
+		rc, _, err := h.Storage.GetReader(r.Context(), e.key)
+		if err != nil {
+			// Per-file failure mid-stream. We can't write a JSON
+			// error any more, so the only reasonable action is to
+			// log + skip. The zip's central directory still ends up
+			// well-formed because we don't call Create() for this
+			// entry at all.
+			log.Printf("zip: GetReader %s (%s): %v", e.key, name, err)
+			continue
+		}
+		zfw, err := zw.Create(name)
+		if err != nil {
+			rc.Close()
+			log.Printf("zip: Create %s: %v", name, err)
+			continue
+		}
+		if _, err := io.Copy(zfw, rc); err != nil {
+			// Mid-entry copy error — the zip entry header is already
+			// written, so the central directory will reference a
+			// truncated file. Most extractors will surface this as
+			// a CRC mismatch on that one entry; the rest of the
+			// archive remains usable.
+			log.Printf("zip: Copy %s: %v", name, err)
+		}
+		rc.Close()
+	}
+	if err := zw.Close(); err != nil {
+		log.Printf("zip: Close: %v", err)
+	}
+}
+
+// zipEntry is one file's slot in the archive after pre-flight passes.
+// `name` is the path inside the zip (may contain "/" when the file
+// came from a folder expansion); `key` is the storage object key the
+// streaming step will read from.
+type zipEntry struct {
+	key  string
+	name string
+	mime string
+}
+
+// dedupeStrings returns a copy of `in` with duplicates removed, in
+// first-seen order. Used to clean caller-supplied ID lists before
+// any DB work.
+func dedupeStrings(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
+
+// zipPreflightFile runs the full per-file gate (sharing access,
+// vault, AV scan, metadata fetch) for a single file ID and returns
+// either the resolved zipEntry, or a structured error to surface.
+//
+// The dirPath argument prefixes the archive name (used during folder
+// expansion). For standalone file IDs pass "".
+//
+// vaultGateFile writes its own 423 response; we forward the same
+// ResponseWriter so the modal-friendly error envelope reaches the
+// client. When that happens we signal "caller must just return" with
+// `wroteResp == true` — the body is committed and the caller can't
+// add another writeErr on top.
+//
+//   - ok == true                       → use `e`, no error.
+//   - ok == false && wroteResp == true → response already written, just return.
+//   - ok == false && wroteResp == false → caller writes via writeErr(status, code, msg).
+func (h *Handler) zipPreflightFile(
+	w http.ResponseWriter, r *http.Request, c *auth.Claims,
+	fileID, dirPath string,
+) (e zipEntry, status int, code, msg string, wroteResp, ok bool) {
+	allowed, err := sharing.CanAccessFile(r.Context(), h.DB, c, fileID)
+	if err != nil {
+		return zipEntry{}, 500, "db_error", err.Error(), false, false
+	}
+	if !allowed {
+		return zipEntry{}, 404, "not_found",
+			fmt.Sprintf("file %s not found", fileID), false, false
+	}
+	if !h.vaultGateFile(w, r, fileID, c.UserID) {
+		return zipEntry{}, 0, "", "", true, false
+	}
+	var key, name, mime, scanStatus, scanSig string
+	if err := h.DB.QueryRow(r.Context(),
+		`SELECT storage_key, name, COALESCE(mime, ''),
+		        COALESCE(scan_status, 'skipped'), COALESCE(scan_signature, '')
+		   FROM files WHERE id=$1 AND org_id=$2 AND trashed_at IS NULL`,
+		fileID, c.OrgID,
+	).Scan(&key, &name, &mime, &scanStatus, &scanSig); err != nil {
+		return zipEntry{}, 404, "not_found",
+			fmt.Sprintf("file %s not found", fileID), false, false
+	}
+	if m, st, cd, blocked := scanner.GateBlock(scanStatus, scanSig); blocked {
+		return zipEntry{}, st, cd,
+			fmt.Sprintf("file %s: %s", fileID, m), false, false
+	}
+	archiveName := name
+	if dirPath != "" {
+		archiveName = dirPath + "/" + name
+	}
+	return zipEntry{key: key, name: archiveName, mime: mime},
+		0, "", "", false, true
+}
+
+// zipFolderDescendant — one row of a folder's expanded descendant list.
+type zipFolderDescendant struct {
+	id      string
+	dirPath string // slash-joined chain from the requested root
+}
+
+// zipExpandFolder walks a folder and every descendant, returning one
+// entry per file found. `dirPath` on each row is the requested root's
+// name plus the chain of subfolders, slash-joined (e.g.
+// "Reports/Q4/audits") — empty when the file lives directly in the
+// requested root and the root has no name (which shouldn't happen).
+//
+// The recursive CTE is bounded by the org_id filter, so a malicious
+// caller can't pivot into another org by passing a known ID; the
+// outer CanAccessFolder check is the gate that lets them in at all.
+//
+// Returns the list of descendant files plus the requested root's
+// display name (used to title the resulting archive when only one
+// folder was requested).
+func (h *Handler) zipExpandFolder(
+	ctx context.Context, orgID, folderID string,
+) ([]zipFolderDescendant, string, error) {
+	// One round trip: anchor at the requested root, recurse via
+	// parent_id, then JOIN the files table to enumerate files at
+	// every node. Path is built as a text array so we can format
+	// any way we want server-side without re-walking.
+	rows, err := h.DB.Query(ctx, `
+		WITH RECURSIVE tree AS (
+		  SELECT id, parent_id, name, ARRAY[name]::text[] AS path
+		    FROM folders WHERE id=$1 AND org_id=$2
+		  UNION ALL
+		  SELECT f.id, f.parent_id, f.name, t.path || f.name
+		    FROM folders f
+		    JOIN tree t ON f.parent_id = t.id
+		    WHERE f.org_id=$2
+		)
+		SELECT f.id::text,
+		       array_to_string(t.path, '/') AS dir_path
+		  FROM files f
+		  JOIN tree t ON f.folder_id = t.id
+		  WHERE f.org_id=$2 AND f.trashed_at IS NULL
+		  ORDER BY t.path, f.name`,
+		folderID, orgID,
+	)
+	if err != nil {
+		return nil, "", err
+	}
+	defer rows.Close()
+	out := []zipFolderDescendant{}
+	for rows.Next() {
+		var id, dirPath string
+		if err := rows.Scan(&id, &dirPath); err != nil {
+			return nil, "", err
+		}
+		out = append(out, zipFolderDescendant{id: id, dirPath: dirPath})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", err
+	}
+	// Look up the root folder's name separately. We could derive
+	// it from the first row of the CTE, but folders can be empty —
+	// a "name your folder, leave it empty, click Download" flow
+	// would otherwise return ("", nil) and we'd lose the title.
+	var rootName string
+	if err := h.DB.QueryRow(ctx,
+		`SELECT name FROM folders WHERE id=$1 AND org_id=$2`,
+		folderID, orgID,
+	).Scan(&rootName); err != nil {
+		return nil, "", err
+	}
+	return out, rootName, nil
+}
+
+// sanitizeForFilename removes characters that would break a HTTP
+// Content-Disposition header or a filesystem path: control chars,
+// path separators, and the few ASCII glyphs Windows still chokes on.
+// Trailing dots are also stripped because Windows silently drops
+// them on rename.
+func sanitizeForFilename(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "folder"
+	}
+	repl := func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return '_'
+		}
+		switch r {
+		case '/', '\\', ':', '*', '?', '"', '<', '>', '|':
+			return '_'
+		}
+		return r
+	}
+	s = strings.Map(repl, s)
+	s = strings.TrimRight(s, ". ")
+	if s == "" {
+		return "folder"
+	}
+	return s
+}
+
+// dedupeArchiveName returns a unique-within-the-archive filename
+// derived from `name`, in the same style as Drive's "make a copy"
+// rename: `Report.pdf` → `Report (2).pdf` → `Report (3).pdf`.
+//
+// The `used` map is mutated in place — callers pass a fresh map per
+// archive so de-dup state doesn't leak across requests. We also bump
+// the count for the synthesized name itself, which protects against
+// the (rare) case where the user has both `Report.pdf` and a literal
+// `Report (2).pdf` in the same selection.
+func dedupeArchiveName(name string, used map[string]int) string {
+	// Strip any leading separators a caller might smuggle in (an
+	// archive name like "/etc/passwd" is treated as a relative path
+	// by some extractors but we want flat siblings inside the zip).
+	name = strings.TrimLeft(filepath.ToSlash(name), "/")
+	if name == "" {
+		name = "file"
+	}
+	n := used[name]
+	used[name] = n + 1
+	if n == 0 {
+		return name
+	}
+	ext := filepath.Ext(name)
+	base := strings.TrimSuffix(name, ext)
+	candidate := fmt.Sprintf("%s (%d)%s", base, n+1, ext)
+	used[candidate]++
+	return candidate
+}
+
+// inlinePreviewMaxBytes caps the total bytes the InlinePreview proxy will
+// stream in a single response. Inline previews are meant for "small enough
+// to render in an iframe" content — anyone trying to push gigabytes through
+// the proxy is either a bug or an abuser. The cap is well above any
+// reasonable HTML/SVG/image preview but low enough that we don't become
+// a free CDN for arbitrary stored blobs.
+const inlinePreviewMaxBytes = 25 * 1024 * 1024
+
+// inlinePreviewAllowedMime returns true for MIMEs we're willing to render
+// inline through the proxy. The CSP header in the response is the primary
+// XSS defence, but layering an allowlist keeps random / malformed content
+// (e.g. an .exe someone forced through) from being served at all.
+//
+// Notable inclusions and exclusions:
+//
+//   - text/html       — allowed, but the strict default CSP keeps it inert
+//                        (no JS, sandboxed). Orgs that want a permissive
+//                        preview must opt into a relaxed CSP.
+//   - image/svg(+xml) — allowed: SVG can host JS, but the CSP's
+//                        default-src 'none' + sandbox blocks execution.
+//   - application/pdf — allowed: pdf.js / browser PDF viewer renders it.
+//   - image/*         — allowed: rasters can't execute.
+//   - text/plain, text/csv, application/json — allowed: shown as text.
+//
+// Everything else (JS, executables, opaque office docs, archives) is 415.
+// If the storage MIME is empty we treat it as plain text — the safest
+// default for "we don't know what this is."
+func inlinePreviewAllowedMime(m string) bool {
+	m = strings.ToLower(strings.TrimSpace(m))
+	if i := strings.Index(m, ";"); i >= 0 {
+		m = strings.TrimSpace(m[:i])
+	}
+	if m == "" {
+		return false // never serve unknown bytes inline; caller must fix the row
+	}
+	if strings.HasPrefix(m, "image/") {
+		return true
+	}
+	switch m {
+	case "text/html", "application/xhtml+xml",
+		"text/plain", "text/csv", "text/markdown",
+		"application/json",
+		"application/pdf":
+		return true
+	}
+	return false
+}
+
+// inlinePreviewResp accompanies the streaming bytes only when the caller
+// asks for `?meta=1`. The web app calls the JSON variant first to learn
+// the iframe sandbox token, then renders `<iframe src="...?stream=1"
+// sandbox={iframeSandbox}>` to fetch the bytes. Splitting metadata from
+// bytes keeps the streaming path free of JSON-decode overhead.
+type inlinePreviewMeta struct {
+	URL            string `json:"url"`            // self-link with ?stream=1
+	Mime           string `json:"mime"`
+	IframeSandbox  string `json:"iframeSandbox"`  // literal value for <iframe sandbox="...">
+	CSP            string `json:"csp"`            // mirror of the header for visibility
+	BytesAvailable int64  `json:"bytesAvailable"` // 0 = unknown
+}
+
+// InlinePreview is the same-origin streaming proxy that hosts content
+// destined for a sandboxed <iframe>. Unlike a presigned URL (which can't
+// carry arbitrary headers), this proxy:
+//
+//   - Attaches Content-Security-Policy from the org's resolved policy.
+//     Defense-in-depth: even if the bytes turn out to be a forged
+//     text/html that slipped past the sniffer, the CSP keeps it inert.
+//   - Sends Content-Disposition: inline so the browser renders rather
+//     than downloads.
+//   - Adds X-Content-Type-Options: nosniff so the browser doesn't
+//     re-interpret the response as a different (possibly more dangerous)
+//     MIME.
+//   - Honours the same scan gate as Download — fail-closed on
+//     pending/infected/error.
+//
+// `?meta=1` returns JSON metadata (url + iframe sandbox + CSP) instead
+// of the bytes; the frontend uses this to set the iframe's `sandbox`
+// attribute before kicking off the stream.
+func (h *Handler) InlinePreview(w http.ResponseWriter, r *http.Request) {
+	c := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
+	id := chi.URLParam(r, "id")
+	ok, err := sharing.CanAccessFile(r.Context(), h.DB, c, id)
+	if err != nil {
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+	if !ok {
+		writeErr(w, 404, "not_found", "file not found")
+		return
+	}
+	if !h.vaultGateFile(w, r, id, c.UserID) {
+		return
+	}
+	var key, name, mime, scanStatus, scanSig string
+	if err := h.DB.QueryRow(r.Context(),
+		`SELECT storage_key, name, COALESCE(mime, ''),
+		        COALESCE(scan_status, 'skipped'), COALESCE(scan_signature, '')
+		   FROM files WHERE id=$1 AND org_id=$2 AND trashed_at IS NULL`,
+		id, c.OrgID,
+	).Scan(&key, &name, &mime, &scanStatus, &scanSig); err != nil {
+		writeErr(w, 404, "not_found", "file not found")
+		return
+	}
+	if msg, status, code, blocked := scanner.GateBlock(scanStatus, scanSig); blocked {
+		writeErr(w, status, code, msg)
+		return
+	}
+	if !inlinePreviewAllowedMime(mime) {
+		writeErr(w, 415, "preview_not_supported",
+			"this file type cannot be previewed inline")
+		return
+	}
+
+	// Resolve the org's effective preview policy. If Policy isn't wired
+	// (tests, certain code paths) fall back to package defaults so we
+	// still emit a meaningful CSP rather than an open one.
+	csp := uploadpolicy.DefaultPreviewCSP
+	sandbox := uploadpolicy.DefaultPreviewIframeSandbox
+	var embedOrigins []string
+	if h.Policy != nil {
+		if p, perr := h.Policy.Effective(r.Context(), c.OrgID); perr == nil {
+			if p.PreviewCSP != "" {
+				csp = p.PreviewCSP
+			}
+			sandbox = p.PreviewIframeSandbox
+			embedOrigins = p.EmbedAllowedOrigins
+		}
+	}
+	// Merge frame-ancestors from the org's embed allowlist into the
+	// preview CSP so customer sites can iframe the preview when the
+	// admin has opted in. Empty allowlist → "frame-ancestors 'self'",
+	// matching the X-Frame-Options: SAMEORIGIN posture we strip below.
+	csp = csp + "; " + uploadpolicy.BuildFrameAncestors(embedOrigins)
+
+	// Metadata branch — the frontend uses this to learn the sandbox
+	// attribute it must set on the <iframe> before it loads the stream.
+	if r.URL.Query().Get("meta") == "1" {
+		writeJSON(w, 200, inlinePreviewMeta{
+			URL:           fmt.Sprintf("/v1/files/%s/inline-preview?stream=1", id),
+			Mime:          mime,
+			IframeSandbox: sandbox,
+			CSP:           csp,
+		})
+		return
+	}
+
+	rd, size, err := h.Storage.GetReader(r.Context(), key)
+	if err != nil {
+		writeErr(w, 500, "storage_error", err.Error())
+		return
+	}
+	defer rd.Close()
+	if size > 0 && size > inlinePreviewMaxBytes {
+		writeErr(w, 413, "preview_too_large",
+			fmt.Sprintf("inline preview supports up to %d bytes", inlinePreviewMaxBytes))
+		return
+	}
+
+	// Headers — order matters only for clarity. Set them all before the
+	// first Write() to avoid the http package locking in a default 200
+	// without our security headers.
+	hdr := w.Header()
+	hdr.Set("Content-Type", mime)
+	hdr.Set("Content-Security-Policy", csp)
+	hdr.Set("X-Content-Type-Options", "nosniff")
+	// The global middleware sets X-Frame-Options: SAMEORIGIN, which some
+	// browsers honour in preference to the CSP frame-ancestors when both
+	// are present. Strip it on the embed surface so the wider allowlist
+	// actually takes effect.
+	hdr.Del("X-Frame-Options")
+	// inline + a sanitised filename. We reuse the storage layer's
+	// sanitiser-by-presign indirectly by emitting a safe filename here.
+	dispName := name
+	if dispName == "" {
+		dispName = "preview"
+	}
+	hdr.Set("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, sanitizeHeaderFilename(dispName)))
+	// Cache: short, private. Inline previews are scan-gated, so a stale
+	// CDN copy could keep serving an infected file after we quarantine it.
+	hdr.Set("Cache-Control", "private, max-age=30")
+	if size > 0 {
+		hdr.Set("Content-Length", fmt.Sprintf("%d", size))
+	}
+	w.WriteHeader(200)
+
+	// Hard ceiling on bytes streamed even if Stat lied about size — the
+	// io.LimitReader collapses cleanly if the object grew between the
+	// Stat call and the Read.
+	_, _ = io.Copy(w, io.LimitReader(rd, inlinePreviewMaxBytes+1))
+}
+
+// isPDFMime reports whether the canonical MIME we resolved at upload
+// time is application/pdf. Used to gate the structural inspection so
+// non-PDFs don't pay the cost of a 50 MiB read + token scan.
+func isPDFMime(mime string) bool {
+	m := strings.ToLower(strings.TrimSpace(mime))
+	if i := strings.Index(m, ";"); i >= 0 {
+		m = strings.TrimSpace(m[:i])
+	}
+	return m == "application/pdf"
+}
+
+// buildUploadCompletedMeta is the single source of truth for the JSON
+// payload attached to a successful "file.upload.completed" audit row.
+// Extracted so the wire shape can be regression-locked in tests — every
+// key here is a contract the audit UI / forensic tooling depends on, so
+// silently dropping or renaming one would break log replay without a
+// loud test failure.
+//
+// `actualMime` and `actualSize` are the post-canonicalisation values
+// (what we actually stored), not the client's original claim — the
+// claim is recorded separately by the matching "file.upload.intent"
+// row at presign time.
+func buildUploadCompletedMeta(fileID, name, actualMime string, actualSize int64, scanEnabled bool, templateID string) map[string]any {
+	scanStatus := "skipped"
+	if scanEnabled {
+		scanStatus = "pending"
+	}
+	m := map[string]any{
+		"fileId":      fileID,
+		"name":        name,
+		"actualMime":  actualMime,
+		"actualSize":  actualSize,
+		"scanEnabled": scanEnabled,
+		"scanStatus":  scanStatus,
+	}
+	if templateID != "" {
+		m["templateId"] = templateID
+	}
+	return m
+}
+
+// runPDFInspection streams the just-uploaded PDF from storage through
+// pdfsec.Inspect and reports whether any of policy.PdfBlockedFeatures
+// fired. Returns (blocked, signature, error) — signature is the
+// canonical pdfsec.Threat constant of the first blocked feature so
+// the caller can persist it as `pdf:<threat>` and the audit log /
+// scan_signature stays machine-readable.
+//
+// When PdfBlockedFeatures is empty AND the policy turned hardening on,
+// we substitute pdfsec.DefaultBlockedFeatures so the toggle behaves
+// "secure by default" rather than silently report-only. An org that
+// truly wants report-only mode passes an explicit empty list — we
+// detect that with a nil/empty distinction at the policy layer.
+func (h *Handler) runPDFInspection(ctx context.Context, key string, p uploadpolicy.Policy) (bool, string, error) {
+	rd, _, err := h.Storage.GetReader(ctx, key)
+	if err != nil {
+		return false, "", err
+	}
+	defer rd.Close()
+	rep, err := pdfsec.Inspect(rd)
+	if err != nil {
+		// Magic-bytes mismatch — caller shouldn't have invoked us, but
+		// be defensive: return "not blocked" rather than failing the
+		// whole upload over a wrong-MIME header.
+		if errors.Is(err, pdfsec.ErrNotPDF) {
+			return false, "", nil
+		}
+		return false, "", err
+	}
+	blocked := p.PdfBlockedFeatures
+	if blocked == nil {
+		blocked = pdfsec.DefaultBlockedFeatures
+	}
+	sig := pdfsec.FirstBlocked(rep, blocked)
+	if sig == "" {
+		return false, "", nil
+	}
+	return true, sig, nil
+}
+
+// sanitizeHeaderFilename strips the four header-injection vectors
+// (CR, LF, ", \) before we reflect a name into Content-Disposition.
+// Mirrors storage.sanitizeDispFilename — duplicated to avoid pulling
+// the storage package's internals through an exported surface.
+func sanitizeHeaderFilename(s string) string {
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '"' || c == '\\' || c == '\r' || c == '\n' {
+			out = append(out, '_')
+			continue
+		}
+		out = append(out, c)
+	}
+	return string(out)
 }
 
 type patchReq struct {

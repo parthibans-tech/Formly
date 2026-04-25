@@ -20,6 +20,7 @@ import (
 	"github.com/docforge/api/internal/files"
 	"github.com/docforge/api/internal/folders"
 	"github.com/docforge/api/internal/images"
+	"github.com/docforge/api/internal/embed"
 	"github.com/docforge/api/internal/formlinks"
 	"github.com/docforge/api/internal/jobs"
 	"github.com/docforge/api/internal/mail"
@@ -48,6 +49,7 @@ import (
 	"github.com/docforge/api/internal/storage"
 	"github.com/docforge/api/internal/team"
 	"github.com/docforge/api/internal/templates"
+	"github.com/docforge/api/internal/uploadpolicy"
 	"github.com/docforge/api/internal/mergerecipes"
 	"github.com/docforge/api/internal/pdfmerge"
 	"github.com/docforge/api/internal/textcontent"
@@ -91,9 +93,20 @@ func main() {
 	a := auth.New(pool)
 	t := templates.New(pool, store)
 	t.Queue = qc
+	// Surface the org-level iframe-sandbox token in PreviewURL responses
+	// so the frontend's <iframe sandbox="..."> stays in lockstep with
+	// the active upload policy. Wired after upSvc is constructed below.
+	// Layered upload-policy resolver: product_config → org_upload_config.
+	// Wired into the files handler so every CreateUploadURL / Complete
+	// path enforces the same rules without each handler re-reading the
+	// DB.
+	upSvc := uploadpolicy.New(pool)
+	upH := uploadpolicy.NewHandler(upSvc)
+	t.Policy = upSvc
 	f := files.New(pool, store)
 	f.Detector = t.DetectAndCreate
 	f.Queue = qc
+	f.Policy = upSvc
 	img := images.New(pool, store)
 	md := mockdata.New(pool)
 	jh := jobs.New(pool)
@@ -119,6 +132,7 @@ func main() {
 	rv := reviews.New(pool)
 	pr := presence.New(pool)
 	rl := reviewlinks.New(pool)
+	embedH := embed.New(pool, upSvc)
 
 	// ONLYOFFICE Document Server integration. Optional — if the JWT
 	// secret env var isn't set, we leave the routes unwired so deploys
@@ -297,6 +311,10 @@ func main() {
 	r.Get("/v1/public/reviews/{token}/comments", rl.PublicListComments)
 	r.Post("/v1/public/reviews/{token}/comments", rl.PublicCreateComment)
 	r.Post("/v1/public/reviews/{token}/decision", rl.PublicDecide)
+	// Embed-policy lookup. The Next.js middleware calls this once per
+	// embed-page render to fetch the org's iframe-allowlist before
+	// emitting the per-request frame-ancestors CSP. Public + cached.
+	r.Get("/v1/public/embed-policy", embedH.Resolve)
 	// Phase 4b: provider webhooks. Public — providers don't carry our
 	// JWT — but each handler verifies a provider-specific signature and
 	// rejects unsigned bodies when the secret is configured.
@@ -392,6 +410,19 @@ func main() {
 		r.Get("/v1/files/{id}", f.Get)
 		r.Patch("/v1/files/{id}", f.Patch)
 		r.Get("/v1/files/{id}/download", f.Download)
+		// Bulk download as a streaming ZIP. POSTs an `{ ids: [...] }`
+		// body and gets back a `Content-Type: application/zip`
+		// streaming response. Replaces the old browser-side
+		// "open N tabs" approach which the popup blocker silently
+		// killed after the first 1–2 files. See files.Zip for the
+		// pre-flight authz/scan/vault contract.
+		r.Post("/v1/files/zip", f.Zip)
+		// Same-origin streaming proxy for sandboxed iframe previews.
+		// Attaches Content-Security-Policy + X-Content-Type-Options +
+		// Content-Disposition: inline so a forged HTML/SVG can't escape
+		// the iframe sandbox. ?meta=1 returns metadata (CSP + sandbox
+		// attribute value); default returns the bytes.
+		r.Get("/v1/files/{id}/inline-preview", f.InlinePreview)
 		r.Delete("/v1/files/{id}", f.Delete)
 		r.Post("/v1/files/{id}/restore", f.Restore)
 		// Hard delete of a single trashed file (blob + row). Distinct
@@ -597,6 +628,17 @@ func main() {
 		r.With(requireSuperAdmin).Post("/v1/admin/plans", bl.AdminUpsertPlan)
 		r.With(requireSuperAdmin).Put("/v1/admin/plans/{id}", bl.AdminUpsertPlan)
 		r.With(requireSuperAdmin).Delete("/v1/admin/plans/{id}", bl.AdminDeletePlan)
+
+		// Product-wide upload policy (super-admin only). Org admins read
+		// the merged "effective" view via /v1/settings/upload-policy below.
+		r.With(requireSuperAdmin).Get("/v1/admin/product-config", upH.GetProduct)
+		r.With(requireSuperAdmin).Patch("/v1/admin/product-config", upH.PatchProduct)
+
+		// Per-org upload policy overrides. Handler self-checks role=admin.
+		r.Get("/v1/settings/upload-policy", upH.GetOrg)
+		r.Patch("/v1/settings/upload-policy", upH.PatchOrg)
+		r.Delete("/v1/settings/upload-policy", upH.DeleteOrg)
+
 		r.Post("/v1/templates/{id}/send", mh.SendTemplate)
 
 		// Scheduled generation jobs.

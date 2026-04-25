@@ -13,6 +13,7 @@ import (
 	"github.com/docforge/api/internal/audit"
 	"github.com/docforge/api/internal/auth"
 	"github.com/docforge/api/internal/events"
+	"github.com/docforge/api/internal/scanner"
 	"github.com/docforge/api/internal/storage"
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -304,17 +305,20 @@ func (h *Handler) Resolve(w http.ResponseWriter, r *http.Request) {
 		oneTime                      bool
 		dlLimit                      *int
 		dlCount                      int
+		scanStatus, scanSig          string
 	)
 	err := h.DB.QueryRow(r.Context(), `
 		SELECT s.id, f.org_id, f.id, f.name, f.mime, f.size, f.storage_key,
 		       s.role, s.expires_at, s.used_at, s.password_hash,
-		       s.one_time, s.download_limit, s.download_count
+		       s.one_time, s.download_limit, s.download_count,
+		       COALESCE(f.scan_status, 'skipped'), COALESCE(f.scan_signature, '')
 		  FROM share_links s JOIN files f ON f.id=s.file_id
 		 WHERE s.token=$1 AND s.revoked_at IS NULL AND f.trashed_at IS NULL`,
 		token,
 	).Scan(&shareID, &orgID, &fileID, &name, &mime, &size, &storageKey,
 		&role, &expiresAt, &usedAt, &passwordHash,
-		&oneTime, &dlLimit, &dlCount)
+		&oneTime, &dlLimit, &dlCount,
+		&scanStatus, &scanSig)
 	if err != nil {
 		writeErr(w, 404, "not_found", "share not found or revoked")
 		return
@@ -342,7 +346,20 @@ func (h *Handler) Resolve(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	url, err := h.Storage.PresignGet(r.Context(), storageKey, name, 10*time.Minute)
+	// AV gate. Public share links are the largest blast radius for an
+	// infected payload — anyone with the URL can grab it. Refuse
+	// release on anything other than 'clean' / 'skipped' regardless of
+	// the share's other allowances. See scanner.GateBlock for the
+	// full status → response mapping.
+	if msg, status, code, blocked := scanner.GateBlock(scanStatus, scanSig); blocked {
+		writeErr(w, status, code, msg)
+		return
+	}
+
+	// Pass `mime` so the storage layer forces `attachment` for risky
+	// renderable types regardless of caller intent — public share links
+	// are the highest-risk download path for stored-XSS.
+	url, err := h.Storage.PresignGet(r.Context(), storageKey, mime, name, 10*time.Minute)
 	if err != nil {
 		writeErr(w, 500, "presign", err.Error())
 		return

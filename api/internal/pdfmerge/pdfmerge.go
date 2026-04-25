@@ -62,6 +62,7 @@ import (
 	"github.com/docforge/api/internal/queue"
 	"github.com/docforge/api/internal/sharing"
 	"github.com/docforge/api/internal/storage"
+	"github.com/docforge/api/internal/uploadpolicy"
 	"github.com/go-chi/chi/v5"
 	"github.com/hibiken/asynq"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -721,7 +722,8 @@ func (h *Handler) persistNewPDF(ctx context.Context, c *auth.Claims, name string
 	).Scan(&id); err != nil {
 		return "", err
 	}
-	key := fmt.Sprintf("orgs/%s/files/%s/%s", c.OrgID, id, name)
+	key := fmt.Sprintf("orgs/%s/files/%s/%s",
+		c.OrgID, id, uploadpolicy.SafeStorageSlug(name))
 	if _, err := h.DB.Exec(ctx, `UPDATE files SET storage_key=$1 WHERE id=$2`, key, id); err != nil {
 		return "", err
 	}

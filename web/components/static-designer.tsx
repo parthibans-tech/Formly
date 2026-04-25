@@ -127,7 +127,10 @@ import {
   toTypeScript,
 } from "@/lib/schema-export";
 
-pdfjs.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.js`;
+// Self-hosted PDF.js worker — see components/acroform/pdf-preview.tsx for
+// the full rationale. tl;dr: avoids a CSP carve-out for unpkg and
+// removes a runtime dependency on a third-party CDN.
+pdfjs.GlobalWorkerOptions.workerSrc = "/pdf-worker/pdf.worker.min.js";
 
 type Widget = {
   id: string;

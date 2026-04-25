@@ -128,11 +128,36 @@ func (c *Client) PresignPost(
 	return &PostUpload{URL: u.String(), Fields: fields}, nil
 }
 
-func (c *Client) PresignGet(ctx context.Context, key, filename string, ttl time.Duration) (string, error) {
+// PresignGet returns a download URL with `Content-Disposition: attachment`
+// ALWAYS forced via the response-content-disposition presign param. This
+// is the secure-by-default download primitive: every byte stream that
+// flows through this URL hits the browser as a save dialog, never an
+// in-page render. Stored XSS via a forged text/html upload — even one
+// that slipped past CanonicalMime sniffing — can't fire when the
+// browser refuses to render the response inline.
+//
+// Why force unconditionally, not just for risky MIMEs:
+//
+//   - Defense in depth. The MIME stored on the object is user-influenced
+//     (the upload sniffer is best-effort, the bucket itself just stores
+//     whatever was POSTed). Trusting that mime to gate disposition gives
+//     the attacker one bit of control over how the browser interprets
+//     the response.
+//   - The "let the browser decide for safe MIMEs" branch was never
+//     load-bearing — every caller of PresignGet either passes a real
+//     filename (download intent explicit) or wants a save dialog anyway.
+//     The two genuine "render this in an iframe" callers use
+//     PresignGetInline.
+//
+// `filename` is reflected verbatim into the disposition value when set,
+// or "download" when blank. The mime arg is retained because we still
+// want it to influence sanitisation (and could re-purpose it for an
+// RFC 5987 filename* fallback later) — it just no longer flips the
+// disposition branch.
+func (c *Client) PresignGet(ctx context.Context, key, mime, filename string, ttl time.Duration) (string, error) {
+	_ = mime // currently advisory; see comment.
 	params := url.Values{}
-	if filename != "" {
-		params.Set("response-content-disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
-	}
+	params.Set("response-content-disposition", attachmentDisposition(filename))
 	u, err := c.publicMC.PresignedGetObject(ctx, c.bucket, key, ttl, params)
 	if err != nil {
 		return "", err
@@ -143,18 +168,124 @@ func (c *Client) PresignGet(ctx context.Context, key, filename string, ttl time.
 // PresignGetInline returns a presigned GET URL with an explicit
 // `Content-Disposition: inline` response override, so browsers render
 // the payload in-place (e.g. an iframe'd PDF) instead of offering a
-// download. Used by the preview/playground paths — the regular
-// PresignGet falls back to whatever the stored object declares, which
-// Safari in particular interprets as "attachment" for PDFs and triggers
-// a save prompt even when the caller intended an inline render.
-func (c *Client) PresignGetInline(ctx context.Context, key string, ttl time.Duration) (string, error) {
+// download.
+//
+// SECURITY: when `mime` is a risky renderable type (HTML, SVG, XHTML,
+// JS-bearing) we refuse the caller's `inline` intent and force
+// attachment. Inline-rendering attacker-supplied HTML/SVG is the classic
+// stored-XSS path; even if the caller asked for inline, it's never the
+// right answer for those MIMEs. Pass `mime=""` only when the content is
+// server-generated and known safe (e.g. our own PDF output).
+func (c *Client) PresignGetInline(ctx context.Context, key, mime string, ttl time.Duration) (string, error) {
 	params := url.Values{}
-	params.Set("response-content-disposition", "inline")
+	if isRiskyMime(mime) {
+		// Override caller's intent — risky MIMEs MUST download.
+		params.Set("response-content-disposition", `attachment; filename="download"`)
+	} else {
+		params.Set("response-content-disposition", "inline")
+	}
 	u, err := c.publicMC.PresignedGetObject(ctx, c.bucket, key, ttl, params)
 	if err != nil {
 		return "", err
 	}
 	return u.String(), nil
+}
+
+// attachmentDisposition builds the always-attachment Content-Disposition
+// value used by PresignGet. Empty filename → "download" so we never
+// emit a disposition without a filename (some browsers ignore it
+// otherwise, and a generic name keeps log spam consistent).
+func attachmentDisposition(filename string) string {
+	fn := filename
+	if fn == "" {
+		fn = "download"
+	}
+	return fmt.Sprintf(`attachment; filename="%s"`, sanitizeDispFilename(fn))
+}
+
+// isRiskyMime is the storage-layer mirror of uploadpolicy.IsRiskyMime —
+// duplicated here so the storage package stays free of policy imports.
+// Keep these two in sync.
+func isRiskyMime(mime string) bool {
+	m := lowerTrim(mime)
+	if m == "" {
+		return false
+	}
+	if i := indexByte(m, ';'); i >= 0 {
+		m = lowerTrim(m[:i])
+	}
+	switch {
+	case m == "text/html", m == "application/xhtml+xml":
+		return true
+	case len(m) >= 9 && m[:9] == "image/svg":
+		return true
+	case containsAll(m, "javascript"), containsAll(m, "ecmascript"):
+		return true
+	}
+	return false
+}
+
+// sanitizeDispFilename strips quote and CRLF characters from a filename
+// before it goes into a Content-Disposition value. Header injection is
+// the concern: a filename with a literal `"` or newline could end the
+// header early and inject another response header. We don't try to
+// support RFC 5987 percent-encoding here — that's a presign URL param,
+// the storage proxy reflects it verbatim into the response header.
+func sanitizeDispFilename(s string) string {
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '"' || c == '\\' || c == '\r' || c == '\n' {
+			out = append(out, '_')
+			continue
+		}
+		out = append(out, c)
+	}
+	return string(out)
+}
+
+func lowerTrim(s string) string {
+	// Trim ASCII whitespace + lowercase ASCII. Avoiding strings.ToLower
+	// + strings.TrimSpace to keep this file's import surface small;
+	// the storage package shouldn't pull in heavy text deps.
+	start := 0
+	end := len(s)
+	for start < end && (s[start] == ' ' || s[start] == '\t') {
+		start++
+	}
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\t') {
+		end--
+	}
+	out := make([]byte, end-start)
+	for i := start; i < end; i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 32
+		}
+		out[i-start] = c
+	}
+	return string(out)
+}
+
+func indexByte(s string, b byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == b {
+			return i
+		}
+	}
+	return -1
+}
+
+func containsAll(s, sub string) bool {
+	if len(sub) == 0 {
+		return true
+	}
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Client) StatObject(ctx context.Context, key string) (minio.ObjectInfo, error) {
@@ -186,6 +317,26 @@ func (c *Client) GetBytes(ctx context.Context, key string) ([]byte, error) {
 	}
 	defer obj.Close()
 	return io.ReadAll(obj)
+}
+
+// GetReader streams the object as an io.ReadCloser plus its declared
+// size. The scanner uses this to feed clamd via INSTREAM without
+// materializing the whole blob in memory — important once we get into
+// the tens-of-megabytes range. Caller MUST Close().
+func (c *Client) GetReader(ctx context.Context, key string) (io.ReadCloser, int64, error) {
+	obj, err := c.mc.GetObject(ctx, c.bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, 0, err
+	}
+	// Stat() drives the size hint we forward to the scanner so it can
+	// short-circuit on MaxStreamSize before we burn bandwidth. If Stat
+	// fails we still hand back the reader with size=-1 (unknown) — the
+	// scanner treats <=0 as "no client-side limit".
+	st, err := obj.Stat()
+	if err != nil {
+		return obj, -1, nil
+	}
+	return obj, st.Size, nil
 }
 
 // HeadBytes reads the first `n` bytes of the object via a Range request,

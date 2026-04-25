@@ -9,6 +9,7 @@ import {
   Check,
   CheckSquare,
   ChevronRight,
+  Camera,
   Copy,
   Download,
   Eye,
@@ -42,7 +43,8 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { api, ApiError, clearSession, getToken, getUser } from "@/lib/api";
+import { api, API_URL, ApiError, clearSession, getToken, getUser } from "@/lib/api";
+import { UploadTooLargeError, uploadToPresign } from "@/lib/upload";
 import {
   canExportPDF,
   canOpenInCodeEditor,
@@ -60,6 +62,7 @@ import {
   type UploadConflict,
 } from "@/components/upload-conflict-dialog";
 import { UploadDropzone } from "@/components/upload-dropzone";
+import { CameraCaptureDialog } from "@/components/camera-capture-dialog";
 import { MergeFilesDialog } from "@/components/merge-files-dialog";
 import { InsertPagesDialog } from "@/components/insert-pages-dialog";
 import { Button } from "@/components/ui/button";
@@ -126,6 +129,7 @@ import { FolderGridCard } from "@/components/folder-grid-card";
 import { ShareModal } from "@/components/share-modal";
 import { SharePeopleModal } from "@/components/share-people-modal";
 import { FilePreviewDialog } from "@/components/file-preview-dialog";
+import { MediaPreviewDialog } from "@/components/media-preview-dialog";
 import { ViewToggle } from "@/components/view-toggle";
 import { useViewMode } from "@/hooks/use-view-mode";
 import { cn } from "@/lib/utils";
@@ -207,6 +211,12 @@ export default function DrivePage() {
   const [err, setErr] = useState<string | null>(null);
   const [shareFor, setShareFor] = useState<FileItem | null>(null);
   const [previewFor, setPreviewFor] = useState<FileItem | null>(null);
+  // In-app audio / video preview target. Separate from `previewFor`
+  // (which is PDF-only and routes through the heavy react-pdf shell)
+  // so we don't pay the pdf.js worker cost for a media click.
+  const [mediaPreviewFor, setMediaPreviewFor] = useState<FileItem | null>(
+    null,
+  );
   // People/group ACL dialog target. Files and folders both flow through
   // this state — the resource type disambiguates which endpoints the
   // modal talks to. `null` = closed.
@@ -220,6 +230,7 @@ export default function DrivePage() {
   const [creatingStarterId, setCreatingStarterId] = useState<string | null>(null);
   const [blankPdfOpen, setBlankPdfOpen] = useState(false);
   const [formBuilderOpen, setFormBuilderOpen] = useState(false);
+  const [cameraOpen, setCameraOpen] = useState(false);
 
   // Drive view state (shared hook — grid by default, persisted).
   const [viewMode, setViewMode] = useViewMode();
@@ -300,7 +311,9 @@ export default function DrivePage() {
       // Replace / Keep both / Cancel before we can proceed.
       let createResp: {
         fileId: string;
-        uploadUrl: string;
+        uploadUrl?: string;
+        upload?: { url: string; fields: Record<string, string> };
+        maxBytes?: number;
         resolvedName?: string;
         replaced?: boolean;
       };
@@ -310,6 +323,10 @@ export default function DrivePage() {
           body: JSON.stringify({
             name: file.name,
             mime: file.type,
+            // Forward the size so the server can reject oversize uploads
+            // before issuing a presign — saves us from streaming a GB
+            // just to learn it's over the limit.
+            size: file.size,
             folderId: currentFolderId || undefined,
             conflict: conflictStrategy,
           }),
@@ -341,9 +358,18 @@ export default function DrivePage() {
         throw e;
       }
 
-      const { fileId, uploadUrl, resolvedName, replaced } = createResp;
-      await putWithProgress(uploadUrl, file, (pct) =>
-        setUploading({ name: file.name, pct })
+      const {
+        fileId,
+        upload: postUpload,
+        uploadUrl,
+        maxBytes,
+        resolvedName,
+        replaced,
+      } = createResp;
+      await uploadToPresign(
+        { upload: postUpload, uploadUrl, maxBytes },
+        file,
+        (pct) => setUploading({ name: file.name, pct })
       );
       const complete = await api<{ templateId?: string }>(
         `/v1/files/${fileId}/complete`,
@@ -371,9 +397,20 @@ export default function DrivePage() {
         toast.show("success", `Uploaded ${displayName} to Drive`);
       }
     } catch (e: any) {
-      setErr(e.message);
       setUploading(null);
-      toast.show("error", "Upload failed", { description: e.message });
+      // Friendlier copy for the policy-driven rejections. Both client-side
+      // (UploadTooLargeError) and server-side (ApiError 413/415) come
+      // through here.
+      let title = "Upload failed";
+      let desc = e?.message ?? String(e);
+      if (e instanceof UploadTooLargeError) {
+        title = "File too large";
+      } else if (e instanceof ApiError) {
+        if (e.status === 413) title = "File too large";
+        else if (e.status === 415) title = "File type not allowed";
+      }
+      setErr(desc);
+      toast.show("error", title, { description: desc });
     }
   }
 
@@ -851,17 +888,116 @@ export default function DrivePage() {
     }
   }
 
-  async function bulkDownload() {
-    for (const id of Array.from(selected)) {
-      try {
-        const { downloadUrl } = await api<{ downloadUrl: string }>(
-          `/v1/files/${id}/download`
-        );
-        window.open(downloadUrl, "_blank");
-      } catch (e: any) {
-        toast.show("error", e.message);
-      }
+  // Streams a server-built ZIP for an arbitrary `{ ids, folderIds }`
+  // payload. The previous browser-side approach (loop `window.open`
+  // over presigned URLs) was killed by every popup blocker after the
+  // first 1–2 files. The server now does the authorization /
+  // vault-unlock / AV pre-flight up front, then streams a single
+  // `application/zip` response which the client saves via a
+  // transient anchor.
+  //
+  // The `progressLabel` parameter is the user-facing description
+  // for the "Preparing…" toast that fires while the server runs its
+  // O(N) pre-flight queries. For folders that can balloon into
+  // hundreds of descendants this matters — silence feels broken.
+  async function downloadZip(
+    payload: { ids?: string[]; folderIds?: string[] },
+    progressLabel: string,
+  ) {
+    let res: Response;
+    try {
+      const token = getToken();
+      res = await fetch(`${API_URL}/v1/files/zip`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify(payload),
+      });
+    } catch (e: any) {
+      // Network error before the response started (CORS, DNS, the
+      // server died). Distinct from a server-side 4xx/5xx — those
+      // surface a structured envelope below.
+      toast.show("error", "Couldn't reach the server", {
+        description: e?.message,
+      });
+      return;
     }
+
+    if (!res.ok) {
+      // Server rejected the bulk request before streaming. The body
+      // is a normal JSON error envelope at this point — every gate
+      // (authz, vault, AV) writes its error UPFRONT precisely so
+      // we can surface a real message here.
+      const body = await res
+        .json()
+        .catch(() => ({ error: { message: res.statusText } }));
+      toast.show(
+        "error",
+        body?.error?.message ?? "Couldn't prepare download",
+      );
+      return;
+    }
+
+    // Successful 200: the body is the zip bytes. Buffer into a Blob
+    // and trigger the save. Using fetch+Blob (not <a href=…>) is
+    // necessary because the endpoint is POST, not GET, so we can't
+    // express it as a same-origin link click.
+    const blob = await res.blob();
+
+    // Pull the filename from Content-Disposition rather than
+    // hard-coding it client-side — the server picks the name (folder
+    // name for single-folder requests, timestamp otherwise) and is
+    // the source of truth.
+    const cd = res.headers.get("content-disposition") || "";
+    const m = /filename="?([^"]+)"?/i.exec(cd);
+    const fname =
+      m?.[1] ||
+      `docforge-${new Date().toISOString().replace(/[:.]/g, "-")}.zip`;
+
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = fname;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    // Hand the blob back to the GC. Keeping the object URL alive
+    // pins the entire archive in memory until the page reloads.
+    URL.revokeObjectURL(url);
+
+    toast.show("success", `Downloaded ${progressLabel} as ${fname}`);
+  }
+
+  // Bulk download → server-streams a multi-file ZIP of every
+  // currently-selected file. Single-file case short-circuits to the
+  // original presign flow so the user gets the file under its real
+  // name instead of unnecessarily wrapped inside a one-entry zip.
+  async function bulkDownload() {
+    if (selected.size === 0) return;
+    if (selected.size === 1) {
+      const [only] = Array.from(selected);
+      await download(only);
+      return;
+    }
+    const ids = Array.from(selected);
+    toast.show("info", `Preparing ${ids.length} files…`, {
+      description: "We'll save a ZIP when it's ready.",
+    });
+    await downloadZip({ ids }, `${ids.length} files`);
+  }
+
+  // Single-folder download → server walks the folder + every
+  // descendant and streams a `<FolderName>.zip`. The pre-flight is
+  // O(N) descendants, so we surface a "Preparing…" toast like
+  // bulkDownload — the user only sees a save dialog once the server
+  // has finished authorising every file in the tree.
+  async function downloadFolder(folder: { id: string; name: string }) {
+    toast.show("info", `Preparing "${folder.name}"…`, {
+      description: "We'll save a ZIP when it's ready.",
+    });
+    await downloadZip({ folderIds: [folder.id] }, `"${folder.name}"`);
   }
 
   async function moveFileToFolder(fileId: string, folderId: string | null) {
@@ -1084,6 +1220,13 @@ export default function DrivePage() {
                 <DropdownMenuItem onClick={() => inputRef.current?.click()}>
                   <Upload className="h-4 w-4" />
                   Upload a file…
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setCameraOpen(true)}>
+                  <Camera className="h-4 w-4" />
+                  Capture image…
+                  <span className="ml-auto text-[10px] text-muted-foreground">
+                    Camera
+                  </span>
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
@@ -1566,6 +1709,16 @@ export default function DrivePage() {
                             <PencilLine className="h-4 w-4" />
                             Rename
                           </DropdownMenuItem>
+                          {/* Server walks the folder tree and streams
+                              a ZIP — replaces the previous
+                              "select-each-file-then-bulk" workaround
+                              for "I just want this folder." */}
+                          <DropdownMenuItem
+                            onClick={() => downloadFolder(f)}
+                          >
+                            <Download className="h-4 w-4" />
+                            Download as ZIP
+                          </DropdownMenuItem>
                           <DropdownMenuItem
                             onClick={() =>
                               setSharePeopleFor({
@@ -1648,6 +1801,16 @@ export default function DrivePage() {
                         }
                         if (file.mime === "application/pdf") {
                           setPreviewFor(file);
+                          return;
+                        }
+                        // Audio / video → in-app player. Routed before
+                        // the download fallback so a click on a video
+                        // row plays it inline instead of forcing the
+                        // user to save-then-open. PDF wins above
+                        // because it has dedicated AcroForm overlays
+                        // we don't want to skip.
+                        if (mediaKindFor(file.mime)) {
+                          setMediaPreviewFor(file);
                           return;
                         }
                         download(file.id);
@@ -1798,6 +1961,20 @@ export default function DrivePage() {
                                   Preview
                                 </DropdownMenuItem>
                               )}
+                            {/* Audio / video preview — same Eye icon
+                                as the PDF preview entry so the action
+                                affordance stays consistent across
+                                file types. */}
+                            {mediaKindFor(file.mime) && (
+                              <DropdownMenuItem
+                                onClick={() => setMediaPreviewFor(file)}
+                              >
+                                <Eye className="h-4 w-4" />
+                                {mediaKindFor(file.mime) === "video"
+                                  ? "Play video"
+                                  : "Play audio"}
+                              </DropdownMenuItem>
+                            )}
                             {/* Insert pages from another file into this
                                 PDF in place. Only meaningful for native
                                 PDFs (the splice happens against an
@@ -1933,6 +2110,7 @@ export default function DrivePage() {
                           })
                         }
                         onToggleLock={() => toggleFolderLock(f)}
+                        onDownload={() => downloadFolder(f)}
                       />
                     ))}
                   </div>
@@ -1977,7 +2155,9 @@ export default function DrivePage() {
                             ? () => router.push(`/templates/${file.templateId}/designer`)
                             : file.mime === "application/pdf"
                               ? () => setPreviewFor(file)
-                              : file.mime.startsWith("image/") && !file.mime.includes("svg")
+                              : mediaKindFor(file.mime)
+                                ? () => setMediaPreviewFor(file)
+                                : file.mime.startsWith("image/") && !file.mime.includes("svg")
                                 ? async () => {
                                     // Backfill the image template on demand — same
                                     // path as the list-view click. Keeps parity
@@ -2022,6 +2202,16 @@ export default function DrivePage() {
                             label: "Preview",
                             icon: <Eye className="h-4 w-4" />,
                             onClick: () => setPreviewFor(file),
+                          } : null,
+                          // Audio / video preview menu entry. Verb
+                          // changes ("Play video" / "Play audio")
+                          // because "Preview" feels static for media
+                          // — the user expects a play action, not a
+                          // still frame.
+                          mediaKindFor(file.mime) ? {
+                            label: mediaKindFor(file.mime) === "video" ? "Play video" : "Play audio",
+                            icon: <Eye className="h-4 w-4" />,
+                            onClick: () => setMediaPreviewFor(file),
                           } : null,
                           { label: "Download", icon: <Download className="h-4 w-4" />, onClick: () => download(file.id) },
                           canExportPDF(file) ? {
@@ -2133,6 +2323,25 @@ export default function DrivePage() {
         />
       )}
 
+      {/* Audio / video preview. Mounted alongside the PDF preview
+          dialog (rather than dispatching from a single state) so the
+          two dialogs stay independent — closing the media preview
+          shouldn't ever knock out a PDF preview that happened to be
+          open behind it, and vice versa. */}
+      {mediaPreviewFor && mediaKindFor(mediaPreviewFor.mime) && (
+        <MediaPreviewDialog
+          fileId={mediaPreviewFor.id}
+          fileName={mediaPreviewFor.name}
+          kind={mediaKindFor(mediaPreviewFor.mime)!}
+          open={!!mediaPreviewFor}
+          onOpenChange={(o) => !o && setMediaPreviewFor(null)}
+          onShare={() => {
+            setShareFor(mediaPreviewFor);
+            setMediaPreviewFor(null);
+          }}
+        />
+      )}
+
       {/* Multi-file → single-PDF stitch. We feed the dialog the
           currently-selected files so the user sees the same set they
           ticked in the toolbar. Drop into the active folder so the
@@ -2195,6 +2404,19 @@ export default function DrivePage() {
         onCreate={buildForm}
         busy={creating}
       />
+
+      <CameraCaptureDialog
+        open={cameraOpen}
+        onOpenChange={setCameraOpen}
+        onCapture={(file) => {
+          // Reuse the same upload pipeline as drag-and-drop / picker:
+          // conflict prompt, presign, complete, toast — everything is
+          // already there. The capture File is built with a unique
+          // timestamped name so collisions are unlikely, but the
+          // existing flow will still ask the user if one happens.
+          void upload(file);
+        }}
+      />
     </AppShell>
   );
 }
@@ -2243,33 +2465,26 @@ function StatCard({
   );
 }
 
-function putWithProgress(
-  url: string,
-  file: File,
-  onProgress: (pct: number) => void
-): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open("PUT", url);
-    xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream");
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable)
-        onProgress(Math.round((e.loaded / e.total) * 100));
-    };
-    xhr.onload = () =>
-      xhr.status >= 200 && xhr.status < 300
-        ? resolve()
-        : reject(new Error(`Upload failed: ${xhr.status}`));
-    xhr.onerror = () => reject(new Error("Network error"));
-    xhr.send(file);
-  });
-}
-
 function fmtSize(b: number) {
   if (b < 1024) return `${b} B`;
   if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
   if (b < 1024 * 1024 * 1024) return `${(b / 1024 / 1024).toFixed(1)} MB`;
   return `${(b / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+
+/**
+ * Classify a MIME for the in-app media preview. Returns the kind the
+ * `MediaPreviewDialog` expects, or null when the file isn't audio /
+ * video. Kept local (rather than added to lib/file-icons) because
+ * the dialog's `kind` prop is the only consumer — moving it to a
+ * shared module would just create a second source of truth for the
+ * same two-line check.
+ */
+function mediaKindFor(mime: string): "audio" | "video" | null {
+  if (!mime) return null;
+  if (mime.startsWith("video/")) return "video";
+  if (mime.startsWith("audio/")) return "audio";
+  return null;
 }
 
 function prettyMime(mime: string) {

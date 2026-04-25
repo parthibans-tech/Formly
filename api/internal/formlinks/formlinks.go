@@ -319,7 +319,9 @@ func (h *Handler) Submit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Pre-signed download URL valid for 10m.
-	dl, err := h.Storage.PresignGet(r.Context(), res.OutputKey, res.OutputName, 10*time.Minute)
+	// Server-generated PDF; name provided so attachment is forced
+	// regardless of the MIME hardening below.
+	dl, err := h.Storage.PresignGet(r.Context(), res.OutputKey, "application/pdf", res.OutputName, 10*time.Minute)
 	if err != nil {
 		writeErr(w, 500, "presign", err.Error())
 		return

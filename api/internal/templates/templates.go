@@ -28,6 +28,7 @@ import (
 	"github.com/docforge/api/internal/queue"
 	"github.com/docforge/api/internal/sharing"
 	"github.com/docforge/api/internal/storage"
+	"github.com/docforge/api/internal/uploadpolicy"
 	"github.com/go-chi/chi/v5"
 	"github.com/hibiken/asynq"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -38,6 +39,13 @@ type Handler struct {
 	Storage *storage.Client
 	Runner  *generate.Runner
 	Queue   *asynq.Client // nil if async is disabled
+	// Policy resolves the org's effective upload-policy. Wired from
+	// cmd/api so PreviewURL can echo the configured iframe-sandbox
+	// token to the frontend (which sets it on `<iframe sandbox="...">`
+	// before fetching the preview). Optional — nil falls back to the
+	// package-default sandbox value, keeping existing tests/builds
+	// that don't configure policy from breaking.
+	Policy *uploadpolicy.Service
 }
 
 func New(db *pgxpool.Pool, s *storage.Client) *Handler {
@@ -698,7 +706,7 @@ func (h *Handler) Generate(w http.ResponseWriter, r *http.Request) {
 	// Non-preview Generate persists the rendered file to Drive and
 	// returns a download-disposition URL so the browser saves it —
 	// that's what "Generate" has always meant on this endpoint.
-	url, err := h.Storage.PresignGet(r.Context(), res.OutputKey, res.OutputName, 10*time.Minute)
+	url, err := h.Storage.PresignGet(r.Context(), res.OutputKey, "application/pdf", res.OutputName, 10*time.Minute)
 	if err != nil {
 		writeErr(w, 500, "presign", err.Error())
 		return
@@ -747,7 +755,11 @@ func (h *Handler) Batch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "db_error", err.Error())
 		return
 	}
-	storageKey := fmt.Sprintf("orgs/%s/batch-input/%s/%s", c.OrgID, jobID, hdr.Filename)
+	// hdr.Filename is multipart-attacker-controllable; slugify before
+	// it lands in an object key. The display form is irrelevant here —
+	// nothing surfaces this path back to the user.
+	storageKey := fmt.Sprintf("orgs/%s/batch-input/%s/%s",
+		c.OrgID, jobID, uploadpolicy.SafeStorageSlug(hdr.Filename))
 	contentType := mimeForKind(kind)
 	if err := h.Storage.PutBytes(r.Context(), storageKey, contentType, body); err != nil {
 		writeErr(w, 500, "storage", err.Error())
@@ -1124,7 +1136,8 @@ func (h *Handler) CreateFormTemplate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "db_error", err.Error())
 		return
 	}
-	key := fmt.Sprintf("orgs/%s/files/%s/%s", c.OrgID, fileID, req.Name)
+	key := fmt.Sprintf("orgs/%s/files/%s/%s",
+		c.OrgID, fileID, uploadpolicy.SafeStorageSlug(req.Name))
 	if _, err := h.DB.Exec(r.Context(),
 		`UPDATE files SET storage_key=$1 WHERE id=$2`, key, fileID,
 	); err != nil {
@@ -1384,7 +1397,8 @@ func (h *Handler) CreateBlankPDF(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "db_error", err.Error())
 		return
 	}
-	key := fmt.Sprintf("orgs/%s/files/%s/%s", c.OrgID, fileID, req.Name)
+	key := fmt.Sprintf("orgs/%s/files/%s/%s",
+		c.OrgID, fileID, uploadpolicy.SafeStorageSlug(req.Name))
 	if _, err := h.DB.Exec(r.Context(),
 		`UPDATE files SET storage_key=$1 WHERE id=$2`, key, fileID,
 	); err != nil {
@@ -1495,7 +1509,8 @@ func (h *Handler) CreateDocTemplate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "db_error", err.Error())
 		return
 	}
-	key := fmt.Sprintf("orgs/%s/files/%s/%s", c.OrgID, fileID, name)
+	key := fmt.Sprintf("orgs/%s/files/%s/%s",
+		c.OrgID, fileID, uploadpolicy.SafeStorageSlug(name))
 	if _, err := h.DB.Exec(r.Context(),
 		`UPDATE files SET storage_key=$1 WHERE id=$2`, key, fileID,
 	); err != nil {
@@ -1793,22 +1808,45 @@ func (h *Handler) UpdateSource(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) PreviewURL(w http.ResponseWriter, r *http.Request) {
 	c := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
 	id := chi.URLParam(r, "id")
-	var key, name string
+	var key, name, mime string
 	err := h.DB.QueryRow(r.Context(),
-		`SELECT f.storage_key, f.name FROM templates t
+		`SELECT f.storage_key, f.name, COALESCE(f.mime, '') FROM templates t
 		 JOIN files f ON f.id=t.file_id
 		 WHERE t.id=$1 AND t.org_id=$2`, id, c.OrgID,
-	).Scan(&key, &name)
+	).Scan(&key, &name, &mime)
 	if err != nil {
 		writeErr(w, 404, "not_found", "template not found")
 		return
 	}
-	url, err := h.Storage.PresignGet(r.Context(), key, "", 10*time.Minute)
+	// Preview UI iframes the result, so we want inline disposition for
+	// safe MIMEs (PDFs, plain images). PresignGetInline carries the
+	// risky-MIME override that flips HTML/SVG/JS back to attachment
+	// — same end state as the old PresignGet behaviour, but expressed
+	// through the explicit-inline primitive instead of relying on
+	// PresignGet's defaults (which now always force attachment).
+	url, err := h.Storage.PresignGetInline(r.Context(), key, mime, 10*time.Minute)
 	if err != nil {
 		writeErr(w, 500, "presign", err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]string{"url": url, "name": name})
+	// Echo the org's configured iframe-sandbox token so the frontend can
+	// apply `<iframe sandbox={iframeSandbox}>` consistent with policy.
+	// Fallback to the package default when policy isn't wired (keeps
+	// existing tests/setups working). The CSP knob is enforced by the
+	// proxy endpoint (/v1/files/{id}/inline-preview) — presigned URLs
+	// can't carry response headers, so the frontend should prefer that
+	// route for HTML/SVG content while this stays in place for PDFs.
+	sandbox := uploadpolicy.DefaultPreviewIframeSandbox
+	if h.Policy != nil {
+		if p, perr := h.Policy.Effective(r.Context(), c.OrgID); perr == nil {
+			sandbox = p.PreviewIframeSandbox
+		}
+	}
+	writeJSON(w, 200, map[string]any{
+		"url":           url,
+		"name":          name,
+		"iframeSandbox": sandbox,
+	})
 }
 
 func isPDF(mime, name string) bool {
@@ -2094,7 +2132,10 @@ func (h *Handler) UpdateAcroformStructure(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	previewURL, _ := h.Storage.PresignGet(ctx, storageKey, "", 10*time.Minute)
+	// PDF only — the AcroForm pipeline writes only PDFs, so the preview
+	// is always safe to render inline. PresignGet now always forces
+	// attachment, so use PresignGetInline for the iframe path.
+	previewURL, _ := h.Storage.PresignGetInline(ctx, storageKey, "application/pdf", 10*time.Minute)
 
 	// Build DTO fields for response.
 	dtos := make([]fieldDTO, 0, len(fresh))

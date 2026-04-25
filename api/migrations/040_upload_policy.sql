@@ -78,7 +78,7 @@ INSERT INTO product_config (id) VALUES ('default') ON CONFLICT DO NOTHING;
 
 -- ---------- org_upload_config (per-org overrides) -----------------------
 CREATE TABLE IF NOT EXISTS org_upload_config (
-    org_id uuid PRIMARY KEY REFERENCES orgs(id) ON DELETE CASCADE,
+    org_id uuid PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
 
     -- Each column NULL = "inherit from product_config".
     max_upload_bytes           bigint,

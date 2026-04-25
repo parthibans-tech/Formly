@@ -11,6 +11,7 @@ import (
 	"github.com/docforge/api/internal/mergerecipes"
 	"github.com/docforge/api/internal/pdfmerge"
 	"github.com/docforge/api/internal/queue"
+	"github.com/docforge/api/internal/scanner"
 	"github.com/docforge/api/internal/scheduled"
 	"github.com/docforge/api/internal/storage"
 	"github.com/docforge/api/internal/webhooks"
@@ -48,7 +49,12 @@ func main() {
 	h := &worker.Handlers{
 		DB: pool, Storage: store, Runner: runner, Log: logger,
 		PDFMerge: pm, MergeRecipes: mr,
+		// Scanner selection is env-driven so dev/CI default to Noop
+		// without any config and prod attaches to ClamAV via
+		// CLAMAV_ADDR. See scanner.FromEnv for the precedence ladder.
+		Scanner: scanner.FromEnv(os.Getenv),
 	}
+	logger.Info("scanner selected", "engine", h.Scanner.Name())
 
 	srv := asynq.NewServer(queue.ClientOpt(), asynq.Config{
 		Concurrency: 4,

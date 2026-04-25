@@ -45,6 +45,19 @@ import { userInitials } from "@/lib/user";
 import { SharePeopleModal } from "@/components/share-people-modal";
 import { ShareModal } from "@/components/share-modal";
 import { FilePreviewDialog } from "@/components/file-preview-dialog";
+import { MediaPreviewDialog } from "@/components/media-preview-dialog";
+
+/**
+ * Same MIME → media-kind classifier used in /drive/page.tsx. Kept
+ * inline here to avoid promoting a two-line check into a shared
+ * module — the only consumer is the MediaPreviewDialog `kind` prop.
+ */
+function mediaKindFor(mime: string): "audio" | "video" | null {
+  if (!mime) return null;
+  if (mime.startsWith("video/")) return "video";
+  if (mime.startsWith("audio/")) return "audio";
+  return null;
+}
 
 export default function StarredPage() {
   const router = useRouter();
@@ -55,6 +68,9 @@ export default function StarredPage() {
   const [search, setSearch] = useState("");
   const [view, setView] = useViewMode();
   const [previewFor, setPreviewFor] = useState<FileItem | null>(null);
+  const [mediaPreviewFor, setMediaPreviewFor] = useState<FileItem | null>(
+    null,
+  );
   const [shareFor, setShareFor] = useState<FileItem | null>(null);
   const [sharePeopleFor, setSharePeopleFor] = useState<
     { id: string; name: string; type: "file" | "folder" } | null
@@ -211,6 +227,21 @@ export default function StarredPage() {
                   },
                 ]
               : []),
+            // Audio / video play action. "Play" verb instead of
+            // "Preview" so users know they're getting a media
+            // player, not a still thumbnail.
+            ...(mediaKindFor(f.mime)
+              ? [
+                  {
+                    label:
+                      mediaKindFor(f.mime) === "video"
+                        ? "Play video"
+                        : "Play audio",
+                    icon: <Eye className="h-4 w-4" />,
+                    onClick: (file: FileItem) => setMediaPreviewFor(file),
+                  },
+                ]
+              : []),
             {
               label: "Download",
               icon: <Download className="h-4 w-4" />,
@@ -262,6 +293,20 @@ export default function StarredPage() {
           onShare={() => {
             setShareFor(previewFor);
             setPreviewFor(null);
+          }}
+        />
+      )}
+
+      {mediaPreviewFor && mediaKindFor(mediaPreviewFor.mime) && (
+        <MediaPreviewDialog
+          fileId={mediaPreviewFor.id}
+          fileName={mediaPreviewFor.name}
+          kind={mediaKindFor(mediaPreviewFor.mime)!}
+          open={!!mediaPreviewFor}
+          onOpenChange={(o) => !o && setMediaPreviewFor(null)}
+          onShare={() => {
+            setShareFor(mediaPreviewFor);
+            setMediaPreviewFor(null);
           }}
         />
       )}
