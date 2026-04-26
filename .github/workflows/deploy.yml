@@ -245,6 +245,21 @@ jobs:
 
           ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
+          # ────────── DEBUG ──────────
+          # Verbose handshake test against the VPS. Verifies that the
+          # exact key on the runner authenticates the runner's
+          # outbound IP. Output goes to the Actions log; remove this
+          # block after the SSH issue is resolved.
+          echo "::group::SSH verbose handshake test"
+          ssh -vvv -i ~/.ssh/deploy_key \
+              -o IdentitiesOnly=yes \
+              -o BatchMode=yes \
+              -o ConnectTimeout=10 \
+              -p "$DEPLOY_PORT" \
+              "$DEPLOY_USER@$DEPLOY_HOST" \
+              "echo SSH_OK from \$(hostname)" || true
+          echo "::endgroup::"
+
       - name: Update .env on VPS with new image tag(s)
         run: |
           set -euo pipefail
