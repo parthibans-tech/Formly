@@ -213,8 +213,11 @@ jobs:
       DEPLOY_API: ${{ needs.plan.outputs.deploy_api }}
       DEPLOY_WEB: ${{ needs.plan.outputs.deploy_web }}
       IMAGE_TAG:  ${{ needs.plan.outputs.image_tag }}
-      API_IMAGE:  ${{ env.REGISTRY }}/${{ needs.plan.outputs.repo_lower }}-api:${{ needs.plan.outputs.image_tag }}
-      WEB_IMAGE:  ${{ env.REGISTRY }}/${{ needs.plan.outputs.repo_lower }}-web:${{ needs.plan.outputs.image_tag }}
+      # NB: ghcr.io is hardcoded here (not ${{ env.REGISTRY }})
+      # because the `env` context is not in scope inside a job-level
+      # `env:` block — GHA only resolves it inside steps.
+      API_IMAGE:  ghcr.io/${{ needs.plan.outputs.repo_lower }}-api:${{ needs.plan.outputs.image_tag }}
+      WEB_IMAGE:  ghcr.io/${{ needs.plan.outputs.repo_lower }}-web:${{ needs.plan.outputs.image_tag }}
     steps:
       - name: Configure SSH
         run: |
