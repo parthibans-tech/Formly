@@ -6,6 +6,7 @@ require (
 	github.com/boombuler/barcode v1.1.0
 	github.com/chromedp/cdproto v0.0.0-20241003230502-a4a8f7c660df
 	github.com/chromedp/chromedp v0.11.0
+	github.com/disintegration/imaging v1.6.2
 	github.com/expr-lang/expr v1.17.8
 	github.com/go-chi/chi/v5 v5.1.0
 	github.com/go-chi/cors v1.2.1
@@ -14,6 +15,7 @@ require (
 	github.com/hibiken/asynq v0.25.0
 	github.com/jackc/pgx/v5 v5.7.1
 	github.com/joho/godotenv v1.5.1
+	github.com/ledongthuc/pdf v0.0.0-20220302134840-0c2507a12d80
 	github.com/minio/minio-go/v7 v7.0.79
 	github.com/pdfcpu/pdfcpu v0.12.0
 	github.com/robfig/cron/v3 v3.0.1
@@ -29,7 +31,6 @@ require (
 	github.com/chromedp/sysutil v1.0.0 // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
-	github.com/disintegration/imaging v1.6.2 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/go-ini/ini v1.67.0 // indirect
 	github.com/gobwas/httphead v0.1.0 // indirect

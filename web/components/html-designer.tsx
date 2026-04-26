@@ -75,6 +75,7 @@ import {
 import { ShortcutHelp, modSymbol } from "@/components/designer/shortcut-help";
 import { InlineRenameTitle } from "@/components/designer/inline-rename-title";
 import { ApiGuideSheet } from "@/components/api-guide-trigger";
+import { DocAITools } from "@/components/doc-ai-tools";
 
 type Template = {
   id: string;
@@ -97,10 +98,18 @@ type Props = {
   // PUT to /config or /source will 403 — short-circuit save locally and
   // disable the Save button so the restriction is obvious up-front.
   readOnly?: boolean;
+  // Source file ID — when present we render Extract text + Summarize /
+  // Ask in the header so the designer can read OCR'd content from the
+  // original upload while authoring HTML around it.
+  fileId?: string;
 };
 type EditorTab = "design" | "code";
 
-export default function HtmlDesigner({ tpl: initialTpl, readOnly = false }: Props) {
+export default function HtmlDesigner({
+  tpl: initialTpl,
+  readOnly = false,
+  fileId,
+}: Props) {
   const toast = useToast();
   const [tpl, setTpl] = useState(initialTpl);
   const [source, setSource] = useState("");
@@ -526,6 +535,15 @@ export default function HtmlDesigner({ tpl: initialTpl, readOnly = false }: Prop
                 </TooltipTrigger>
                 <TooltipContent>Keyboard shortcuts (?)</TooltipContent>
               </Tooltip>
+
+              <Separator orientation="vertical" className="mx-1 h-6" />
+
+              {/* OCR + AI affordances against the source asset. Both
+                  open right-side drawers so the editor stays visible
+                  while the user reads / asks. */}
+              {fileId ? (
+                <DocAITools fileId={fileId} fileName={tpl.name} />
+              ) : null}
 
               <Separator orientation="vertical" className="mx-1 h-6" />
 

@@ -82,5 +82,5 @@ export default function DocDesignerPage() {
     );
   }
 
-  return <DocDesigner tpl={tpl} />;
+  return <DocDesigner tpl={tpl} fileId={tpl.fileId} />;
 }

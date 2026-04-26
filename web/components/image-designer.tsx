@@ -63,6 +63,7 @@ import {
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { ApiGuideSheet } from "@/components/api-guide-trigger";
+import { DocAITools } from "@/components/doc-ai-tools";
 
 type ImageTpl = {
   id: string;
@@ -88,9 +89,14 @@ type Rect = { x: number; y: number; w: number; h: number };
 export default function ImageDesigner({
   tpl,
   previewUrl,
+  fileId,
 }: {
   tpl: ImageTpl;
   previewUrl: string;
+  // Source file ID. When present, renders Extract text + Summarize /
+  // Ask in the toolbar so the user can OCR the image directly from
+  // the editor rather than bouncing back to Drive.
+  fileId?: string;
 }) {
   const router = useRouter();
   const toast = useToast();
@@ -338,6 +344,11 @@ export default function ImageDesigner({
             </div>
           </div>
           <div className="flex items-center gap-1.5">
+            {/* OCR + AI for the source image. Compact mode keeps the
+                editor's already-busy toolbar from wrapping. */}
+            {fileId ? (
+              <DocAITools fileId={fileId} fileName={tpl.name} compact />
+            ) : null}
             <ApiGuideSheet templateId={tpl.id} templateName={tpl.name} />
             <Button
               variant="ghost"

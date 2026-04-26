@@ -5,7 +5,7 @@
 // localStorage so the layout sticks across sessions per browser. Items
 // are still source-of-truth here; pins just promote them to the top.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
@@ -29,10 +29,12 @@ import {
   Pin,
   PinOff,
   Plug,
+  ScanText,
   Search,
   Settings,
   Share2,
   ShieldCheck,
+  Sparkles,
   Star,
   Trash2,
   UserCog,
@@ -43,6 +45,7 @@ import {
 import { cn } from "@/lib/utils";
 import { getUser } from "@/lib/api";
 import { Input } from "@/components/ui/input";
+import { useAIConfig, type AIFeatureFlags } from "@/hooks/use-ai-config";
 
 type Role = "admin" | "editor" | "viewer";
 
@@ -62,6 +65,10 @@ type Item = {
   // Hint shown under the label in search results so users can tell apart
   // similarly-named items (e.g. "Audit log" vs "Platform audit").
   hint?: string;
+  // aiFeature: when set, the entry only renders if that AI feature flag
+  // is on. Mirrors the `<AIFeature>` component's gate on the page side
+  // so the sidebar and the actual route are consistent — no dead links.
+  aiFeature?: keyof AIFeatureFlags;
 };
 
 type Section = {
@@ -88,6 +95,13 @@ const SECTIONS: Section[] = [
       { href: "/drive", label: "My Drive", icon: HardDrive },
       { href: "/drive/shared", label: "Shared with me", icon: Share2 },
       { href: "/drive/starred", label: "Starred", icon: Star },
+      {
+        href: "/drive/smart-search",
+        label: "Smart search",
+        icon: Sparkles,
+        aiFeature: "smartSearch",
+        hint: "AI semantic search",
+      },
       { href: "/drive/templates", label: "Templates", icon: Files },
       { href: "/merge-recipes", label: "Merge recipes", icon: Layers },
       { href: "/drive/recent", label: "Recent", icon: Clock },
@@ -148,6 +162,13 @@ const SECTIONS: Section[] = [
         icon: Lock,
         roles: ["admin"],
         hint: "File security",
+      },
+      {
+        href: "/settings/ocr-profiles",
+        label: "OCR profiles",
+        icon: ScanText,
+        roles: ["admin"],
+        hint: "Document-type presets",
       },
       {
         href: "/settings/ops",
@@ -246,6 +267,13 @@ const SECTIONS: Section[] = [
         hint: "Upload defaults",
       },
       {
+        href: "/settings/ocr-profiles",
+        label: "OCR profiles",
+        icon: ScanText,
+        superAdmin: true,
+        hint: "Built-in document types",
+      },
+      {
         href: "/settings/audit",
         label: "Audit",
         icon: ShieldCheck,
@@ -288,6 +316,7 @@ function visibleFor(
   role: Role | null,
   isSuperAdmin: boolean,
   items: Item[],
+  aiFeatureOn: (k: keyof AIFeatureFlags) => boolean,
 ): Item[] {
   // Default to most-restrictive ("viewer") when role is unknown — keeps
   // a half-loaded sidebar from briefly flashing admin links to a viewer.
@@ -295,6 +324,9 @@ function visibleFor(
   return items.filter((it) => {
     if (it.superAdmin && !isSuperAdmin) return false;
     if (it.roles && !it.roles.includes(r)) return false;
+    // AI gate: hide entries whose feature flag is off so the sidebar
+    // never advertises a route the page itself would 503 on.
+    if (it.aiFeature && !aiFeatureOn(it.aiFeature)) return false;
     return true;
   });
 }
@@ -316,6 +348,14 @@ export function AppSidebar({ onNavigate }: { onNavigate?: () => void }) {
   const [pins, setPins] = useState<string[]>([]);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const searchRef = useRef<HTMLInputElement>(null);
+  // One AI-config fetch per page-load (the hook is module-cached).
+  // We synthesize a per-feature predicate here so visibleFor stays a
+  // pure function — no hook calls inside its filter loop.
+  const aiCfg = useAIConfig();
+  const aiFeatureOn = useCallback(
+    (k: keyof AIFeatureFlags) => aiCfg.enabled && !!aiCfg.features[k],
+    [aiCfg],
+  );
 
   // Hydrate from localStorage / user blob on mount. Both are sync reads
   // so the first paint already has the right state.
@@ -379,9 +419,12 @@ export function AppSidebar({ onNavigate }: { onNavigate?: () => void }) {
 
   const allVisible = useMemo(() => {
     return orderedSections.flatMap((s) =>
-      visibleFor(role, isSuperAdmin, s.items).map((it) => ({ ...it, sectionTitle: s.title })),
+      visibleFor(role, isSuperAdmin, s.items, aiFeatureOn).map((it) => ({
+        ...it,
+        sectionTitle: s.title,
+      })),
     );
-  }, [orderedSections, role, isSuperAdmin]);
+  }, [orderedSections, role, isSuperAdmin, aiFeatureOn]);
 
   const pinnedItems = useMemo(() => {
     if (pins.length === 0) return [];
@@ -470,7 +513,7 @@ export function AppSidebar({ onNavigate }: { onNavigate?: () => void }) {
             )}
 
             {orderedSections.map((s) => {
-              const items = visibleFor(role, isSuperAdmin, s.items);
+              const items = visibleFor(role, isSuperAdmin, s.items, aiFeatureOn);
               if (items.length === 0) return null;
               return (
                 <SectionBlock

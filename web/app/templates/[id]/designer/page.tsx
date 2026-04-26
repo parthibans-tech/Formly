@@ -21,6 +21,7 @@ import ImageDesigner from "@/components/image-designer";
 import { TemplateViewer } from "@/components/template-viewer";
 import { BatchDialog } from "@/components/batch-dialog";
 import { ApiGuideSheet } from "@/components/api-guide-trigger";
+import { DocAITools } from "@/components/doc-ai-tools";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -311,6 +312,7 @@ export default function DesignerPage() {
           config: tpl.config || {},
         }}
         previewUrl={previewUrl}
+        fileId={tpl.fileId}
       />
     );
   }
@@ -325,6 +327,7 @@ export default function DesignerPage() {
           version: tpl.version,
           config: tpl.config || {},
         }}
+        fileId={tpl.fileId}
       />
     );
   }
@@ -339,6 +342,7 @@ export default function DesignerPage() {
           version: tpl.version,
           config: tpl.config || {},
         }}
+        fileId={tpl.fileId}
       />
     );
   }
@@ -359,6 +363,7 @@ export default function DesignerPage() {
           config: (tpl.config as any) || {},
         }}
         previewUrl={previewUrl}
+        fileId={tpl.fileId}
       />
     );
   }
@@ -375,6 +380,7 @@ export default function DesignerPage() {
           config: (tpl.config as any) || {},
         }}
         previewUrl={previewUrl}
+        fileId={tpl.fileId}
       />
     );
   }
@@ -425,6 +431,13 @@ export default function DesignerPage() {
                 /templates/:id/api mirrors this content for shareable
                 URLs. */}
             <ApiGuideSheet templateId={tpl.id} templateName={tpl.name} />
+            {/* OCR + AI for the source PDF — same drawer pair the
+                other designer modes expose. Useful here because the
+                fallback acroform editor tends to need cross-reference
+                between AcroForm field metadata and prose in the PDF. */}
+            {tpl.fileId ? (
+              <DocAITools fileId={tpl.fileId} fileName={tpl.name} />
+            ) : null}
             <Button variant="ghost" size="sm" asChild>
               <Link href={`/templates/${tpl.id}/playground`}>
                 <Sparkles className="h-4 w-4" />

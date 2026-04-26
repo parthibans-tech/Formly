@@ -46,6 +46,7 @@ import { SharePeopleModal } from "@/components/share-people-modal";
 import { ShareModal } from "@/components/share-modal";
 import { FilePreviewDialog } from "@/components/file-preview-dialog";
 import { MediaPreviewDialog } from "@/components/media-preview-dialog";
+import { ImagePreviewDialog } from "@/components/image-preview-dialog";
 
 /**
  * Same MIME → media-kind classifier used in /drive/page.tsx. Kept
@@ -68,6 +69,15 @@ export default function StarredPage() {
   const [search, setSearch] = useState("");
   const [view, setView] = useViewMode();
   const [previewFor, setPreviewFor] = useState<FileItem | null>(null);
+  // Image preview target — kept distinct from PDF / media so that
+  // closing one preview doesn't accidentally tear down another. Same
+  // pattern as /drive/page.tsx; the dialog itself owns the AI panel
+  // gating (off when the operator hasn't enabled summarize, off when
+  // OCR isn't installed) so this state just tracks "which file row
+  // wants to be previewed."
+  const [imagePreviewFor, setImagePreviewFor] = useState<FileItem | null>(
+    null,
+  );
   const [mediaPreviewFor, setMediaPreviewFor] = useState<FileItem | null>(
     null,
   );
@@ -227,6 +237,25 @@ export default function StarredPage() {
                   },
                 ]
               : []),
+            // Raster image preview action. Goes through the dedicated
+            // ImagePreviewDialog (with optional AI Summarize / Ask
+            // backed by OCR). SVG is excluded — vector markup has no
+            // pixels to OCR, so the AI panel would only ever fail
+            // there; falling through to Download is more honest.
+            ...(!f.templateId &&
+            f.mime.startsWith("image/") &&
+            !f.mime.includes("svg")
+              ? [
+                  {
+                    // "Preview & read text" so the OCR/AI entry point
+                    // is discoverable from the menu, not just from the
+                    // dialog header. Mirrors /drive/page.tsx.
+                    label: "Preview & read text",
+                    icon: <Eye className="h-4 w-4" />,
+                    onClick: (file: FileItem) => setImagePreviewFor(file),
+                  },
+                ]
+              : []),
             // Audio / video play action. "Play" verb instead of
             // "Preview" so users know they're getting a media
             // player, not a still thumbnail.
@@ -307,6 +336,19 @@ export default function StarredPage() {
           onShare={() => {
             setShareFor(mediaPreviewFor);
             setMediaPreviewFor(null);
+          }}
+        />
+      )}
+
+      {imagePreviewFor && (
+        <ImagePreviewDialog
+          fileId={imagePreviewFor.id}
+          fileName={imagePreviewFor.name}
+          open={!!imagePreviewFor}
+          onOpenChange={(o) => !o && setImagePreviewFor(null)}
+          onShare={() => {
+            setShareFor(imagePreviewFor);
+            setImagePreviewFor(null);
           }}
         />
       )}

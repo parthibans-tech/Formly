@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -72,6 +73,17 @@ type Handler struct {
 	// defaults → per-org overrides). Required for CreateUploadURL and
 	// Complete. main.go wires this in after construction.
 	Policy *uploadpolicy.Service
+	// AIEmbedEnabled toggles enqueueing TaskEmbedFile from Complete. Set
+	// at boot from `ai.Client.Enabled() && Capabilities().Embed` so the
+	// HTTP layer doesn't depend on the ai package directly. When false,
+	// uploads complete without indexing — exactly the off-by-default
+	// behaviour we want for AI features.
+	AIEmbedEnabled bool
+	// AIAutoTagEnabled toggles enqueueing TaskAutoTagFile from Complete.
+	// Boot-set from `ai.Client.Enabled() && Capabilities().Chat` (auto-
+	// tag uses chat, not embed, so chat-only providers like Anthropic
+	// still get this feature even when Smart Search is dark).
+	AIAutoTagEnabled bool
 }
 
 func New(db *pgxpool.Pool, s *storage.Client) *Handler {
@@ -97,6 +109,14 @@ type fileDTO struct {
 	PreviewPdfID    *string `json:"previewPdfId,omitempty"`
 	ConvertStatus   *string `json:"convertStatus,omitempty"`
 	ConvertWarning  *string `json:"convertWarning,omitempty"`
+	// AI auto-tag pipeline (migration 046). Tags is always present
+	// (defaulted to []); the rest are pointers because most rows have
+	// NULL for them — either AI was off at upload, or the worker
+	// hasn't finished, or the model couldn't make a useful suggestion.
+	Tags                 []string `json:"tags"`
+	AutoTagStatus        *string  `json:"autoTagStatus,omitempty"`
+	AutoRenameSuggestion *string  `json:"autoRenameSuggestion,omitempty"`
+	OriginalName         *string  `json:"originalName,omitempty"`
 }
 
 type uploadURLReq struct {
@@ -177,8 +197,20 @@ func (h *Handler) CreateUploadURL(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "missing_name", "name required")
 		return
 	}
-	if req.Mime == "" {
-		req.Mime = "application/octet-stream"
+	// Browsers populate File.type from the OS MIME registry, which on
+	// Windows + some Linux desktops is incomplete for raster images
+	// (HEIC, WebP, sometimes even PNG come up empty). When the client
+	// gives us nothing — or the catch-all octet-stream — fall back to
+	// guessing from the filename extension so downstream features that
+	// branch on mime ("image/*" → preview & OCR, "application/pdf" →
+	// docchat) light up immediately on first upload instead of waiting
+	// for the image-editor save path to rewrite the column.
+	if req.Mime == "" || strings.EqualFold(req.Mime, "application/octet-stream") {
+		if guess := guessMimeFromName(req.Name); guess != "" {
+			req.Mime = guess
+		} else if req.Mime == "" {
+			req.Mime = "application/octet-stream"
+		}
 	}
 
 	// Sanitise the display name UNCONDITIONALLY — the storage-key
@@ -819,6 +851,57 @@ func (h *Handler) Complete(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// AI smart-search index build. Only runs when:
+	//   - the operator turned AI on at boot (AI_ENABLED + Embed-capable
+	//     provider; main.go sets h.AIEmbedEnabled accordingly), AND
+	//   - we have a queue client to enqueue against.
+	// We mark embed_status='pending' first so the operator query
+	// "which files are still waiting?" works the moment the row exists.
+	// A NULL value (the migration default) means "AI was off when this
+	// file was uploaded"; pending means "AI is on, worker hasn't
+	// finished yet". The distinction matters for backfills.
+	if h.AIEmbedEnabled && h.Queue != nil {
+		if _, err := h.DB.Exec(r.Context(),
+			`UPDATE files SET embed_status='pending', embed_error=NULL, updated_at=now() WHERE id=$1`,
+			id,
+		); err == nil {
+			task, terr := queue.NewEmbedFile(queue.EmbedFilePayload{
+				JobID:      id, // reuse file id as the job key — embedding is idempotent
+				OrgID:      c.OrgID,
+				FileID:     id,
+				StorageKey: key,
+				MIME:       mime,
+			})
+			if terr == nil {
+				_, _ = h.Queue.Enqueue(task)
+			}
+		}
+	}
+
+	// AI auto-tag + auto-rename. Independent of the embed pipeline:
+	// chat-only providers light up auto-tag without smart search, and
+	// vice-versa for embed-only providers. We mark auto_tag_status
+	// 'pending' first so the UI can render a "tagging…" pill the moment
+	// the file appears in the listing.
+	if h.AIAutoTagEnabled && h.Queue != nil {
+		if _, err := h.DB.Exec(r.Context(),
+			`UPDATE files SET auto_tag_status='pending', auto_tag_error=NULL, updated_at=now() WHERE id=$1`,
+			id,
+		); err == nil {
+			task, terr := queue.NewAutoTagFile(queue.AutoTagFilePayload{
+				JobID:      id, // reuse file id; tagging is idempotent
+				OrgID:      c.OrgID,
+				FileID:     id,
+				StorageKey: key,
+				MIME:       mime,
+				Name:       name,
+			})
+			if terr == nil {
+				_, _ = h.Queue.Enqueue(task)
+			}
+		}
+	}
+
 	resp := map[string]any{"ok": true, "size": info.Size}
 	if h.Detector != nil {
 		tplID, err := h.Detector(r.Context(), id, c.OrgID, name, mime, key)
@@ -891,7 +974,9 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	baseSelect := `SELECT files.id, files.name, files.mime, files.size, files.status,
 	                       files.template_id, files.folder_id, files.created_at,
 	                       (sf.user_id IS NOT NULL) AS starred,
-	                       files.preview_pdf_id::text, files.convert_status, files.convert_warning
+	                       files.preview_pdf_id::text, files.convert_status, files.convert_warning,
+	                       COALESCE(files.tags, '{}'::text[]),
+	                       files.auto_tag_status, files.auto_rename_suggestion, files.original_name
 	               FROM files
 	               LEFT JOIN starred_files sf
 	                 ON sf.file_id = files.id AND sf.user_id = $1::uuid`
@@ -974,9 +1059,17 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	out := []fileDTO{}
 	for rows.Next() {
 		var f fileDTO
-		if err := rows.Scan(&f.ID, &f.Name, &f.Mime, &f.Size, &f.Status, &f.TemplateID, &f.FolderID, &f.CreatedAt, &f.Starred, &f.PreviewPdfID, &f.ConvertStatus, &f.ConvertWarning); err != nil {
+		if err := rows.Scan(
+			&f.ID, &f.Name, &f.Mime, &f.Size, &f.Status,
+			&f.TemplateID, &f.FolderID, &f.CreatedAt, &f.Starred,
+			&f.PreviewPdfID, &f.ConvertStatus, &f.ConvertWarning,
+			&f.Tags, &f.AutoTagStatus, &f.AutoRenameSuggestion, &f.OriginalName,
+		); err != nil {
 			writeErr(w, 500, "db_error", err.Error())
 			return
+		}
+		if f.Tags == nil {
+			f.Tags = []string{}
 		}
 		out = append(out, f)
 	}
@@ -1851,6 +1944,23 @@ func sanitizeHeaderFilename(s string) string {
 type patchReq struct {
 	Name     *string `json:"name"`
 	FolderID *string `json:"folderId"` // "" = root
+	// Tags: nil = leave alone, []string{} = clear, [...]= replace.
+	// We replace rather than merge because the client always has the
+	// authoritative list (it just edited the chip row); a merge here
+	// would let stale chips re-appear on a slow second client.
+	Tags *[]string `json:"tags,omitempty"`
+	// AcceptRenameSuggestion: when true, copy auto_rename_suggestion
+	// onto name (preserving the prior name in original_name if not
+	// already set) and clear the suggestion. Mutually exclusive with
+	// DismissRenameSuggestion; both true = ambiguous, treated as
+	// AcceptRenameSuggestion.
+	AcceptRenameSuggestion bool `json:"acceptRenameSuggestion,omitempty"`
+	// DismissRenameSuggestion: when true, just clear the suggestion
+	// without changing name. The "no, the original is fine" path.
+	DismissRenameSuggestion bool `json:"dismissRenameSuggestion,omitempty"`
+	// RevertRename: when true, copy original_name back onto name and
+	// clear original_name. The undo path for an auto-applied rename.
+	RevertRename bool `json:"revertRename,omitempty"`
 }
 
 func (h *Handler) Patch(w http.ResponseWriter, r *http.Request) {
@@ -1903,6 +2013,84 @@ func (h *Handler) Patch(w http.ResponseWriter, r *http.Request) {
 		if _, err := h.DB.Exec(r.Context(),
 			`UPDATE files SET folder_id=$1, updated_at=now() WHERE id=$2 AND org_id=$3`,
 			arg, id, c.OrgID,
+		); err != nil {
+			writeErr(w, 500, "db_error", err.Error())
+			return
+		}
+	}
+	// Tag replacement. We normalise lightly here (trim, dedupe, drop
+	// empties) because the chip-input UI is forgiving but we don't want
+	// the DB to hold whitespace-only entries that overlap-queries can't
+	// match. Heavy normalisation (lowercase, stop-word drop) lives in
+	// the autotag package; user-typed tags stay close to what they
+	// typed beyond the basics.
+	if req.Tags != nil {
+		clean := make([]string, 0, len(*req.Tags))
+		seen := make(map[string]struct{}, len(*req.Tags))
+		for _, t := range *req.Tags {
+			t = strings.TrimSpace(t)
+			if t == "" {
+				continue
+			}
+			key := strings.ToLower(t)
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			clean = append(clean, t)
+		}
+		if _, err := h.DB.Exec(r.Context(),
+			`UPDATE files SET tags=$1, updated_at=now() WHERE id=$2 AND org_id=$3`,
+			clean, id, c.OrgID,
+		); err != nil {
+			writeErr(w, 500, "db_error", err.Error())
+			return
+		}
+	}
+	// Rename-suggestion lifecycle. Accept wins if both flags are set
+	// (Dismiss is the safer no-op so an accidental double-flag still
+	// applies the user's apparent positive intent). Revert is
+	// independent — a user who reverts an auto-applied rename isn't
+	// interacting with the suggestion column at all.
+	switch {
+	case req.AcceptRenameSuggestion:
+		// COALESCE on original_name preserves the upload-time name on
+		// the *first* accept; subsequent edits don't clobber it. The
+		// suggestion column is cleared so the banner disappears.
+		if _, err := h.DB.Exec(r.Context(),
+			`UPDATE files
+			    SET name = COALESCE(auto_rename_suggestion, name),
+			        original_name = COALESCE(original_name, name),
+			        auto_rename_suggestion = NULL,
+			        updated_at = now()
+			  WHERE id=$1 AND org_id=$2 AND auto_rename_suggestion IS NOT NULL`,
+			id, c.OrgID,
+		); err != nil {
+			writeErr(w, 500, "db_error", err.Error())
+			return
+		}
+	case req.DismissRenameSuggestion:
+		if _, err := h.DB.Exec(r.Context(),
+			`UPDATE files SET auto_rename_suggestion = NULL, updated_at = now()
+			  WHERE id=$1 AND org_id=$2`,
+			id, c.OrgID,
+		); err != nil {
+			writeErr(w, 500, "db_error", err.Error())
+			return
+		}
+	}
+	if req.RevertRename {
+		// Only acts when original_name is populated — i.e. an
+		// auto-rename was actually applied. The WHERE guard means a
+		// stray RevertRename:true on a never-renamed file is a no-op
+		// instead of nuking the user's chosen name.
+		if _, err := h.DB.Exec(r.Context(),
+			`UPDATE files
+			    SET name = original_name,
+			        original_name = NULL,
+			        updated_at = now()
+			  WHERE id=$1 AND org_id=$2 AND original_name IS NOT NULL`,
+			id, c.OrgID,
 		); err != nil {
 			writeErr(w, 500, "db_error", err.Error())
 			return
@@ -2097,4 +2285,74 @@ func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 
 func writeErr(w http.ResponseWriter, code int, slug, msg string) {
 	writeJSON(w, code, map[string]any{"error": map[string]string{"code": slug, "message": msg}})
+}
+
+// extensionMime is a hardcoded fallback table for the file types we
+// care about routing on (preview, OCR, docchat). The Go stdlib's
+// mime.TypeByExtension consults the host OS's MIME registry, which on
+// minimal Linux containers and some Windows installs returns empty
+// for image/* and even some Office formats — so we override with
+// canonical IANA strings here. Keep in sync with the MIME allowlist
+// in uploadpolicy and with the frontend's `file.mime.startsWith(...)`
+// branches in web/app/drive/*.
+var extensionMime = map[string]string{
+	// images — primary use case (OCR pipeline routes on image/*)
+	".png":  "image/png",
+	".jpg":  "image/jpeg",
+	".jpeg": "image/jpeg",
+	".gif":  "image/gif",
+	".webp": "image/webp",
+	".bmp":  "image/bmp",
+	".tif":  "image/tiff",
+	".tiff": "image/tiff",
+	".heic": "image/heic",
+	".heif": "image/heif",
+	".svg":  "image/svg+xml",
+	// documents
+	".pdf":  "application/pdf",
+	".txt":  "text/plain",
+	".csv":  "text/csv",
+	".md":   "text/markdown",
+	".json": "application/json",
+	".xml":  "application/xml",
+	".html": "text/html",
+	".htm":  "text/html",
+	// office (kept for completeness — convert pipeline already keys on these)
+	".doc":  "application/msword",
+	".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	".xls":  "application/vnd.ms-excel",
+	".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	".ppt":  "application/vnd.ms-powerpoint",
+	".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+	".odt":  "application/vnd.oasis.opendocument.text",
+	".ods":  "application/vnd.oasis.opendocument.spreadsheet",
+	".odp":  "application/vnd.oasis.opendocument.presentation",
+	".rtf":  "application/rtf",
+	// archives
+	".zip": "application/zip",
+}
+
+// guessMimeFromName derives a content-type from the filename extension.
+// Returns "" when no good guess is available so the caller can decide
+// whether to fall back to application/octet-stream or reject the upload.
+// Tries the curated table first (deterministic across hosts), then the
+// stdlib lookup, then empty.
+func guessMimeFromName(name string) string {
+	ext := strings.ToLower(filepath.Ext(name))
+	if ext == "" {
+		return ""
+	}
+	if m, ok := extensionMime[ext]; ok {
+		return m
+	}
+	if m := mime.TypeByExtension(ext); m != "" {
+		// stdlib often returns "text/plain; charset=utf-8" — strip the
+		// parameter so DB rows stay short and downstream prefix matches
+		// (image/, application/pdf) keep working.
+		if i := strings.IndexByte(m, ';'); i > 0 {
+			m = strings.TrimSpace(m[:i])
+		}
+		return m
+	}
+	return ""
 }

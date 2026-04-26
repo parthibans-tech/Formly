@@ -12,8 +12,10 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/docforge/api/internal/autotag"
 	"github.com/docforge/api/internal/batchdata"
 	"github.com/docforge/api/internal/docconvert"
+	"github.com/docforge/api/internal/embeddings"
 	"github.com/docforge/api/internal/generate"
 	"github.com/docforge/api/internal/jobs"
 	"github.com/docforge/api/internal/mergerecipes"
@@ -44,6 +46,17 @@ type Handlers struct {
 	// startup so dev/CI default to Noop and prod attaches to ClamAV.
 	// Nil = scan handler refuses to run (fail-loud, not silent-pass).
 	Scanner scanner.Scanner
+	// Embedder powers TaskEmbedFile (AI smart-search index build).
+	// Nil = embed handler logs a warning and acks the job rather than
+	// retry-storming; that path runs when AI was on at enqueue time
+	// but the worker started without an AI client (operator flipped
+	// AI_ENABLED off between enqueue and process).
+	Embedder *embeddings.Embedder
+	// Tagger powers TaskAutoTagFile (AI auto-tag + auto-rename). Same
+	// nil-safety as Embedder above: a nil Tagger means the worker has
+	// no AI client and we ack-without-retry on incoming jobs so flipping
+	// AI off between enqueue and dequeue doesn't strand the queue.
+	Tagger *autotag.Tagger
 }
 
 func (h *Handlers) Register(mux *asynq.ServeMux) {
@@ -53,6 +66,8 @@ func (h *Handlers) Register(mux *asynq.ServeMux) {
 	mux.HandleFunc(queue.TaskMergePDF, h.mergePDF)
 	mux.HandleFunc(queue.TaskRunMergeRecipe, h.runMergeRecipe)
 	mux.HandleFunc(queue.TaskScanFile, h.scanFile)
+	mux.HandleFunc(queue.TaskEmbedFile, h.embedFile)
+	mux.HandleFunc(queue.TaskAutoTagFile, h.autoTagFile)
 }
 
 // runMergeRecipe is the asynq entry point for TaskRunMergeRecipe. The

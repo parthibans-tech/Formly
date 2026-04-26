@@ -72,6 +72,12 @@ export function FilePreviewDialog({
       onOpenChange={onOpenChange}
       url={url}
       fileName={fileName}
+      // Hand the file ID to the shared dialog so it can wire up the
+      // optional AI Summarize / Ask side panel. The dialog itself
+      // gates on AIFeature(summarize) before rendering anything; we
+      // unconditionally pass the ID because the gate decision belongs
+      // in one place.
+      aiFileId={fileId}
       actions={
         onShare ? (
           <Button

@@ -9,6 +9,8 @@ import (
 	"sort"
 	"time"
 
+	"github.com/docforge/api/internal/ai"
+	"github.com/docforge/api/internal/aisearch"
 	"github.com/docforge/api/internal/apikeys"
 	"github.com/docforge/api/internal/audit"
 	"github.com/docforge/api/internal/auth"
@@ -16,7 +18,9 @@ import (
 	"github.com/docforge/api/internal/comments"
 	"github.com/docforge/api/internal/compliance"
 	"github.com/docforge/api/internal/db"
+	"github.com/docforge/api/internal/docchat"
 	"github.com/docforge/api/internal/email"
+	"github.com/docforge/api/internal/embeddings"
 	"github.com/docforge/api/internal/files"
 	"github.com/docforge/api/internal/folders"
 	"github.com/docforge/api/internal/images"
@@ -27,6 +31,8 @@ import (
 	"github.com/docforge/api/internal/mfa"
 	"github.com/docforge/api/internal/mockdata"
 	"github.com/docforge/api/internal/observability"
+	"github.com/docforge/api/internal/ocr"
+	"github.com/docforge/api/internal/ocrprofiles"
 	"github.com/docforge/api/internal/memberships"
 	"github.com/docforge/api/internal/onlyoffice"
 	"github.com/docforge/api/internal/orggate"
@@ -166,6 +172,66 @@ func main() {
 	cp := compliance.New(pool)
 	vt := vault.New(pool)
 
+	// AI seam — off by default. Turning on requires the operator to
+	// set AI_ENABLED=1 (and pick a provider). When off, NewFromEnv
+	// returns a Disabled client whose every method returns
+	// ErrDisabled, and the public /v1/ai/config endpoint reports
+	// `enabled:false` so the frontend hides AI affordances.
+	aiClient := ai.NewFromEnv()
+	logger.Info("ai", "enabled", aiClient.Enabled(), "provider", aiClient.Provider())
+	aiH := ai.NewHandler(aiClient)
+
+	// Tell the files handler to enqueue TaskEmbedFile from Complete()
+	// only when AI is on AND the active provider supports embeddings.
+	// Anthropic-only deployments keep search disabled (no Embed API);
+	// Ollama/vLLM enable it. The flag is read at boot and not mutable
+	// at runtime — flipping AI on/off requires a restart, same as
+	// every other env-driven config in this app.
+	f.AIEmbedEnabled = aiClient.Enabled() && aiClient.Capabilities().Embed
+	// Auto-tag uses Chat (not Embed) so it can light up even on chat-
+	// only providers — the file handler enqueues TaskAutoTagFile from
+	// Complete() when this flag is on.
+	f.AIAutoTagEnabled = aiClient.Enabled() && aiClient.Capabilities().Chat
+
+	// Smart-search HTTP surface. Constructed unconditionally so the
+	// route mount stays in one place; the handler self-503s when AI is
+	// off so a request never reaches the embedder in disabled mode.
+	// Sharing the same Embedder instance with the worker (via the AI
+	// client) keeps query-side and index-side embeddings model-aligned.
+	embedder := embeddings.New(pool, store, aiClient, logger)
+	asH := aisearch.New(pool, embedder, aiClient)
+	// "Summarize / Ask in document preview" — same off-by-default
+	// contract as aisearch (handler self-503s when AI is off / chat
+	// capability is missing). Lives in its own package so the AI
+	// dependency stays out of the everyday files handler.
+	//
+	// OCR is layered on via WithOCR. When OCR_ENABLED is unset the call
+	// is a no-op so the docchat handler still 415s on scanned PDFs and
+	// images — exactly the behaviour pre-OCR. We probe the binaries on
+	// startup and log a clear warning if they're missing so an operator
+	// who flips the flag without installing tesseract+pdftoppm sees the
+	// problem immediately rather than per-request.
+	ocrCfg := ocr.FromEnv()
+	if ocrCfg.Enabled {
+		if err := ocrCfg.Probe(); err != nil {
+			logger.Warn("ocr.probe_failed",
+				"error", err.Error(),
+				"hint", "install tesseract-ocr and poppler-utils, or unset OCR_ENABLED")
+		} else {
+			logger.Info("ocr.enabled",
+				"lang", ocrCfg.Lang, "max_pages", ocrCfg.MaxPages, "dpi", ocrCfg.DPI)
+		}
+	}
+	// OCR profile registry + CRUD. The handler owns the DBRegistry
+	// instance; we reuse it on docchat so /extract-text reads from
+	// the same DB-backed source the picker writes to. Built-ins live
+	// alongside org-authored profiles in the `ocr_profiles` table
+	// (migration 047); the package falls back to a hardcoded static
+	// set when the DB is empty (fresh dev box pre-migration).
+	opH := ocrprofiles.NewHandler(pool)
+	dcH := docchat.New(pool, store, aiClient, logger).WithOCR(ocrCfg)
+	dcH.Profiles = opH.Registry
+
 	// Super-admin user management (Phase 1 — list, lock, MFA reset,
 	// session revoke). Routes are protected by the requireSuperAdmin
 	// middleware below; the handler trusts that gate and only writes
@@ -255,6 +321,19 @@ func main() {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Recoverer)
+	// gzip / deflate response compression. JSON list endpoints (drive,
+	// audit, OCR profiles, embeddings search) ship multi-KB payloads
+	// that compress 5–10× on the wire; we leave the heavy binary
+	// surfaces (file downloads, inline preview, PDF export, image
+	// thumbnails, ZIP export) untouched because chi's default MIME
+	// allowlist already excludes application/pdf, image/*, and
+	// application/octet-stream — re-compressing already-compressed
+	// blobs only burns CPU. Level 5 is the standard "balanced" setting
+	// — level 9 saves a few percent for ~3× the CPU and isn't worth
+	// it on dynamically-rendered JSON. Mounted after Recoverer so a
+	// panic deeper in the chain still produces a clean 500 (rather
+	// than a half-flushed gzip stream).
+	r.Use(middleware.Compress(5))
 	// Global request budget. 30s was too tight for any endpoint that
 	// invokes Chromium (generate, batch, html preview): cold-start alone
 	// can eat 5–10s on dev machines, leaving too little headroom before
@@ -360,6 +439,24 @@ func main() {
 		mf.Mount(r)
 		ss.Mount(r)
 		cp.Mount(r)
+
+		// AI capability discovery. Single GET that drives both backend
+		// gating and frontend feature visibility — no second source of
+		// truth to drift from.
+		aiH.Mount(r)
+		// Smart-search lives behind the same auth middleware as every
+		// other authenticated endpoint; the handler itself enforces
+		// AI-on + Embed-capable and re-applies file visibility per
+		// caller, so admins and viewers see results scoped to what
+		// they could already access via /v1/files.
+		asH.Mount(r)
+		// Summarize / Ask in document preview. Mounted alongside the
+		// other AI surfaces; the handler enforces sharing.CanAccessFile
+		// + scanner gate per request, identical to /v1/files/{id}/download.
+		dcH.Mount(r)
+		// OCR profiles — small read-only list, used by the Extract
+		// Text picker on every designer/preview surface.
+		opH.Mount(r)
 
 		// Observability (admin-only inside the handler).
 		obs.Mount(r)

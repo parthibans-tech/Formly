@@ -47,6 +47,7 @@ import {
 } from "@/components/translations-dialog";
 import { FormLinksDialog } from "@/components/form-links-dialog";
 import { ApiGuideSheet } from "@/components/api-guide-trigger";
+import { DocAITools } from "@/components/doc-ai-tools";
 import { SendEmailDialog } from "@/components/send-email-dialog";
 import { CollabDrawer } from "@/components/collab-drawer";
 import { MessageSquare } from "lucide-react";
@@ -78,9 +79,17 @@ type Props = {
   // Viewer shares land here too — short-circuit every mutation path
   // instead of letting the user edit locally and then 403 on save.
   readOnly?: boolean;
+  // Source file ID; renders Extract text + Summarize / Ask in the
+  // header when present so the user can pull OCR'd text out of the
+  // original asset while drafting markdown around it.
+  fileId?: string;
 };
 
-export default function MarkdownDesigner({ tpl: initialTpl, readOnly = false }: Props) {
+export default function MarkdownDesigner({
+  tpl: initialTpl,
+  readOnly = false,
+  fileId,
+}: Props) {
   const toast = useToast();
   const [tpl, setTpl] = useState(initialTpl);
   const [source, setSource] = useState("");
@@ -429,6 +438,11 @@ export default function MarkdownDesigner({ tpl: initialTpl, readOnly = false }: 
             </div>
           </div>
           <div className="flex items-center gap-1.5">
+            {/* Read text / ask the source asset — useful when authoring
+                markdown alongside a scanned PDF or image upload. */}
+            {fileId ? (
+              <DocAITools fileId={fileId} fileName={tpl.name} />
+            ) : null}
             <Button variant="ghost" size="sm" asChild>
               <Link href={`/templates/${tpl.id}/versions`}>
                 <History className="h-4 w-4" />

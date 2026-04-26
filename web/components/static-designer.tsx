@@ -116,6 +116,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { InlineRenameTitle } from "@/components/designer/inline-rename-title";
 import { ApiGuideSheet } from "@/components/api-guide-trigger";
+import { DocAITools } from "@/components/doc-ai-tools";
 import { Label } from "@/components/ui/label";
 import { TYPOGRAPHY_PRESETS, FONT_FAMILIES } from "@/lib/font-presets";
 import {
@@ -168,6 +169,12 @@ type Props = {
   // hammer the server with 403s from local edits. Local state still
   // accepts changes (so users can poke around) — nothing persists.
   readOnly?: boolean;
+  // Source file ID. Threaded through from the page wrapper so the
+  // header can offer Extract text + Summarize / Ask against the
+  // underlying PDF/asset — same affordance Drive shows on preview.
+  // Optional because some legacy entry points (test fixtures) may
+  // mount the designer without a backing file row.
+  fileId?: string;
 };
 
 const PALETTE: { type: Widget["type"]; label: string; defaultW: number; defaultH: number; group?: string }[] = [
@@ -201,7 +208,12 @@ const GRID_PT = 6;
 // Autosave debounce after the last edit.
 const AUTOSAVE_MS = 1800;
 
-export default function StaticDesigner({ tpl, previewUrl, readOnly = false }: Props) {
+export default function StaticDesigner({
+  tpl,
+  previewUrl,
+  readOnly = false,
+  fileId,
+}: Props) {
   const toast = useToast();
   // Hydrate persisted locked/hidden flags out of `props.*` so they survive
   // reload (see save() for the mirror side of this tunneling).
@@ -1668,6 +1680,13 @@ export default function StaticDesigner({ tpl, previewUrl, readOnly = false }: Pr
           >
             Generate
           </button>
+          {/* Extract text + Summarize / Ask. Both open a right-side
+              drawer so the designer canvas stays visible behind them
+              — useful when the user wants to copy a value out of the
+              source PDF and paste it into a widget property. */}
+          {fileId ? (
+            <DocAITools fileId={fileId} fileName={tpl.name} />
+          ) : null}
           {/* API integration guide — drawer with endpoint, payload, and
               runnable snippets derived from this template's schema. */}
           <ApiGuideSheet templateId={tpl.id} templateName={tpl.name} />

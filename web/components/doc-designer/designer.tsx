@@ -58,6 +58,7 @@ import {
 } from "@/lib/doc/ast";
 import { renderDoc, wrapInDocument } from "@/lib/doc/render";
 import { InlineRenameTitle } from "@/components/designer/inline-rename-title";
+import { DocAITools } from "@/components/doc-ai-tools";
 import { DocEditor, type FieldRequest } from "./editor";
 import { DocToolbar } from "./toolbar";
 import { SchemaPanel } from "./schema-panel";
@@ -72,6 +73,10 @@ export interface DocDesignerTemplate {
   name: string;
   mode: string;
   version: number;
+  // The underlying file row's ID. Optional — doc-mode templates can
+  // be authored from scratch without a backing file — but when set it
+  // unlocks the OCR + AI affordances in the header.
+  fileId?: string;
   config: {
     placeholders?: string[];
     sampleData?: Record<string, unknown>;
@@ -81,13 +86,21 @@ export interface DocDesignerTemplate {
 
 export interface DocDesignerProps {
   tpl: DocDesignerTemplate;
+  // Source file ID. When present, the header offers Extract text +
+  // Summarize / Ask drawers against the underlying upload. Optional
+  // because some doc-mode templates are authored from scratch
+  // without a backing source file.
+  fileId?: string;
 }
 
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 
-export default function DocDesigner({ tpl: initialTpl }: DocDesignerProps) {
+export default function DocDesigner({
+  tpl: initialTpl,
+  fileId,
+}: DocDesignerProps) {
   const toast = useToast();
   const [tpl, setTpl] = useState(initialTpl);
   const [doc, setDoc] = useState<Doc>(emptyDoc());
@@ -261,6 +274,9 @@ export default function DocDesigner({ tpl: initialTpl }: DocDesignerProps) {
             {rendered.diagnostics.length === 1 ? "" : "s"}
           </Badge>
         ) : null}
+        {/* OCR + AI for the source upload — opens right-side drawers
+            so the doc editor stays readable behind them. */}
+        {fileId ? <DocAITools fileId={fileId} fileName={tpl.name} /> : null}
         <Button
           variant="ghost"
           size="sm"

@@ -10,9 +10,13 @@ import {
   Move,
   PencilLine,
   Share2,
+  Sparkles,
   Star,
   Trash2,
+  Undo2,
+  X,
 } from "lucide-react";
+import { useIsAIFeatureOn } from "@/components/ai-feature";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -51,6 +55,13 @@ export type GridFile = {
   previewPdfId?: string | null;
   convertStatus?: "pending" | "ready" | "failed" | "unsupported" | "macro_warning" | null;
   convertWarning?: string | null;
+  // Auto-tag pipeline (mirrors FileItem). Tags drive the chip strip
+  // shown above the footer; status drives the "tagging…" placeholder
+  // while AI is mid-flight.
+  tags?: string[];
+  autoTagStatus?: string | null;
+  autoRenameSuggestion?: string | null;
+  originalName?: string | null;
 };
 
 export type GridCardMenuItem = {
@@ -95,6 +106,12 @@ type Props = {
   bulkSelectActive?: boolean;
   // Whether this card is draggable (drive page) or not (trash/recent/etc.).
   draggable?: boolean;
+  // Auto-rename suggestion lifecycle. Same semantics as FileList:
+  // omitting these props hides the AI strip even when the file
+  // carries tags / suggestions, so non-drive views stay clean.
+  onAcceptRename?: () => void;
+  onDismissRename?: () => void;
+  onRevertRename?: () => void;
 };
 
 export function FileGridCard({
@@ -115,8 +132,12 @@ export function FileGridCard({
   showSelectCheckbox,
   bulkSelectActive = false,
   draggable = true,
+  onAcceptRename,
+  onDismissRename,
+  onRevertRename,
 }: Props) {
   const kind = categorizeFile(file.mime, file.name);
+  const autoTagOn = useIsAIFeatureOn("autoTag");
   const canOpenDetails =
     clickOpensDetails ?? (typeof onOpenDetails === "function");
   const canToggleSelect =
@@ -323,6 +344,18 @@ export function FileGridCard({
         )}
       </div>
 
+      {/* AI strip: tags / rename suggestion. Sits between thumbnail
+          and footer so a busy strip can wrap onto multiple lines
+          without crowding the actor avatar. Hidden entirely when AI
+          is off or the file has no AI metadata. */}
+      {autoTagOn && (
+        <AIGridStrip
+          file={file}
+          onAcceptRename={onAcceptRename}
+          onDismissRename={onDismissRename}
+          onRevertRename={onRevertRename}
+        />
+      )}
       {/* Footer: actor + activity */}
       <div className="flex items-center gap-2 border-t px-3 py-2">
         <Avatar className="h-5 w-5">
@@ -340,6 +373,99 @@ export function FileGridCard({
         )}
         <ConvertChip file={file} />
       </div>
+    </div>
+  );
+}
+
+// AIGridStrip — grid-card analogue of FileList's AIMetaStrip. Same
+// data + same callback contract, restyled for the cramped grid card
+// (smaller chips, fewer visible tags before the "+N" overflow).
+function AIGridStrip({
+  file,
+  onAcceptRename,
+  onDismissRename,
+  onRevertRename,
+}: {
+  file: GridFile;
+  onAcceptRename?: () => void;
+  onDismissRename?: () => void;
+  onRevertRename?: () => void;
+}) {
+  const tagging =
+    file.autoTagStatus === "pending" || file.autoTagStatus === "running";
+  const tags = file.tags ?? [];
+  const hasSuggestion = !!file.autoRenameSuggestion && !!onAcceptRename;
+  const hasRename = !!file.originalName && !!onRevertRename;
+  if (!tagging && tags.length === 0 && !hasSuggestion && !hasRename) {
+    return null;
+  }
+  return (
+    <div className="flex flex-wrap items-center gap-1 border-t px-3 py-1.5">
+      {tagging && (
+        <Badge variant="secondary" className="text-[9px]">
+          <Sparkles className="mr-0.5 h-2.5 w-2.5" />
+          Tagging…
+        </Badge>
+      )}
+      {tags.slice(0, 3).map((t) => (
+        <Badge
+          key={t}
+          variant="secondary"
+          className="text-[9px] font-normal text-muted-foreground"
+          title={t}
+        >
+          {t}
+        </Badge>
+      ))}
+      {tags.length > 3 && (
+        <span className="text-[9px] text-muted-foreground">
+          +{tags.length - 3}
+        </span>
+      )}
+      {hasSuggestion && (
+        <span
+          className="ml-auto inline-flex items-center gap-1 rounded-md border border-sky-200 bg-sky-50 px-1.5 py-0.5 text-[9px] text-sky-800 dark:border-sky-900 dark:bg-sky-950 dark:text-sky-200"
+          title={`AI suggests renaming to "${file.autoRenameSuggestion}"`}
+        >
+          <Sparkles className="h-2.5 w-2.5" />
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onAcceptRename!();
+            }}
+            className="rounded font-medium hover:underline"
+            aria-label="Accept rename suggestion"
+          >
+            Rename
+          </button>
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onDismissRename?.();
+            }}
+            className="rounded p-0.5 hover:bg-sky-100 dark:hover:bg-sky-900"
+            aria-label="Dismiss rename suggestion"
+          >
+            <X className="h-2.5 w-2.5" />
+          </button>
+        </span>
+      )}
+      {hasRename && !hasSuggestion && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onRevertRename!();
+          }}
+          className="ml-auto inline-flex items-center gap-1 text-[9px] text-muted-foreground hover:text-foreground"
+          title={`Renamed by AI from "${file.originalName}". Click to undo.`}
+        >
+          <Undo2 className="h-2.5 w-2.5" />
+          Renamed by AI
+        </button>
+      )}
     </div>
   );
 }

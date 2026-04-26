@@ -2,7 +2,17 @@
 
 import Link from "next/link";
 import { useMemo } from "react";
-import { MoreHorizontal, PencilLine, Download, RotateCcw, Star, Trash2 } from "lucide-react";
+import {
+  MoreHorizontal,
+  PencilLine,
+  Download,
+  RotateCcw,
+  Sparkles,
+  Star,
+  Trash2,
+  Undo2,
+  X,
+} from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -14,6 +24,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { iconForMime, colorForMime } from "@/lib/file-icons";
 import { cn } from "@/lib/utils";
+import { useIsAIFeatureOn } from "@/components/ai-feature";
 import {
   FileGridCard,
   type GridCardMenuItem,
@@ -38,6 +49,24 @@ export type FileItem = {
   previewPdfId?: string | null;
   convertStatus?: "pending" | "ready" | "failed" | "unsupported" | "macro_warning" | null;
   convertWarning?: string | null;
+  // Auto-tag pipeline. `tags` is the authoritative current tag list
+  // (manual edits + LLM output, post-normalisation). Empty array =
+  // untagged, undefined = backend handler doesn't expose tags yet
+  // (treat as empty for rendering).
+  tags?: string[];
+  // 'pending' | 'running' | 'ready' | 'failed' — only present when AI
+  // is on. UI uses 'pending'/'running' to show a "tagging…" pill so
+  // users don't think the file is just unlabeled.
+  autoTagStatus?: string | null;
+  // Non-null when the model proposed a better filename and the
+  // upload-time name didn't look generic enough to auto-apply.
+  // Renders an inline "Rename to: …" affordance the user accepts or
+  // dismisses; clears either way.
+  autoRenameSuggestion?: string | null;
+  // Captured ONLY when the auto-rename was actually applied. Powers
+  // the "revert rename" undo action — null when no rename happened or
+  // the user already reverted.
+  originalName?: string | null;
 };
 
 type RowAction = {
@@ -83,6 +112,18 @@ type Props = {
    * (flip `file.starred` locally, issue POST/DELETE, roll back on error).
    */
   onToggleStar?: (file: FileItem) => void;
+  /**
+   * Auto-rename suggestion lifecycle. When provided, files with a
+   * non-empty `autoRenameSuggestion` render an inline banner under
+   * the filename with Accept / Dismiss buttons; files with an
+   * `originalName` (i.e. an auto-rename was applied) render a
+   * subtle "revert" affordance. Parent owns the PATCH calls and the
+   * optimistic local-state mutation. Omitting these props hides the
+   * UI entirely — keeps non-drive views (trash/recent/shared) clean.
+   */
+  onAcceptRename?: (file: FileItem) => void;
+  onDismissRename?: (file: FileItem) => void;
+  onRevertRename?: (file: FileItem) => void;
 };
 
 export function FileList({
@@ -95,7 +136,14 @@ export function FileList({
   actorLabel = "Modified",
   selection,
   onToggleStar,
+  onAcceptRename,
+  onDismissRename,
+  onRevertRename,
 }: Props) {
+  // Single subscription to AIFeature(autoTag) for the whole list — the
+  // hook is cheap (module-level cache) but a per-row call would still
+  // generate a hundred identical reads.
+  const autoTagOn = useIsAIFeatureOn("autoTag");
   const filtered = useMemo(() => {
     const q = filter?.trim().toLowerCase();
     if (!q) return files;
@@ -160,6 +208,15 @@ export function FileList({
               bulkSelectActive={bulkSelectActive}
               onToggleStar={
                 onToggleStar ? () => onToggleStar(file) : undefined
+              }
+              onAcceptRename={
+                onAcceptRename ? () => onAcceptRename(file) : undefined
+              }
+              onDismissRename={
+                onDismissRename ? () => onDismissRename(file) : undefined
+              }
+              onRevertRename={
+                onRevertRename ? () => onRevertRename(file) : undefined
               }
             />
           );
@@ -291,6 +348,14 @@ export function FileList({
                         </Badge>
                       )}
                       <ConvertChip file={file} />
+                      {autoTagOn && (
+                        <AIFileMetaStrip
+                          file={file}
+                          onAcceptRename={onAcceptRename}
+                          onDismissRename={onDismissRename}
+                          onRevertRename={onRevertRename}
+                        />
+                      )}
                     </div>
                   </div>
                 </td>
@@ -342,6 +407,121 @@ export function FileList({
           })}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+// AIFileMetaStrip renders the auto-tag chips + rename suggestion banner
+// below the filename in list view. Kept inline (not its own file)
+// because every interactive bit needs the row's enclosing FileItem to
+// dispatch back through the parent's onAccept/Dismiss/Revert
+// callbacks. Hidden entirely when AI is off (the parent gates with
+// `autoTagOn` before mounting this).
+//
+// Visual hierarchy:
+//   - "Tagging…" chip while autoTagStatus ∈ pending/running.
+//   - Tag pills (subtle, comma-density) once tags exist.
+//   - Rename-suggestion banner (info-coloured) when
+//     autoRenameSuggestion is set — the loud one because it expects
+//     a click. Accept/Dismiss buttons inline.
+//   - "Renamed by AI · Undo" affordance when originalName is set
+//     (i.e. an auto-rename was applied) — quiet, since it's a
+//     historical state not asking for action.
+// Generic over the row type so callers using a local FileItem
+// (drive/page.tsx defines its own with `status: string` required)
+// don't get a variance error when their handler receives the row
+// back. T must structurally satisfy FileItem — every consumer's row
+// already does because the AI fields are all optional.
+export function AIFileMetaStrip<T extends FileItem>({
+  file,
+  onAcceptRename,
+  onDismissRename,
+  onRevertRename,
+}: {
+  file: T;
+  onAcceptRename?: (f: T) => void;
+  onDismissRename?: (f: T) => void;
+  onRevertRename?: (f: T) => void;
+}) {
+  const tagging =
+    file.autoTagStatus === "pending" || file.autoTagStatus === "running";
+  const tags = file.tags ?? [];
+  const hasSuggestion = !!file.autoRenameSuggestion && !!onAcceptRename;
+  const hasRename = !!file.originalName && !!onRevertRename;
+  if (!tagging && tags.length === 0 && !hasSuggestion && !hasRename) {
+    return null;
+  }
+  return (
+    <div className="mt-1 flex flex-wrap items-center gap-1.5">
+      {tagging && (
+        <Badge variant="secondary" className="text-[10px]">
+          <Sparkles className="mr-1 h-2.5 w-2.5" />
+          Tagging…
+        </Badge>
+      )}
+      {tags.slice(0, 6).map((t) => (
+        <Badge
+          key={t}
+          variant="secondary"
+          className="text-[10px] font-normal text-muted-foreground"
+          title={t}
+        >
+          {t}
+        </Badge>
+      ))}
+      {tags.length > 6 && (
+        <span className="text-[10px] text-muted-foreground">
+          +{tags.length - 6}
+        </span>
+      )}
+      {hasSuggestion && (
+        <span
+          className="ml-1 inline-flex items-center gap-1 rounded-md border border-sky-200 bg-sky-50 px-1.5 py-0.5 text-[10px] text-sky-800 dark:border-sky-900 dark:bg-sky-950 dark:text-sky-200"
+          title={`AI suggests renaming to "${file.autoRenameSuggestion}"`}
+        >
+          <Sparkles className="h-2.5 w-2.5" />
+          Rename to{" "}
+          <span className="max-w-[14rem] truncate font-medium">
+            {file.autoRenameSuggestion}
+          </span>
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onAcceptRename!(file);
+            }}
+            className="ml-1 rounded px-1 py-px text-[10px] font-medium text-sky-700 hover:bg-sky-100 dark:text-sky-200 dark:hover:bg-sky-900"
+            aria-label="Accept rename suggestion"
+          >
+            Accept
+          </button>
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onDismissRename?.(file);
+            }}
+            className="rounded p-0.5 text-sky-700 hover:bg-sky-100 dark:text-sky-200 dark:hover:bg-sky-900"
+            aria-label="Dismiss rename suggestion"
+          >
+            <X className="h-2.5 w-2.5" />
+          </button>
+        </span>
+      )}
+      {hasRename && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onRevertRename!(file);
+          }}
+          className="inline-flex items-center gap-1 rounded text-[10px] text-muted-foreground hover:text-foreground"
+          title={`Renamed by AI from "${file.originalName}". Click to undo.`}
+        >
+          <Undo2 className="h-2.5 w-2.5" />
+          Renamed by AI
+        </button>
+      )}
     </div>
   );
 }

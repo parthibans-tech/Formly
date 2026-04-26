@@ -38,6 +38,26 @@ const (
 	// stamps the verdict back on the files row, and updates the
 	// scan_jobs audit row. See internal/scanner + cmd/worker.
 	TaskScanFile = "scan:file"
+	// AI smart-search embedding. Enqueued from files.Complete after a
+	// successful upload when AI is enabled and the active provider
+	// reports Embed capability. Worker:
+	//   1. Marks files.embed_status='running'.
+	//   2. Fetches blob bytes (text-extracted if necessary).
+	//   3. Splits content into ~512-token chunks and asks the AI client
+	//      to embed each one.
+	//   4. INSERTs file_chunks rows (one per chunk).
+	//   5. Marks files.embed_status='ready' (or 'failed' / 'skipped').
+	// See internal/embeddings + migration 045.
+	TaskEmbedFile = "embed:file"
+	// AI auto-tag + auto-rename. Enqueued from files.Complete after a
+	// successful upload when AI is enabled and the active provider
+	// reports Chat capability. Worker asks the chat model for a small
+	// JSON payload describing the file (3-5 tags + a suggested
+	// filename), writes the tags to files.tags, stores the rename
+	// suggestion in files.auto_rename_suggestion, and only overrides
+	// files.name when the original looks generic (IMG_*, scan.pdf,
+	// untitled.txt, etc.). See internal/autotag + migration 046.
+	TaskAutoTagFile = "autotag:file"
 )
 
 // RedisAddr returns the Redis connection string (from env, default to localhost).
@@ -218,6 +238,67 @@ func NewScanFile(p ScanFilePayload) (*asynq.Task, error) {
 	// scan_jobs.last_error captures the reason and the gate stays
 	// fail-closed so a retry-storm doesn't matter for safety.
 	return asynq.NewTask(TaskScanFile, b, asynq.MaxRetry(3)), nil
+}
+
+// EmbedFilePayload is consumed by the worker registered for
+// TaskEmbedFile. Mirrors ScanFilePayload's shape for the same reason —
+// duplicating StorageKey + OrgID into the payload keeps the worker's
+// hot path one query lighter and lets us re-issue an embedding job
+// against an arbitrary file (e.g. after a model upgrade or OCR
+// backfill) without coordinating with a side table.
+//
+// MIME is included so the worker can short-circuit non-textual files
+// (mark embed_status='skipped') without fetching the blob first; for
+// formats that need OCR or office-conversion the worker delegates to
+// the same docconvert pipeline already used for PDF previews.
+type EmbedFilePayload struct {
+	JobID      string `json:"jobId"`
+	OrgID      string `json:"orgId"`
+	FileID     string `json:"fileId"`
+	StorageKey string `json:"storageKey"`
+	MIME       string `json:"mime,omitempty"`
+}
+
+func NewEmbedFile(p EmbedFilePayload) (*asynq.Task, error) {
+	b, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	// 2 retries — most failures are either Ollama being down (recovers
+	// fast) or the file being non-textual (won't recover at all, but
+	// the worker marks 'skipped' rather than erroring so retry doesn't
+	// matter). Genuine model-side errors are surfaced via embed_error
+	// and an operator can re-enqueue manually.
+	return asynq.NewTask(TaskEmbedFile, b, asynq.MaxRetry(2)), nil
+}
+
+// AutoTagFilePayload mirrors EmbedFilePayload — same shape, same
+// rationale (denormalising key + mime saves the worker a round trip).
+// Name is the user's uploaded filename; the worker reads it to decide
+// whether the auto-rename suggestion should be applied silently
+// (generic name) or only stored for the UI to surface (intentional
+// name). Without it, every rename would either always-overwrite or
+// never-overwrite and we'd lose the "smart enough to know not to
+// touch a deliberate filename" property.
+type AutoTagFilePayload struct {
+	JobID      string `json:"jobId"`
+	OrgID      string `json:"orgId"`
+	FileID     string `json:"fileId"`
+	StorageKey string `json:"storageKey"`
+	MIME       string `json:"mime,omitempty"`
+	Name       string `json:"name,omitempty"`
+}
+
+func NewAutoTagFile(p AutoTagFilePayload) (*asynq.Task, error) {
+	b, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	// 2 retries — same reasoning as TaskEmbedFile. Chat completions are
+	// the dominant cost so we don't want a model that returned bad JSON
+	// to retry forever; the orchestrator marks 'failed' on parse errors
+	// instead of bubbling, so retries only fire on transport hiccups.
+	return asynq.NewTask(TaskAutoTagFile, b, asynq.MaxRetry(2)), nil
 }
 
 func NewWebhookDeliver(p WebhookDeliverPayload) (*asynq.Task, error) {

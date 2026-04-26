@@ -1,6 +1,13 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    # pgvector/pgvector ships Postgres 16 with the `vector` extension
+    # preinstalled. Same wire-compat as postgres:16-alpine — existing
+    # migrations run unchanged. Required by migration 045 for the
+    # AI smart-search feature; can be swapped back to postgres:16-alpine
+    # in any deployment that disables AI (extension creation in 045
+    # is `IF NOT EXISTS` and only fires when AI is on, but the type
+    # `vector` won't be available at all without this image).
+    image: pgvector/pgvector:pg16
     environment:
       POSTGRES_USER: docforge
       POSTGRES_PASSWORD: docforge
@@ -74,9 +81,57 @@ services:
       - onlyoffice_log:/var/log/onlyoffice
       - onlyoffice_cache:/var/lib/onlyoffice/documentserver/App_Data/cache/files
 
+  # Ollama — local LLM runtime. Powers the AI feature seam in
+  # `api/internal/ai`. The Go API process runs on the host (not in
+  # this compose network), so we publish 11434 to the host and the
+  # API connects via http://localhost:11434 (default in
+  # api/internal/ai/ollama.go). Set AI_ENABLED=1 in api/.env to turn
+  # AI features on; leave it unset and the whole stack continues to
+  # run identically to before (the Disabled provider returns
+  # ErrDisabled for every call).
+  #
+  # Model defaults are chosen for "works on a developer laptop":
+  #   - llama3.1:8b           (chat, summarize, classify) — ~5GB
+  #   - nomic-embed-text       (embeddings for smart search) — ~280MB
+  # Override via AI_CHAT_MODEL / AI_EMBED_MODEL in api/.env when
+  # benchmarking other models.
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # No GPU passthrough by default — works on CPU, slow on big
+    # models, fine for `nomic-embed-text` and small chat models.
+    # Operators with NVIDIA GPUs should add `deploy.resources.reservations.devices`
+    # for nvidia/gpu; Apple Silicon users running Docker Desktop get
+    # CPU only (run Ollama natively on the host for Metal acceleration).
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  # One-shot init container — pulls the embedding + chat models once
+  # so the first inference call doesn't time out waiting on a multi-GB
+  # download. Idempotent: `ollama pull` is a no-op when the model is
+  # already present, so re-running `docker compose up` is safe.
+  ollama-init:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      OLLAMA_HOST=ollama:11434 ollama pull nomic-embed-text &&
+      OLLAMA_HOST=ollama:11434 ollama pull llama3.1:8b
+      "
+    restart: "no"
+
 volumes:
   pgdata:
   miniodata:
   onlyoffice_data:
   onlyoffice_log:
   onlyoffice_cache:
+  ollama_data:

@@ -6,7 +6,10 @@ import (
 	"os"
 	"time"
 
+	"github.com/docforge/api/internal/ai"
+	"github.com/docforge/api/internal/autotag"
 	"github.com/docforge/api/internal/db"
+	"github.com/docforge/api/internal/embeddings"
 	"github.com/docforge/api/internal/generate"
 	"github.com/docforge/api/internal/mergerecipes"
 	"github.com/docforge/api/internal/pdfmerge"
@@ -46,15 +49,36 @@ func main() {
 	// recipe rendered async produces byte-identical output to one
 	// rendered inline.
 	mr := mergerecipes.New(pool, store, runner, pm, nil)
+	// AI client — same off-by-default contract as the API process. When
+	// AI_ENABLED is unset we get a Disabled provider; the embed handler
+	// will gracefully no-op for any TaskEmbedFile that arrives (e.g.
+	// from a stale enqueue before AI was turned off).
+	aiClient := ai.NewFromEnv()
+	var emb *embeddings.Embedder
+	if aiClient.Enabled() && aiClient.Capabilities().Embed {
+		emb = embeddings.New(pool, store, aiClient, logger)
+	}
+	// Auto-tag piggy-backs on Chat (not Embed): some providers ship
+	// chat-only (Anthropic) and we still want auto-tag there even
+	// though Smart Search stays disabled. Constructed independently
+	// so each feature can light up on its own capability gate.
+	var tg *autotag.Tagger
+	if aiClient.Enabled() && aiClient.Capabilities().Chat {
+		tg = autotag.New(pool, store, aiClient, logger)
+	}
+
 	h := &worker.Handlers{
 		DB: pool, Storage: store, Runner: runner, Log: logger,
 		PDFMerge: pm, MergeRecipes: mr,
 		// Scanner selection is env-driven so dev/CI default to Noop
 		// without any config and prod attaches to ClamAV via
 		// CLAMAV_ADDR. See scanner.FromEnv for the precedence ladder.
-		Scanner: scanner.FromEnv(os.Getenv),
+		Scanner:  scanner.FromEnv(os.Getenv),
+		Embedder: emb,
+		Tagger:   tg,
 	}
 	logger.Info("scanner selected", "engine", h.Scanner.Name())
+	logger.Info("ai", "enabled", aiClient.Enabled(), "provider", aiClient.Provider())
 
 	srv := asynq.NewServer(queue.ClientOpt(), asynq.Config{
 		Concurrency: 4,

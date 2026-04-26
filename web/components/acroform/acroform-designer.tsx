@@ -97,6 +97,7 @@ import {
 import { DesignQAPanel, runAcroQA } from "./design-qa-panel";
 import { InlineRenameTitle } from "@/components/designer/inline-rename-title";
 import { ApiGuideSheet } from "@/components/api-guide-trigger";
+import { DocAITools } from "@/components/doc-ai-tools";
 import { validateAll } from "@/lib/acroform-validation";
 import {
   applyStructurePatches,
@@ -133,9 +134,19 @@ type Props = {
   // restriction explicit. Viewers can still click around (inspect
   // mappings, try Generate) but nothing they change here persists.
   readOnly?: boolean;
+  // Source PDF file ID. Threaded from the templates page so the
+  // designer's header can offer Extract text + Summarize / Ask
+  // against the underlying PDF — handy when mapping AcroForm fields
+  // to data keys whose names live inside the PDF's instructions.
+  fileId?: string;
 };
 
-export function AcroFormDesigner({ tpl, previewUrl, readOnly = false }: Props) {
+export function AcroFormDesigner({
+  tpl,
+  previewUrl,
+  readOnly = false,
+  fileId,
+}: Props) {
   const router = useRouter();
   const toast = useToast();
   const [mappings, setMappings] = useState<MappingMap>(
@@ -1192,6 +1203,15 @@ export function AcroFormDesigner({ tpl, previewUrl, readOnly = false }: Props) {
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
+
+            {/* OCR + AI for the source PDF — drawer-style so the
+                designer's PDF preview / field overlay stays in view
+                behind them. Useful when mapping fields whose intended
+                data keys are described in body text rather than
+                AcroForm metadata. */}
+            {fileId ? (
+              <DocAITools fileId={fileId} fileName={tpl.name} />
+            ) : null}
 
             {/* API integration guide — drawer with endpoint, payload, and
                 runnable snippets derived live from this template's schema. */}

@@ -129,11 +129,14 @@ import type { Starter } from "@/lib/starters";
 import { getStarterDoc } from "@/lib/starters";
 import { iconForMime } from "@/lib/file-icons";
 import { FileGridCard, type GridCardMenuItem } from "@/components/file-grid-card";
+import { AIFileMetaStrip } from "@/components/file-list";
+import { useIsAIFeatureOn } from "@/components/ai-feature";
 import { FolderGridCard } from "@/components/folder-grid-card";
 import { ShareModal } from "@/components/share-modal";
 import { SharePeopleModal } from "@/components/share-people-modal";
 import { FilePreviewDialog } from "@/components/file-preview-dialog";
 import { MediaPreviewDialog } from "@/components/media-preview-dialog";
+import { ImagePreviewDialog } from "@/components/image-preview-dialog";
 import { ViewToggle } from "@/components/view-toggle";
 import { useViewMode } from "@/hooks/use-view-mode";
 import { cn } from "@/lib/utils";
@@ -161,6 +164,13 @@ type FileItem = {
     | "macro_warning"
     | null;
   convertWarning?: string | null;
+  // Auto-tag pipeline. See FileItem in @/components/file-list for the
+  // full contract; mirrored here because the drive page declares its
+  // own local type that the bespoke list-view markup binds to.
+  tags?: string[];
+  autoTagStatus?: string | null;
+  autoRenameSuggestion?: string | null;
+  originalName?: string | null;
 };
 
 type Folder = {
@@ -197,6 +207,11 @@ export default function DrivePage() {
 
   const [user, setUser] = useState<any>(null);
   const [files, setFiles] = useState<FileItem[]>([]);
+  // Module-cached AI gate. We render the meta strip only when AI is on
+  // AND the autoTag feature flag is set; everything else (state, list
+  // markup) stays the same shape so flipping AI off mid-session
+  // simply hides the strip without remounting rows.
+  const autoTagOn = useIsAIFeatureOn("autoTag");
   const [folders, setFolders] = useState<Folder[]>([]);
   const [breadcrumbs, setBreadcrumbs] = useState<Folder[]>([]);
   const [loading, setLoading] = useState(true);
@@ -219,6 +234,16 @@ export default function DrivePage() {
   // (which is PDF-only and routes through the heavy react-pdf shell)
   // so we don't pay the pdf.js worker cost for a media click.
   const [mediaPreviewFor, setMediaPreviewFor] = useState<FileItem | null>(
+    null,
+  );
+  // In-app image preview target. Distinct from `previewFor` /
+  // `mediaPreviewFor` because the image dialog mounts the AI
+  // Summarize / Ask panel (gated by AIFeature) — phone photos of
+  // PAN / Aadhaar / receipts are the canonical "OCR this for me"
+  // upload, and we want the click → button → endpoint chain wired
+  // for them. SVGs are excluded by the click-router below since the
+  // OCR backend can't read vector graphics anyway.
+  const [imagePreviewFor, setImagePreviewFor] = useState<FileItem | null>(
     null,
   );
   // People/group ACL dialog target. Files and folders both flow through
@@ -510,6 +535,88 @@ export default function DrivePage() {
         xs.map((x) => (x.id === file.id ? { ...x, starred: !next } : x))
       );
       toast.show("error", "Couldn't update star", { description: e.message });
+    }
+  }
+
+  // ---- Auto-rename suggestion lifecycle ----
+  //
+  // All three handlers do an optimistic local mutation first so the
+  // suggestion banner / "Renamed by AI" affordance disappears
+  // immediately, then issue the PATCH. On failure we restore the
+  // pre-click snapshot so the UI doesn't lie about server state.
+  // We don't `await load()` because the local mutation already
+  // captures the new shape — a refetch would just flash the row.
+  async function acceptRename(file: FileItem) {
+    if (!file.autoRenameSuggestion) return;
+    const prev = file;
+    const newName = file.autoRenameSuggestion;
+    setFiles((xs) =>
+      xs.map((x) =>
+        x.id === file.id
+          ? {
+              ...x,
+              name: newName,
+              originalName: x.originalName ?? x.name,
+              autoRenameSuggestion: null,
+            }
+          : x
+      )
+    );
+    try {
+      await api(`/v1/files/${file.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ acceptRenameSuggestion: true }),
+      });
+      toast.show("success", "Renamed", { description: newName });
+    } catch (e: any) {
+      setFiles((xs) => xs.map((x) => (x.id === file.id ? prev : x)));
+      toast.show("error", "Couldn't rename", { description: e.message });
+    }
+  }
+
+  async function dismissRename(file: FileItem) {
+    if (!file.autoRenameSuggestion) return;
+    const prev = file;
+    setFiles((xs) =>
+      xs.map((x) =>
+        x.id === file.id ? { ...x, autoRenameSuggestion: null } : x
+      )
+    );
+    try {
+      await api(`/v1/files/${file.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ dismissRenameSuggestion: true }),
+      });
+    } catch (e: any) {
+      setFiles((xs) => xs.map((x) => (x.id === file.id ? prev : x)));
+      toast.show("error", "Couldn't dismiss suggestion", {
+        description: e.message,
+      });
+    }
+  }
+
+  async function revertRename(file: FileItem) {
+    if (!file.originalName) return;
+    const prev = file;
+    const restored = file.originalName;
+    setFiles((xs) =>
+      xs.map((x) =>
+        x.id === file.id
+          ? { ...x, name: restored, originalName: null }
+          : x
+      )
+    );
+    try {
+      await api(`/v1/files/${file.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ revertRename: true }),
+      });
+      toast.show("success", "Restored original name", {
+        description: restored,
+      });
+    } catch (e: any) {
+      setFiles((xs) => xs.map((x) => (x.id === file.id ? prev : x)));
+      toast.show("error", "Couldn't restore name", { description: e.message });
     }
   }
 
@@ -2130,7 +2237,28 @@ export default function DrivePage() {
                           openInCodeEditor(file, (href) => router.push(href));
                           return;
                         }
-                        // PDF / image / markdown / html / native templates
+                        // Raster images → in-app image preview with
+                        // optional AI Summarize / Ask (OCR fallback).
+                        // Routed BEFORE canOpenInDesigner because
+                        // designerEligible() includes raster images
+                        // (you can build a form template over a photo)
+                        // and would otherwise shadow this branch. The
+                        // designer remains available via the right-click
+                        // action menu — gated on !templateId so a file
+                        // the user has already turned into a template
+                        // still opens the designer on click.
+                        // SVG is intentionally excluded — vector markup
+                        // has no pixels to OCR; falling through avoids
+                        // showing an AI panel that can only ever fail.
+                        if (
+                          !file.templateId &&
+                          file.mime.startsWith("image/") &&
+                          !file.mime.includes("svg")
+                        ) {
+                          setImagePreviewFor(file);
+                          return;
+                        }
+                        // PDF / markdown / html / native templates
                         // route to the form/static designer.
                         if (canOpenInDesigner(file)) {
                           await openInDesigner(file);
@@ -2218,6 +2346,14 @@ export default function DrivePage() {
                             <div className="mt-0.5 text-[10px] text-muted-foreground md:hidden">
                               {prettyMime(file.mime)} · {fmtSize(file.size)}
                             </div>
+                            {autoTagOn && (
+                              <AIFileMetaStrip
+                                file={file}
+                                onAcceptRename={acceptRename}
+                                onDismissRename={dismissRename}
+                                onRevertRename={revertRename}
+                              />
+                            )}
                           </div>
                         </div>
                       </td>
@@ -2472,6 +2608,9 @@ export default function DrivePage() {
                         bulkSelectActive={totalSelected > 0}
                         onToggleSelect={() => toggleSelect(file.id)}
                         onToggleStar={() => toggleStar(file)}
+                        onAcceptRename={() => acceptRename(file)}
+                        onDismissRename={() => dismissRename(file)}
+                        onRevertRename={() => revertRename(file)}
                         // Clicking a template card opens the designer;
                         // clicking a regular file card used to trigger a
                         // silent download, which was surprising and
@@ -2552,6 +2691,25 @@ export default function DrivePage() {
                             label: mediaKindFor(file.mime) === "video" ? "Play video" : "Play audio",
                             icon: <Eye className="h-4 w-4" />,
                             onClick: () => setMediaPreviewFor(file),
+                          } : null,
+                          // Image preview menu entry — only for raster
+                          // images and only when there's no template
+                          // path (templated images route to the
+                          // designer instead). Same SVG carve-out as
+                          // the row click router: vector graphics
+                          // can't be OCR'd so the AI panel would only
+                          // ever fail there.
+                          !file.templateId &&
+                          file.mime.startsWith("image/") &&
+                          !file.mime.includes("svg") ? {
+                            // "Preview & read text" advertises the OCR
+                            // entry point in the menu itself — without
+                            // it, users hunting for an "OCR" or "extract
+                            // text" affordance don't realize the Preview
+                            // dialog is where it lives.
+                            label: "Preview & read text",
+                            icon: <Eye className="h-4 w-4" />,
+                            onClick: () => setImagePreviewFor(file),
                           } : null,
                           { label: "Download", icon: <Download className="h-4 w-4" />, onClick: () => download(file.id) },
                           canExportPDF(file) ? {
@@ -2688,6 +2846,22 @@ export default function DrivePage() {
           onShare={() => {
             setShareFor(mediaPreviewFor);
             setMediaPreviewFor(null);
+          }}
+        />
+      )}
+
+      {/* Image preview with AI panel. Independent state from the
+          other previews for the same reason — closing this shouldn't
+          knock out an unrelated dialog underneath. */}
+      {imagePreviewFor && (
+        <ImagePreviewDialog
+          fileId={imagePreviewFor.id}
+          fileName={imagePreviewFor.name}
+          open={!!imagePreviewFor}
+          onOpenChange={(o) => !o && setImagePreviewFor(null)}
+          onShare={() => {
+            setShareFor(imagePreviewFor);
+            setImagePreviewFor(null);
           }}
         />
       )}
