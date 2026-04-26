@@ -62,6 +62,10 @@ import {
   type UploadConflict,
 } from "@/components/upload-conflict-dialog";
 import { UploadDropzone } from "@/components/upload-dropzone";
+import {
+  DownloadProgressCard,
+  type DownloadProgressState,
+} from "@/components/download-progress-card";
 import { CameraCaptureDialog } from "@/components/camera-capture-dialog";
 import { MergeFilesDialog } from "@/components/merge-files-dialog";
 import { InsertPagesDialog } from "@/components/insert-pages-dialog";
@@ -242,6 +246,25 @@ export default function DrivePage() {
     "all" | "templates" | "pdf" | "html" | "markdown" | "image" | "other"
   >("all");
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  // Folder multi-select. Distinct from `selected` (files) so the bulk
+  // toolbar can show a combined "N selected" count and the
+  // bulk-download payload can carry both `ids` and `folderIds`. We
+  // keep them in two sets — rather than one tagged set — because the
+  // overwhelming majority of code paths only care about files (e.g.
+  // type-filter chips, merge-to-PDF) and a tagged set would force
+  // every consumer to filter by kind.
+  const [selectedFolders, setSelectedFolders] = useState<Set<string>>(
+    new Set(),
+  );
+  // Download progress state — drives the sticky bottom-right card. We
+  // use a single state object (rather than four separate setters) so
+  // each `tick()` is one cheap object swap. The AbortController lives
+  // in a ref because cancelling shouldn't trigger a re-render — it's
+  // a side-effect on the in-flight fetch, which then unwinds through
+  // the catch block and updates state once.
+  const [downloadState, setDownloadState] =
+    useState<DownloadProgressState | null>(null);
+  const downloadAbortRef = useRef<AbortController | null>(null);
   // PDF merge / insert dialog state. mergeOpen drives the multi-file
   // stitch flow (bulk toolbar entry); insertFor drives the single-PDF
   // splice flow (row-action entry on PDF rows). Mutually exclusive in
@@ -841,9 +864,20 @@ export default function DrivePage() {
     return { folders: f, files: files2 };
   }, [search, folders, files, typeFilter, sortBy, sortDir]);
 
+  // "All selected" = every visible file AND every visible folder is in
+  // their respective sets. The toolbar's master checkbox toggles both
+  // halves at once so the keyboard / click affordance matches what
+  // users expect from a Drive-style grid.
   const allSelected =
-    filtered.files.length > 0 &&
-    filtered.files.every((f) => selected.has(f.id));
+    filtered.files.length + filtered.folders.length > 0 &&
+    filtered.files.every((f) => selected.has(f.id)) &&
+    filtered.folders.every((f) => selectedFolders.has(f.id));
+
+  // Combined count drives the bulk toolbar visibility and label. Two
+  // separate sets stay clean for the consumers that only care about
+  // files (merge-to-PDF, type filters); this derived value is the
+  // single thing the toolbar itself needs.
+  const totalSelected = selected.size + selectedFolders.size;
 
   function toggleSelect(id: string) {
     setSelected((prev) => {
@@ -853,34 +887,60 @@ export default function DrivePage() {
       return next;
     });
   }
+  function toggleFolderSelect(id: string) {
+    setSelectedFolders((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
   function toggleSelectAll() {
+    if (allSelected) {
+      setSelected(new Set());
+      setSelectedFolders(new Set());
+      return;
+    }
     setSelected((prev) => {
-      if (allSelected) return new Set();
       const next = new Set(prev);
       filtered.files.forEach((f) => next.add(f.id));
+      return next;
+    });
+    setSelectedFolders((prev) => {
+      const next = new Set(prev);
+      filtered.folders.forEach((f) => next.add(f.id));
       return next;
     });
   }
   function clearSelection() {
     setSelected(new Set());
+    setSelectedFolders(new Set());
   }
 
   async function bulkTrash() {
-    if (selected.size === 0) return;
+    const total = selected.size + selectedFolders.size;
+    if (total === 0) return;
     const ok = await confirm({
-      title: `Move ${selected.size} item${selected.size === 1 ? "" : "s"} to trash?`,
+      title: `Move ${total} item${total === 1 ? "" : "s"} to trash?`,
       description: "You can restore them later from the trash view.",
       confirmLabel: "Move to trash",
       destructive: true,
     });
     if (!ok) return;
     try {
-      await Promise.all(
-        Array.from(selected).map((id) =>
+      // Files and folders use distinct DELETE endpoints. Fire them in
+      // parallel rather than serialising for a snappier feel; the
+      // backend is idempotent on each, so partial failure surfaces
+      // through the catch and the user can retry.
+      await Promise.all([
+        ...Array.from(selected).map((id) =>
           api(`/v1/files/${id}`, { method: "DELETE" })
-        )
-      );
-      toast.show("success", `${selected.size} item(s) moved to trash`);
+        ),
+        ...Array.from(selectedFolders).map((id) =>
+          api(`/v1/folders/${id}`, { method: "DELETE" })
+        ),
+      ]);
+      toast.show("success", `${total} item(s) moved to trash`);
       clearSelection();
       await load();
     } catch (e: any) {
@@ -891,19 +951,96 @@ export default function DrivePage() {
   // Streams a server-built ZIP for an arbitrary `{ ids, folderIds }`
   // payload. The previous browser-side approach (loop `window.open`
   // over presigned URLs) was killed by every popup blocker after the
-  // first 1–2 files. The server now does the authorization /
-  // vault-unlock / AV pre-flight up front, then streams a single
-  // `application/zip` response which the client saves via a
-  // transient anchor.
+  // first 1–2 files. The server does authorization / vault-unlock /
+  // AV pre-flight up front, then streams a single `application/zip`
+  // response.
   //
-  // The `progressLabel` parameter is the user-facing description
-  // for the "Preparing…" toast that fires while the server runs its
-  // O(N) pre-flight queries. For folders that can balloon into
-  // hundreds of descendants this matters — silence feels broken.
+  // This implementation does three things beyond the naive
+  // `await res.blob()`:
+  //
+  //  1. **Cancel.** An AbortController gates the fetch. The sticky
+  //     progress card surfaces a Cancel button that aborts the
+  //     in-flight request — server-side the goroutine notices the
+  //     closed connection and stops streaming.
+  //  2. **Per-byte progress.** We pull the response body via the
+  //     reader API and tick a cumulative byte counter into
+  //     `downloadState`. The sticky card reads that and shows
+  //     "Downloading… 42 MB" in real time.
+  //  3. **Stream-to-disk (progressive enhancement).** Where
+  //     `showSaveFilePicker` is available (Chromium-based browsers),
+  //     we open a writable file handle BEFORE the network request and
+  //     pipe each chunk directly to disk — so the archive is never
+  //     buffered in memory and multi-GB exports work. Firefox / Safari
+  //     fall back to the previous Blob path (fine up to ~1–2 GB).
   async function downloadZip(
     payload: { ids?: string[]; folderIds?: string[] },
     progressLabel: string,
   ) {
+    // Cancel any download already in flight. We only run one zip
+    // export at a time — running two would race the progress card and
+    // confuse the user about which one Cancel cancels.
+    if (downloadAbortRef.current) {
+      downloadAbortRef.current.abort();
+    }
+    const controller = new AbortController();
+    downloadAbortRef.current = controller;
+
+    setDownloadState({
+      label: progressLabel,
+      bytes: 0,
+      phase: "preflight",
+    });
+
+    // Try to open a writable file handle up front. If the user picks
+    // a save location we can stream straight to disk — otherwise we
+    // fall back to buffering and triggering an anchor click.
+    //
+    // showSaveFilePicker MUST be called from a user gesture, which
+    // is why we do it here (still inside the click handler chain)
+    // rather than after `fetch` completes. Calling it post-fetch
+    // throws SecurityError on Chromium.
+    let fileHandle: FileSystemFileHandle | null = null;
+    let writable: FileSystemWritableFileStream | null = null;
+    const supportsFSPicker =
+      typeof window !== "undefined" &&
+      // @ts-expect-error - File System Access API isn't in lib.dom yet
+      typeof window.showSaveFilePicker === "function";
+    if (supportsFSPicker) {
+      try {
+        // We don't know the server's chosen filename yet (it lives in
+        // Content-Disposition). Use a sensible default; the user can
+        // rename in the picker.
+        const defaultName =
+          payload.folderIds?.length === 1 && !payload.ids?.length
+            ? "folder.zip"
+            : `docforge-${new Date()
+                .toISOString()
+                .replace(/[:.]/g, "-")}.zip`;
+        // @ts-expect-error - FSAccess API
+        fileHandle = await window.showSaveFilePicker({
+          suggestedName: defaultName,
+          types: [
+            {
+              description: "ZIP archive",
+              accept: { "application/zip": [".zip"] },
+            },
+          ],
+        });
+      } catch (e: any) {
+        if (e?.name === "AbortError") {
+          // User cancelled the save dialog before any work happened
+          // — silently bail without showing the progress card error.
+          downloadAbortRef.current = null;
+          setDownloadState(null);
+          return;
+        }
+        // Any other failure (permission denied, weird filesystem) —
+        // fall through to the blob path. Don't surface; the user
+        // will get a normal browser save flow.
+        fileHandle = null;
+      }
+    }
+
     let res: Response;
     try {
       const token = getToken();
@@ -914,13 +1051,23 @@ export default function DrivePage() {
           ...(token ? { Authorization: `Bearer ${token}` } : {}),
         },
         body: JSON.stringify(payload),
+        signal: controller.signal,
       });
     } catch (e: any) {
-      // Network error before the response started (CORS, DNS, the
-      // server died). Distinct from a server-side 4xx/5xx — those
-      // surface a structured envelope below.
-      toast.show("error", "Couldn't reach the server", {
-        description: e?.message,
+      downloadAbortRef.current = null;
+      if (e?.name === "AbortError") {
+        setDownloadState({
+          label: progressLabel,
+          bytes: 0,
+          phase: "cancelled",
+        });
+        return;
+      }
+      setDownloadState({
+        label: progressLabel,
+        bytes: 0,
+        phase: "error",
+        error: e?.message ?? "Network error",
       });
       return;
     }
@@ -928,34 +1075,167 @@ export default function DrivePage() {
     if (!res.ok) {
       // Server rejected the bulk request before streaming. The body
       // is a normal JSON error envelope at this point — every gate
-      // (authz, vault, AV) writes its error UPFRONT precisely so
-      // we can surface a real message here.
+      // (authz, vault, AV) writes its error UPFRONT precisely so we
+      // can surface a real message here.
+      downloadAbortRef.current = null;
       const body = await res
         .json()
         .catch(() => ({ error: { message: res.statusText } }));
-      toast.show(
-        "error",
-        body?.error?.message ?? "Couldn't prepare download",
-      );
+      setDownloadState({
+        label: progressLabel,
+        bytes: 0,
+        phase: "error",
+        error: body?.error?.message ?? "Couldn't prepare download",
+      });
       return;
     }
 
-    // Successful 200: the body is the zip bytes. Buffer into a Blob
-    // and trigger the save. Using fetch+Blob (not <a href=…>) is
-    // necessary because the endpoint is POST, not GET, so we can't
-    // express it as a same-origin link click.
-    const blob = await res.blob();
-
-    // Pull the filename from Content-Disposition rather than
-    // hard-coding it client-side — the server picks the name (folder
-    // name for single-folder requests, timestamp otherwise) and is
-    // the source of truth.
+    // Resolve the server-chosen filename (folder name or timestamp)
+    // from Content-Disposition. Used both for the anchor fallback and
+    // for renaming the picker file at the end (the picker doesn't let
+    // us change the name post-creation, but we can use it for the
+    // toast).
     const cd = res.headers.get("content-disposition") || "";
     const m = /filename="?([^"]+)"?/i.exec(cd);
-    const fname =
+    const serverFname =
       m?.[1] ||
       `docforge-${new Date().toISOString().replace(/[:.]/g, "-")}.zip`;
 
+    setDownloadState((prev) =>
+      prev ? { ...prev, phase: "streaming" } : prev,
+    );
+
+    // Hand off the body stream. If the browser doesn't expose a
+    // ReadableStream we fall back to res.blob() — same as the original
+    // implementation. Modern Chrome/Firefox/Safari all expose it.
+    if (!res.body) {
+      try {
+        const blob = await res.blob();
+        await deliverBlob(blob, serverFname, fileHandle, writable);
+        downloadAbortRef.current = null;
+        setDownloadState({
+          label: progressLabel,
+          bytes: blob.size,
+          phase: "done",
+        });
+      } catch (e: any) {
+        downloadAbortRef.current = null;
+        setDownloadState({
+          label: progressLabel,
+          bytes: 0,
+          phase: "error",
+          error: e?.message ?? "Download failed",
+        });
+      }
+      return;
+    }
+
+    // Streaming path: pull chunks, tick progress, write to either the
+    // FS Access handle or accumulate into a blob.
+    if (fileHandle) {
+      try {
+        writable = await fileHandle.createWritable();
+      } catch (e: any) {
+        // Failed to open writable — fall through to blob accumulation.
+        fileHandle = null;
+        writable = null;
+      }
+    }
+
+    const reader = res.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let received = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          received += value.byteLength;
+          if (writable) {
+            await writable.write(value);
+          } else {
+            chunks.push(value);
+          }
+          // Mutate-into-new-object so React notices.
+          setDownloadState((prev) =>
+            prev
+              ? { ...prev, bytes: received, phase: "streaming" }
+              : prev,
+          );
+        }
+      }
+    } catch (e: any) {
+      downloadAbortRef.current = null;
+      // If the user cancelled, the reader.read() rejects with
+      // AbortError. Distinguish so the card shows "cancelled" rather
+      // than "failed".
+      try {
+        if (writable) await writable.abort();
+      } catch {
+        /* ignore */
+      }
+      if (e?.name === "AbortError") {
+        setDownloadState({
+          label: progressLabel,
+          bytes: received,
+          phase: "cancelled",
+        });
+        return;
+      }
+      setDownloadState({
+        label: progressLabel,
+        bytes: received,
+        phase: "error",
+        error: e?.message ?? "Download interrupted",
+      });
+      return;
+    }
+
+    try {
+      if (writable) {
+        await writable.close();
+      } else {
+        // Build the blob and trigger the anchor save. Using
+        // BlobPart[] from the chunk array keeps the original byte
+        // ordering without an extra copy.
+        const blob = new Blob(chunks as BlobPart[], {
+          type: "application/zip",
+        });
+        await deliverBlob(blob, serverFname, null, null);
+      }
+    } catch (e: any) {
+      downloadAbortRef.current = null;
+      setDownloadState({
+        label: progressLabel,
+        bytes: received,
+        phase: "error",
+        error: e?.message ?? "Couldn't save the file",
+      });
+      return;
+    }
+
+    downloadAbortRef.current = null;
+    setDownloadState({
+      label: progressLabel,
+      bytes: received,
+      phase: "done",
+    });
+  }
+
+  // Delivers a fully-buffered Blob via an anchor click. Only used
+  // when (a) the browser doesn't expose `res.body` (very old) or
+  // (b) we're on the FS-Access fallback path (Firefox / Safari).
+  async function deliverBlob(
+    blob: Blob,
+    fname: string,
+    handle: FileSystemFileHandle | null,
+    writable: FileSystemWritableFileStream | null,
+  ) {
+    if (handle && writable) {
+      await writable.write(blob);
+      await writable.close();
+      return;
+    }
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -963,40 +1243,57 @@ export default function DrivePage() {
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    // Hand the blob back to the GC. Keeping the object URL alive
-    // pins the entire archive in memory until the page reloads.
     URL.revokeObjectURL(url);
+  }
 
-    toast.show("success", `Downloaded ${progressLabel} as ${fname}`);
+  // Wired to the sticky progress card. Aborts the in-flight fetch;
+  // the catch block on `downloadZip` flips the card into the
+  // "cancelled" terminal state and the user can dismiss.
+  function cancelDownload() {
+    downloadAbortRef.current?.abort();
   }
 
   // Bulk download → server-streams a multi-file ZIP of every
-  // currently-selected file. Single-file case short-circuits to the
-  // original presign flow so the user gets the file under its real
-  // name instead of unnecessarily wrapped inside a one-entry zip.
+  // currently-selected file AND every currently-selected folder
+  // (recursively expanded server-side). Two short-circuits to avoid
+  // wrapping a single thing in a useless one-entry zip:
+  //   - exactly 1 file selected (no folders)  → presigned download
+  //   - exactly 1 folder selected (no files)  → folder ZIP under its
+  //     own name (server names it `<FolderName>.zip`)
+  // Anything mixed or larger gets the combined zip.
   async function bulkDownload() {
-    if (selected.size === 0) return;
-    if (selected.size === 1) {
+    const fileCount = selected.size;
+    const folderCount = selectedFolders.size;
+    const total = fileCount + folderCount;
+    if (total === 0) return;
+    if (total === 1 && fileCount === 1) {
       const [only] = Array.from(selected);
       await download(only);
       return;
     }
+    if (total === 1 && folderCount === 1) {
+      const [folderId] = Array.from(selectedFolders);
+      const folder = folders.find((f) => f.id === folderId);
+      if (folder) {
+        await downloadFolder(folder);
+        return;
+      }
+    }
     const ids = Array.from(selected);
-    toast.show("info", `Preparing ${ids.length} files…`, {
-      description: "We'll save a ZIP when it's ready.",
-    });
-    await downloadZip({ ids }, `${ids.length} files`);
+    const folderIds = Array.from(selectedFolders);
+    const parts: string[] = [];
+    if (fileCount) parts.push(`${fileCount} file${fileCount === 1 ? "" : "s"}`);
+    if (folderCount)
+      parts.push(`${folderCount} folder${folderCount === 1 ? "" : "s"}`);
+    const label = parts.join(" + ");
+    await downloadZip({ ids, folderIds }, label);
   }
 
   // Single-folder download → server walks the folder + every
-  // descendant and streams a `<FolderName>.zip`. The pre-flight is
-  // O(N) descendants, so we surface a "Preparing…" toast like
-  // bulkDownload — the user only sees a save dialog once the server
-  // has finished authorising every file in the tree.
+  // descendant and streams a `<FolderName>.zip`. Progress + cancel
+  // surface through the sticky DownloadProgressCard the same way
+  // bulkDownload does.
   async function downloadFolder(folder: { id: string; name: string }) {
-    toast.show("info", `Preparing "${folder.name}"…`, {
-      description: "We'll save a ZIP when it's ready.",
-    });
     await downloadZip({ folderIds: [folder.id] }, `"${folder.name}"`);
   }
 
@@ -1025,9 +1322,9 @@ export default function DrivePage() {
         e.preventDefault();
         searchRef.current?.focus();
       } else if (e.key === "Escape") {
-        if (selected.size > 0) clearSelection();
+        if (selected.size + selectedFolders.size > 0) clearSelection();
       } else if ((e.key === "Delete" || e.key === "Backspace") && !isEditable) {
-        if (selected.size > 0) {
+        if (selected.size + selectedFolders.size > 0) {
           e.preventDefault();
           bulkTrash();
         }
@@ -1036,7 +1333,7 @@ export default function DrivePage() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selected]);
+  }, [selected, selectedFolders]);
 
   if (!user) return null;
 
@@ -1434,12 +1731,17 @@ export default function DrivePage() {
           </div>
         )}
 
-        {/* Bulk action bar */}
-        {selected.size > 0 && (
+        {/* Bulk action bar — visible whenever any file OR folder is
+            selected. Label breaks out files vs folders so the user can
+            tell at a glance what the next action will operate on
+            (especially Merge to PDF, which is files-only). */}
+        {totalSelected > 0 && (
           <div className="mb-3 flex items-center gap-2 rounded-md border border-primary/40 bg-primary/5 px-3 py-2 text-sm">
             <CheckSquare className="h-4 w-4 text-primary" />
             <span className="font-medium">
-              {selected.size} selected
+              {selected.size > 0 && selectedFolders.size > 0
+                ? `${selected.size} file${selected.size === 1 ? "" : "s"}, ${selectedFolders.size} folder${selectedFolders.size === 1 ? "" : "s"} selected`
+                : `${totalSelected} selected`}
             </span>
             <div className="ml-auto flex items-center gap-1">
               <Button variant="ghost" size="sm" onClick={bulkDownload}>
@@ -1450,8 +1752,11 @@ export default function DrivePage() {
                   and only when at least one is something we can convert
                   (PDF, image, or office doc). The dialog enforces the
                   details; this gate just keeps the button unobtrusive
-                  when the selection is e.g. all .zip archives. */}
-              {selected.size >= 2 && (
+                  when the selection is e.g. all .zip archives. Hidden
+                  outright when any folder is selected — folders aren't
+                  flattenable into a PDF, and silently ignoring them
+                  would surprise users. */}
+              {selected.size >= 2 && selectedFolders.size === 0 && (
                 <Button
                   variant="ghost"
                   size="sm"
@@ -1657,10 +1962,42 @@ export default function DrivePage() {
                     className={cn(
                       "group border-b last:border-0 transition-colors hover:bg-muted/40",
                       dropTargetFolder === f.id &&
-                        "bg-primary/5 ring-1 ring-primary/30"
+                        "bg-primary/5 ring-1 ring-primary/30",
+                      selectedFolders.has(f.id) && "bg-primary/5"
                     )}
                   >
-                    <td className="px-3 py-2"></td>
+                    <td className="px-3 py-2">
+                      {/* Selection checkbox — mirrors the file row's
+                          checkbox cell so a user can multi-select
+                          folders alongside files in list view. Same
+                          visibility convention as FolderGridCard:
+                          always visible when selected or in bulk-mode,
+                          fades in on hover otherwise. */}
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          toggleFolderSelect(f.id);
+                        }}
+                        aria-label={
+                          selectedFolders.has(f.id)
+                            ? "Deselect folder"
+                            : "Select folder"
+                        }
+                        aria-pressed={selectedFolders.has(f.id)}
+                        className={cn(
+                          "grid h-4 w-4 place-items-center rounded border bg-background transition-opacity",
+                          selectedFolders.has(f.id) || totalSelected > 0
+                            ? "opacity-100"
+                            : "opacity-0 group-hover:opacity-100",
+                          selectedFolders.has(f.id) &&
+                            "border-primary bg-primary text-primary-foreground"
+                        )}
+                      >
+                        {selectedFolders.has(f.id) ? (
+                          <Check className="h-3 w-3" />
+                        ) : null}
+                      </button>
+                    </td>
                     <td className="px-3 py-2">
                       <Link
                         href={`/drive?folder=${f.id}`}
@@ -2111,6 +2448,9 @@ export default function DrivePage() {
                         }
                         onToggleLock={() => toggleFolderLock(f)}
                         onDownload={() => downloadFolder(f)}
+                        selected={selectedFolders.has(f.id)}
+                        bulkSelectActive={totalSelected > 0}
+                        onToggleSelect={() => toggleFolderSelect(f.id)}
                       />
                     ))}
                   </div>
@@ -2129,7 +2469,7 @@ export default function DrivePage() {
                         file={file}
                         actorInitials={initials}
                         selected={selected.has(file.id)}
-                        bulkSelectActive={selected.size > 0}
+                        bulkSelectActive={totalSelected > 0}
                         onToggleSelect={() => toggleSelect(file.id)}
                         onToggleStar={() => toggleStar(file)}
                         // Clicking a template card opens the designer;
@@ -2289,6 +2629,16 @@ export default function DrivePage() {
           conflict?.resolve(choice);
           setConflict(null);
         }}
+      />
+
+      {/* Sticky bottom-right download progress / cancel card. Mounted
+          unconditionally so its dismiss timer can fire even after the
+          last selected item gets cleared. Returns null when there's
+          no in-flight download. */}
+      <DownloadProgressCard
+        state={downloadState}
+        onCancel={cancelDownload}
+        onDismiss={() => setDownloadState(null)}
       />
 
       {shareFor && (

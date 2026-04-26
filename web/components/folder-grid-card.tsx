@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import {
+  Check,
   Download,
   Folder as FolderIcon,
   Lock,
@@ -47,6 +48,21 @@ type Props = {
    * out without forcing them to no-op the prop.
    */
   onDownload?: () => void;
+  /**
+   * Multi-select state. Mirrors `FileGridCard`'s checkbox affordance
+   * so a Drive grid can hold a mixed file+folder selection. When
+   * `onToggleSelect` is omitted the checkbox is hidden entirely
+   * (e.g. trash view, where bulk-download doesn't apply).
+   */
+  selected?: boolean;
+  onToggleSelect?: () => void;
+  /**
+   * True when the parent grid currently has any item selected. Forces
+   * the checkbox to stay visible across every card so the multi-select
+   * mode is unambiguous; otherwise the checkbox only fades in on
+   * hover. Same convention as `FileGridCard`.
+   */
+  bulkSelectActive?: boolean;
 };
 
 export function FolderGridCard({
@@ -60,7 +76,11 @@ export function FolderGridCard({
   onShare,
   onToggleLock,
   onDownload,
+  selected = false,
+  onToggleSelect,
+  bulkSelectActive = false,
 }: Props) {
+  const canToggleSelect = typeof onToggleSelect === "function";
   return (
     <div
       onDragOver={(e) => {
@@ -82,9 +102,35 @@ export function FolderGridCard({
       className={cn(
         "group flex items-center gap-2 rounded-lg border bg-card px-3 py-2.5 shadow-subtle transition-all hover:border-border hover:bg-muted/30 hover:shadow-card",
         isDropTarget &&
-          "border-primary bg-primary/5 shadow-card ring-1 ring-primary/30"
+          "border-primary bg-primary/5 shadow-card ring-1 ring-primary/30",
+        selected && "border-primary bg-primary/5 ring-1 ring-primary/30"
       )}
     >
+      {/* Selection checkbox. Sits before the folder icon (vs.
+          FileGridCard's overlay) because FolderGridCard is a compact
+          single-line card with no thumbnail to host an overlay. Same
+          visibility rules: always visible when selected or in bulk
+          mode, hover-only otherwise. */}
+      {canToggleSelect && (
+        <button
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            onToggleSelect?.();
+          }}
+          aria-label={selected ? "Deselect folder" : "Select folder"}
+          aria-pressed={selected}
+          className={cn(
+            "grid h-4 w-4 shrink-0 place-items-center rounded border bg-background transition-opacity",
+            selected || bulkSelectActive
+              ? "border-primary opacity-100"
+              : "opacity-0 group-hover:opacity-100",
+            selected && "border-primary bg-primary text-primary-foreground"
+          )}
+        >
+          {selected ? <Check className="h-3 w-3" /> : null}
+        </button>
+      )}
       <Link
         href={`/drive?folder=${folder.id}`}
         className="flex min-w-0 flex-1 items-center gap-2.5"
