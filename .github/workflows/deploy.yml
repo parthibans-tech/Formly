@@ -20,23 +20,23 @@
 # ghcr.io and the VERSION ldflag in the Go binary, so /healthz can
 # echo it.
 #
-# DEPLOY MECHANICS (per tag):
-#   1. plan job parses the tag and decides which build job(s) run.
-#   2. Only the relevant image(s) get rebuilt + pushed to ghcr.io.
-#   3. deploy job SSHes to the VPS, rewrites the matching IMAGE
-#      line(s) in /opt/formly/.env, and runs:
-#        docker compose pull <changed services>
-#        docker compose up -d <changed services>
-#      Other containers (postgres, caddy, the half you didn't
-#      deploy) stay untouched.
+# DEPLOY MECHANICS (per tag) — mirrors scripts/deploy/manual-deploy.sh:
+#
+#   1. plan job        — parses the tag, decides which build job(s) run.
+#   2. build-* jobs    — docker buildx → push to ghcr.io.
+#                        Runner does the heavy lifting; VPS CPU stays free.
+#   3. deploy job      — SSHes to the VPS via appleboy/ssh-action and:
+#                        a. docker login ghcr.io   (so we can pull)
+#                        b. docker pull <new image(s)>
+#                        c. rewrite IMAGE_* lines in /opt/formly/.env
+#                        d. docker compose up -d --no-deps <changed services>
+#                        Containers we didn't redeploy keep running.
+#   4. smoke tests     — curl /healthz to confirm the new image is live.
 #
 # REQUIRED REPO SECRETS:
 #   HOSTINGER_HOST       — VPS IP or hostname
 #   HOSTINGER_USER       — `deploy`
 #   HOSTINGER_SSH_KEY    — private key (PEM) for the deploy user.
-#                          Use the SAME key/value as bookmypg's
-#                          working secret — that one is proven to
-#                          authenticate against this VPS.
 #   HOSTINGER_SSH_PORT   — optional, default 22
 #
 # REQUIRED REPO VARS (Settings → Variables → Actions):
@@ -44,9 +44,11 @@
 #   WEB_DOMAIN           — drive360.nearbyme.app
 #
 # REGISTRY:
-#   We push to ghcr.io/<owner>/<repo>-{api,web}. Auth uses the
-#   built-in GITHUB_TOKEN. For private repos either set the package
-#   to public OR provision a PAT with read:packages on the VPS.
+#   Pushed to ghcr.io/<owner>/<repo>-{api,web}. Auth on both push
+#   (runner) and pull (VPS) uses the auto-generated GITHUB_TOKEN —
+#   it's valid for the duration of the workflow run, which is more
+#   than enough for the VPS to docker-login + pull. No long-lived PAT
+#   needed.
 
 name: deploy
 
@@ -189,15 +191,15 @@ jobs:
           cache-to: type=gha,scope=web,mode=max
 
   # ═════════════════════════════════════════════════════════════
-  # SSH to the VPS, rewrite the relevant IMAGE line(s) in .env,
-  # then `docker compose pull && up -d` ONLY the services that got
-  # rebuilt. Postgres / Redis / MinIO / ONLYOFFICE / the
-  # not-being-deployed half stay running.
+  # SSH to the VPS → docker login ghcr.io → docker pull → rewrite
+  # /opt/formly/.env → docker compose up. Only the services that
+  # got rebuilt are recreated; postgres / redis / minio / caddy /
+  # the not-being-deployed half keep running.
   #
-  # `if: !cancelled()` so this runs even when one of the build jobs
-  # is skipped (skipped is success-with-no-output, but the default
-  # `needs:` semantics treat skipped as "do not run the dependent").
-  # We override that by gating on the plan flags directly.
+  # The complex `if:` runs the deploy even when one build job is
+  # skipped (api-only or web-only deploys). Default needs-semantics
+  # treat skipped as "block dependents" — we override that by
+  # checking the plan flags directly.
   # ═════════════════════════════════════════════════════════════
   deploy:
     needs: [plan, build-api, build-web]
@@ -208,11 +210,8 @@ jobs:
       (needs.build-web.result == 'success' || needs.build-web.result == 'skipped') &&
       (needs.plan.outputs.deploy_api == 'true' || needs.plan.outputs.deploy_web == 'true')
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     env:
-      DEPLOY_HOST: ${{ secrets.HOSTINGER_HOST }}
-      DEPLOY_USER: ${{ secrets.HOSTINGER_USER }}
-      DEPLOY_PORT: ${{ secrets.HOSTINGER_SSH_PORT || '22' }}
       DEPLOY_API: ${{ needs.plan.outputs.deploy_api }}
       DEPLOY_WEB: ${{ needs.plan.outputs.deploy_web }}
       IMAGE_TAG:  ${{ needs.plan.outputs.image_tag }}
@@ -221,49 +220,44 @@ jobs:
       # `env:` block — GHA only resolves it inside steps.
       API_IMAGE:  ghcr.io/${{ needs.plan.outputs.repo_lower }}-api:${{ needs.plan.outputs.image_tag }}
       WEB_IMAGE:  ghcr.io/${{ needs.plan.outputs.repo_lower }}-web:${{ needs.plan.outputs.image_tag }}
+      # GHCR_USER / GHCR_TOKEN are passed through to the VPS so it
+      # can `docker login ghcr.io` and pull. github.actor is the user
+      # that triggered the run; GITHUB_TOKEN has read:packages for
+      # this repo's packages. Both have ~hours-of-validity, plenty
+      # for the deploy step.
+      GHCR_USER:  ${{ github.actor }}
+      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      # ────────── DEBUG ──────────
-      # Fingerprint-only diagnostic. Confirms the secret currently in
-      # HOSTINGER_SSH_KEY parses + which keypair it represents. The
-      # fingerprint must equal:
-      #   SHA256:CRZakjHBCvOblJveW9PIZpyI87OZpR7iXGu+kwKq8Yg
-      # (the public key installed in /home/deploy/.ssh/authorized_keys
-      # on the VPS — verified via `ssh-keygen -lf`).
-      # If the fingerprint differs OR the key fails to parse, the
-      # secret value is the problem. Remove this step once SSH is
-      # green.
-      - name: Verify SSH secret fingerprint
-        env:
-          SSH_KEY: ${{ secrets.HOSTINGER_SSH_KEY }}
-        run: |
-          set -euo pipefail
-          tmp=$(mktemp)
-          trap 'rm -f "$tmp"' EXIT
-          printf '%s\n' "$SSH_KEY" > "$tmp"
-          chmod 600 "$tmp"
-          if ! ssh-keygen -y -f "$tmp" > "${tmp}.pub" 2>/tmp/keygen.err; then
-            echo "::error::HOSTINGER_SSH_KEY did not parse as a private key:"
-            cat /tmp/keygen.err
-            exit 1
-          fi
-          fp=$(ssh-keygen -lf "${tmp}.pub")
-          echo "Secret fingerprint: $fp"
-          expected="SHA256:CRZakjHBCvOblJveW9PIZpyI87OZpR7iXGu+kwKq8Yg"
-          if echo "$fp" | grep -q "$expected"; then
-            echo "✅ Fingerprint matches the public key on VPS authorized_keys."
-          else
-            echo "::error::Secret holds a DIFFERENT key than what's authorized on the VPS."
-            echo "::error::Expected $expected"
-            echo "::error::Re-upload with: gh secret set HOSTINGER_SSH_KEY < ~/.ssh/<correct-key-file>"
-            exit 1
-          fi
+      # ─── 1. Login + pull on the VPS ──────────────────────────
+      # Mirrors `manual-deploy.sh` step 5: the VPS authenticates to
+      # ghcr.io with a short-lived token piped from the runner, then
+      # pulls only the image(s) we just built.
+      - name: VPS — docker login + pull image(s)
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOSTINGER_HOST }}
+          username: ${{ secrets.HOSTINGER_USER }}
+          key: ${{ secrets.HOSTINGER_SSH_KEY }}
+          port: ${{ secrets.HOSTINGER_SSH_PORT || 22 }}
+          envs: DEPLOY_API,DEPLOY_WEB,API_IMAGE,WEB_IMAGE,GHCR_USER,GHCR_TOKEN
+          command_timeout: 10m
+          script: |
+            set -euo pipefail
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            if [ "$DEPLOY_API" = "true" ]; then
+              echo "→ pulling $API_IMAGE"
+              docker pull "$API_IMAGE"
+            fi
+            if [ "$DEPLOY_WEB" = "true" ]; then
+              echo "→ pulling $WEB_IMAGE"
+              docker pull "$WEB_IMAGE"
+            fi
 
-      # appleboy/ssh-action handles all the key-loading and known-hosts
-      # gymnastics internally. The previous DIY approach (printf > file
-      # + ssh) hit edge cases around trailing newlines, key formats,
-      # and host-key verification that this action handles correctly.
-      # ~30M deploys/month run on this — battle-tested.
-      - name: Update .env on VPS with new image tag(s)
+      # ─── 2. Rewrite /opt/formly/.env ─────────────────────────
+      # Compose reads ${API_IMAGE} / ${WEB_IMAGE} from .env. Updating
+      # those lines is how we tell compose to use the freshly-pulled
+      # image on the next `up -d`.
+      - name: VPS — update /opt/formly/.env with new image tag(s)
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.HOSTINGER_HOST }}
@@ -276,17 +270,20 @@ jobs:
             cd /opt/formly
             if [ "$DEPLOY_API" = "true" ]; then
               sed -i "s|^API_IMAGE=.*|API_IMAGE=$API_IMAGE|" .env
-              echo "Set API_IMAGE=$API_IMAGE"
             fi
             if [ "$DEPLOY_WEB" = "true" ]; then
               sed -i "s|^WEB_IMAGE=.*|WEB_IMAGE=$WEB_IMAGE|" .env
-              echo "Set WEB_IMAGE=$WEB_IMAGE"
             fi
             sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=$IMAGE_TAG|" .env
-            echo "---"
+            echo "--- post-edit:"
             grep -E '^(API_IMAGE|WEB_IMAGE|IMAGE_TAG)=' .env
 
-      - name: Pull and recreate changed services
+      # ─── 3. Recreate only the changed services ───────────────
+      # First-time deploys bring up the whole stack (postgres, caddy,
+      # everything). Subsequent deploys only recreate api/web with
+      # --no-deps so the database doesn't get bounced just because
+      # api depends on it.
+      - name: VPS — docker compose up
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.HOSTINGER_HOST }}
@@ -294,9 +291,6 @@ jobs:
           key: ${{ secrets.HOSTINGER_SSH_KEY }}
           port: ${{ secrets.HOSTINGER_SSH_PORT || 22 }}
           envs: DEPLOY_API,DEPLOY_WEB
-          # Compose pull/up timeout — image pulls + container starts
-          # can take a couple of minutes on first deploy (cold image
-          # cache). Default 10m is fine; explicit so it's reviewable.
           command_timeout: 10m
           script: |
             set -euo pipefail
@@ -306,16 +300,21 @@ jobs:
             [ "$DEPLOY_API" = "true" ] && services="$services api"
             [ "$DEPLOY_WEB" = "true" ] && services="$services web"
             services=$(echo $services | xargs)
-            echo "deploying: $services"
 
-            # Pull only services that changed.
-            docker compose pull $services
-
-            # Recreate only those containers. --no-deps avoids
-            # restarting postgres/redis just because api depends on
-            # them.
-            docker compose up -d --no-deps $services
+            if ! docker compose ps --quiet | grep -q .; then
+              echo "(first run — bringing up the full stack)"
+              docker compose up -d
+            else
+              echo "(incremental — recreating: $services)"
+              docker compose up -d --no-deps $services
+            fi
             docker compose ps
+
+      # ─── 4. Smoke tests ──────────────────────────────────────
+      # Hit the public domain so we're testing through Caddy / TLS /
+      # DNS — not just the container's local port. Generous retry
+      # window because Caddy fetches a fresh Let's Encrypt cert on
+      # cold-start of a new domain (happens on first deploy only).
 
       - name: Smoke test API
         if: needs.plan.outputs.deploy_api == 'true'
