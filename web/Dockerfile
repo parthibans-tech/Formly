@@ -27,7 +27,9 @@ WORKDIR /app
 # during install — the postinstall script (copies pdf.worker.min.js
 # into public/) needs `public/` writable, but we'll re-run it after
 # copying source in the builder stage.
-COPY package.json package-lock.json ./
+# .npmrc carries `legacy-peer-deps=true` — required because the
+# lockfile was generated under that resolver (see web/.npmrc for why).
+COPY package.json package-lock.json .npmrc ./
 RUN npm ci --no-audit --no-fund --ignore-scripts
 
 # ---------- builder ----------
