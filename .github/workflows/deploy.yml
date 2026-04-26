@@ -219,94 +219,64 @@ jobs:
       API_IMAGE:  ghcr.io/${{ needs.plan.outputs.repo_lower }}-api:${{ needs.plan.outputs.image_tag }}
       WEB_IMAGE:  ghcr.io/${{ needs.plan.outputs.repo_lower }}-web:${{ needs.plan.outputs.image_tag }}
     steps:
-      - name: Configure SSH
-        env:
-          SSH_KEY: ${{ secrets.HOSTINGER_SSH_KEY }}
-        run: |
-          set -euo pipefail
-          mkdir -p ~/.ssh
-          # Use printf, not echo — echo mangles backslashes on some
-          # shells and may eat a leading dash. The trailing \n is
-          # mandatory: openssh rejects a key that doesn't end in
-          # newline with "error in libcrypto".
-          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-
-          # Validate the key parses. ssh-keygen -y derives the public
-          # key from the private one — if this fails, the secret is
-          # malformed (truncated, wrong format, or pasted as the
-          # public key by mistake). Fingerprint goes to logs without
-          # leaking the key itself.
-          if ! ssh-keygen -y -f ~/.ssh/deploy_key > /tmp/deploy_key.pub; then
-            echo "::error::HOSTINGER_SSH_KEY secret is not a valid private key. Re-paste the entire contents of your private key file (including BEGIN/END lines and trailing newline)."
-            exit 1
-          fi
-          echo "Key fingerprint: $(ssh-keygen -lf /tmp/deploy_key.pub)"
-
-          ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
-
-          # ────────── DEBUG ──────────
-          # Verbose handshake test against the VPS. Verifies that the
-          # exact key on the runner authenticates the runner's
-          # outbound IP. Output goes to the Actions log; remove this
-          # block after the SSH issue is resolved.
-          echo "::group::SSH verbose handshake test"
-          ssh -vvv -i ~/.ssh/deploy_key \
-              -o IdentitiesOnly=yes \
-              -o BatchMode=yes \
-              -o ConnectTimeout=10 \
-              -p "$DEPLOY_PORT" \
-              "$DEPLOY_USER@$DEPLOY_HOST" \
-              "echo SSH_OK from \$(hostname)" || true
-          echo "::endgroup::"
-
+      # appleboy/ssh-action handles all the key-loading and known-hosts
+      # gymnastics internally. The previous DIY approach (printf > file
+      # + ssh) hit edge cases around trailing newlines, key formats,
+      # and host-key verification that this action handles correctly.
+      # ~30M deploys/month run on this — battle-tested.
       - name: Update .env on VPS with new image tag(s)
-        run: |
-          set -euo pipefail
-          # Conditionally rewrite only the IMAGE line(s) for halves
-          # we actually built. IMAGE_TAG always advances (it doubles
-          # as a release marker on the box).
-          ssh -i ~/.ssh/deploy_key -p "$DEPLOY_PORT" \
-            "$DEPLOY_USER@$DEPLOY_HOST" bash -se <<EOF
-          set -euo pipefail
-          cd /opt/formly
-          if [ "$DEPLOY_API" = "true" ]; then
-            sed -i "s|^API_IMAGE=.*|API_IMAGE=$API_IMAGE|" .env
-            echo "Set API_IMAGE=$API_IMAGE"
-          fi
-          if [ "$DEPLOY_WEB" = "true" ]; then
-            sed -i "s|^WEB_IMAGE=.*|WEB_IMAGE=$WEB_IMAGE|" .env
-            echo "Set WEB_IMAGE=$WEB_IMAGE"
-          fi
-          sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=$IMAGE_TAG|" .env
-          echo "---"
-          grep -E '^(API_IMAGE|WEB_IMAGE|IMAGE_TAG)=' .env
-          EOF
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOSTINGER_HOST }}
+          username: ${{ secrets.HOSTINGER_USER }}
+          key: ${{ secrets.HOSTINGER_SSH_KEY }}
+          port: ${{ secrets.HOSTINGER_SSH_PORT || 22 }}
+          envs: DEPLOY_API,DEPLOY_WEB,API_IMAGE,WEB_IMAGE,IMAGE_TAG
+          script: |
+            set -euo pipefail
+            cd /opt/formly
+            if [ "$DEPLOY_API" = "true" ]; then
+              sed -i "s|^API_IMAGE=.*|API_IMAGE=$API_IMAGE|" .env
+              echo "Set API_IMAGE=$API_IMAGE"
+            fi
+            if [ "$DEPLOY_WEB" = "true" ]; then
+              sed -i "s|^WEB_IMAGE=.*|WEB_IMAGE=$WEB_IMAGE|" .env
+              echo "Set WEB_IMAGE=$WEB_IMAGE"
+            fi
+            sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=$IMAGE_TAG|" .env
+            echo "---"
+            grep -E '^(API_IMAGE|WEB_IMAGE|IMAGE_TAG)=' .env
 
       - name: Pull and recreate changed services
-        run: |
-          ssh -i ~/.ssh/deploy_key -p "$DEPLOY_PORT" \
-            "$DEPLOY_USER@$DEPLOY_HOST" bash -se <<EOF
-          set -euo pipefail
-          cd /opt/formly
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOSTINGER_HOST }}
+          username: ${{ secrets.HOSTINGER_USER }}
+          key: ${{ secrets.HOSTINGER_SSH_KEY }}
+          port: ${{ secrets.HOSTINGER_SSH_PORT || 22 }}
+          envs: DEPLOY_API,DEPLOY_WEB
+          # Compose pull/up timeout — image pulls + container starts
+          # can take a couple of minutes on first deploy (cold image
+          # cache). Default 10m is fine; explicit so it's reviewable.
+          command_timeout: 10m
+          script: |
+            set -euo pipefail
+            cd /opt/formly
 
-          services=""
-          [ "$DEPLOY_API" = "true" ] && services="\$services api"
-          [ "$DEPLOY_WEB" = "true" ] && services="\$services web"
-          services=\$(echo \$services | xargs)   # trim
-          echo "deploying: \$services"
+            services=""
+            [ "$DEPLOY_API" = "true" ] && services="$services api"
+            [ "$DEPLOY_WEB" = "true" ] && services="$services web"
+            services=$(echo $services | xargs)
+            echo "deploying: $services"
 
-          # Pull only the services that changed. Compose otherwise
-          # would touch every image in the file.
-          docker compose pull \$services
+            # Pull only services that changed.
+            docker compose pull $services
 
-          # `up -d <services>` recreates only those containers.
-          # Compose is smart enough to leave dependents alone unless
-          # their config changed. --no-deps avoids restarting
-          # postgres / redis just because api depends on them.
-          docker compose up -d --no-deps \$services
-          docker compose ps
-          EOF
+            # Recreate only those containers. --no-deps avoids
+            # restarting postgres/redis just because api depends on
+            # them.
+            docker compose up -d --no-deps $services
+            docker compose ps
 
       - name: Smoke test API
         if: needs.plan.outputs.deploy_api == 'true'
