@@ -1,0 +1,28 @@
+# Keep the build context small — anything in here doesn't get sent
+# to the Docker daemon.
+.git
+.gitignore
+*.md
+Dockerfile
+.dockerignore
+
+# Local artifacts.
+*.log
+*.test
+*.out
+coverage.txt
+tmp/
+dist/
+bin/
+
+# Editor cruft.
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Anything sensitive that shouldn't get baked into a layer.
+.env
+.env.*
+*.pem
+*.key

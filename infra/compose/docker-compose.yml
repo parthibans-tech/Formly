@@ -1,0 +1,302 @@
+# Formly — full-stack docker compose deployment.
+#
+# This file describes EVERYTHING that runs on the VPS. The deploy
+# pipeline only needs to:
+#   1. SSH in
+#   2. cd /opt/formly
+#   3. docker compose pull   # grabs new api/web images from ghcr.io
+#   4. docker compose up -d  # recreates anything whose image changed
+#
+# That's the whole "one-push deploy" — no install scripts, no
+# symlink swaps, no nginx surgery.
+#
+# Public surface: ONLY Caddy is exposed on :80 / :443. Everything
+# else binds to the internal docker network — Postgres, Redis, the
+# API, ONLYOFFICE, MinIO. Nothing answers on a public port except
+# the reverse proxy.
+#
+# State lives in named volumes (postgres_data, redis_data, …) which
+# survive `docker compose down`. To wipe everything: `docker compose
+# down -v` (the -v drops volumes too — DESTRUCTIVE).
+#
+# Image tag flow:
+#   • Local dev: `docker compose build` rebuilds api+web from source.
+#   • CI:        builds and pushes to ghcr.io/<org>/<repo>-{api,web}.
+#                The deploy step `docker compose pull` grabs new tags.
+#   • Both code paths share THIS file — toggled via the
+#     IMAGE_TAG / API_IMAGE / WEB_IMAGE env vars in .env.
+
+name: formly
+
+# Default networks: one for everything. Docker creates a bridge
+# network with built-in DNS so services reach each other by name
+# (postgres, redis, api, etc.).
+networks:
+  default:
+    name: formly
+
+services:
+  # ────────────────────────────────────────────────────────────
+  # Caddy — reverse proxy + automatic Let's Encrypt TLS.
+  #
+  # Why Caddy over nginx + certbot:
+  #   • One container handles HTTP→HTTPS, ACME challenges, cert
+  #     renewal, and proxying. nginx requires an external certbot,
+  #     a snakeoil placeholder cert for first start, and a renewal
+  #     cron. Caddy figures it all out.
+  #   • Config is ~15 lines vs nginx's 80+. Easier to audit.
+  #   • Live reloads via `caddy reload` (HUP signal) — no restart.
+  #
+  # The Caddyfile is mounted from ./Caddyfile so changes don't
+  # require rebuilding the image.
+  # ────────────────────────────────────────────────────────────
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3 / QUIC
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data       # cert storage — DO NOT lose this
+      - caddy_config:/config
+    environment:
+      DOMAIN_WEB: ${DOMAIN_WEB}
+      DOMAIN_API: ${DOMAIN_API}
+      DOMAIN_OFFICE: ${DOMAIN_OFFICE:-}   # optional
+      DOMAIN_S3: ${DOMAIN_S3:-}            # optional (public MinIO)
+      ACME_EMAIL: ${ACME_EMAIL}
+    depends_on:
+      api:
+        condition: service_started
+      web:
+        condition: service_started
+
+  # ────────────────────────────────────────────────────────────
+  # API — Go service, built from api/Dockerfile.
+  # ────────────────────────────────────────────────────────────
+  api:
+    image: ${API_IMAGE:-ghcr.io/your-org/formly-api:latest}
+    # `build:` only kicks in for local `docker compose build`. CI
+    # ignores this and uses the pre-built image. Keeping it here so
+    # `docker compose up --build` works from a fresh clone.
+    build:
+      context: ../../api
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${IMAGE_TAG:-dev}
+    restart: unless-stopped
+    environment:
+      # ── Connections (resolved by docker DNS, never localhost) ──
+      DATABASE_URL: postgres://formly:${POSTGRES_PASSWORD}@postgres:5432/formly?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      # ── Auth ──
+      JWT_SECRET: ${JWT_SECRET}
+      # ── S3 (MinIO inside the network) ──
+      S3_ENDPOINT: http://minio:9000
+      S3_REGION: us-east-1
+      S3_BUCKET: ${S3_BUCKET:-formly}
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      S3_FORCE_PATH_STYLE: "true"   # MinIO needs path-style addressing
+      # ── AI (Ollama in this same compose, optional) ──
+      AI_ENABLED: ${AI_ENABLED:-false}
+      AI_PROVIDER: ${AI_PROVIDER:-ollama}
+      AI_BASE_URL: ${AI_BASE_URL:-http://ollama:11434}
+      AI_CHAT_MODEL: ${AI_CHAT_MODEL:-llama3.2:3b}
+      AI_EMBED_MODEL: ${AI_EMBED_MODEL:-nomic-embed-text}
+      AI_VISION_MODEL: ${AI_VISION_MODEL:-}
+      AI_TIMEOUT_SEC: ${AI_TIMEOUT_SEC:-180}
+      DOCCHAT_TIMEOUT_SEC: ${DOCCHAT_TIMEOUT_SEC:-180}
+      # ── ONLYOFFICE ──
+      ONLYOFFICE_URL: http://onlyoffice
+      ONLYOFFICE_JWT_SECRET: ${ONLYOFFICE_JWT_SECRET}
+      # ── Misc ──
+      LISTEN_ADDR: ":8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    # Memory hint to docker. Not a hard cap (no `mem_limit`) — that
+    # would OOM-kill rather than swap, which is harsher than we want
+    # on a single VPS where bursts are normal.
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+
+  # ────────────────────────────────────────────────────────────
+  # Web — Next.js standalone, built from web/Dockerfile.
+  # ────────────────────────────────────────────────────────────
+  web:
+    image: ${WEB_IMAGE:-ghcr.io/your-org/formly-web:latest}
+    build:
+      context: ../../web
+      dockerfile: Dockerfile
+      args:
+        # NEXT_PUBLIC_* baked into the bundle at build time.
+        NEXT_PUBLIC_API_URL: https://${DOMAIN_API}
+        NEXT_PUBLIC_STORAGE_URL: ${PUBLIC_STORAGE_URL:-https://${DOMAIN_API}}
+    restart: unless-stopped
+    environment:
+      # Server-side env (the Next.js node process). Anything the SSR
+      # path needs that isn't NEXT_PUBLIC_*. Right now nothing.
+      PORT: 3000
+      HOSTNAME: 0.0.0.0
+    depends_on:
+      api:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # ────────────────────────────────────────────────────────────
+  # Postgres + pgvector. The pgvector image is a drop-in pg16 with
+  # the `vector` extension precompiled — saves us building it.
+  # ────────────────────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: formly
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: formly
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Init script auto-creates the `vector` extension in the
+      # `formly` DB on first boot. Idempotent.
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/01-vector.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U formly -d formly"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # ────────────────────────────────────────────────────────────
+  # Redis. Default config, AOF off — used as a session/cache store,
+  # losing it on container restart is acceptable.
+  # ────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ────────────────────────────────────────────────────────────
+  # MinIO — S3-compatible object storage. Single-node deployment;
+  # data lives in /var/lib/minio on the host (volume below).
+  #
+  # The API talks to it over the docker network as `minio:9000`. If
+  # you want browsers to upload directly via presigned URLs, expose
+  # MinIO publicly via Caddy (DOMAIN_S3 in .env) — see Caddyfile.
+  # ────────────────────────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ────────────────────────────────────────────────────────────
+  # MinIO bucket bootstrap. One-shot container that creates the
+  # `formly` bucket on first start, then exits. Re-runs are no-ops.
+  # ────────────────────────────────────────────────────────────
+  minio-mc:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 '${MINIO_ROOT_USER}' '${MINIO_ROOT_PASSWORD}' &&
+      mc mb --ignore-existing local/${S3_BUCKET:-formly} &&
+      mc anonymous set download local/${S3_BUCKET:-formly} || true;
+      echo 'minio bucket ready';
+      "
+    restart: "no"
+
+  # ────────────────────────────────────────────────────────────
+  # ONLYOFFICE Document Server. Heavy — ~1.5 GB resident. Disable
+  # by removing this service or setting profile `office` (compose
+  # `--profile` flag) if you don't need it.
+  #
+  # The container speaks HTTP only; Caddy fronts it with TLS.
+  # ────────────────────────────────────────────────────────────
+  onlyoffice:
+    image: onlyoffice/documentserver:latest
+    restart: unless-stopped
+    environment:
+      JWT_ENABLED: "true"
+      JWT_SECRET: ${ONLYOFFICE_JWT_SECRET}
+      JWT_HEADER: AuthorizationJwt
+    volumes:
+      - onlyoffice_data:/var/www/onlyoffice/Data
+      - onlyoffice_log:/var/log/onlyoffice
+      - onlyoffice_cache:/var/lib/onlyoffice
+      - onlyoffice_db:/var/lib/postgresql
+    deploy:
+      resources:
+        limits:
+          memory: 1500M
+
+  # ────────────────────────────────────────────────────────────
+  # Ollama — local AI. Big (~4 GB image, models are 2-7 GB each
+  # in the volume). On KVM 2 (8 GB RAM total) this competes hard
+  # with ONLYOFFICE; pick one or upgrade.
+  #
+  # Activated via compose profile so a default `up` doesn't pull
+  # the image unless WITH_OLLAMA=1 in .env enables the profile.
+  # ────────────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    profiles: ["ai"]
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+
+volumes:
+  caddy_data:
+  caddy_config:
+  postgres_data:
+  redis_data:
+  minio_data:
+  onlyoffice_data:
+  onlyoffice_log:
+  onlyoffice_cache:
+  onlyoffice_db:
+  ollama_data:

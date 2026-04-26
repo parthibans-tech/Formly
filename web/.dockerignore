@@ -1,0 +1,30 @@
+# Don't ship build artifacts or local cruft into the build context.
+.git
+.gitignore
+*.md
+Dockerfile
+.dockerignore
+
+node_modules
+.next
+.turbo
+out
+dist
+
+# Test + editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+coverage/
+
+# Secrets — never bake into image
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Generated
+tsconfig.tsbuildinfo
+next-env.d.ts

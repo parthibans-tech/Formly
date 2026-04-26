@@ -121,6 +121,11 @@ const DEFAULT_CSP = buildDefaultCSP();
 
 module.exports = {
   reactStrictMode: true,
+  // `standalone` produces a self-contained .next/standalone/ tree
+  // with only the runtime files needed to `node server.js`. The
+  // Docker image copies that tree + .next/static + public — no
+  // node_modules in the runtime layer (saves ~500 MB on the image).
+  output: "standalone",
   webpack: (config) => {
     config.resolve.alias.canvas = false;
     return config;

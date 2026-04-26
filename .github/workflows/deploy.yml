@@ -1,78 +1,62 @@
-# Formly — tag-based deploy pipeline for Hostinger VPS.
+# Formly — docker-compose-based deploy pipeline.
 #
-# WHY THIS IS TAG-BASED, NOT BRANCH-BASED:
-#   Pushing to `main` happens many times a day — most pushes don't
-#   need to ship to production immediately. A tag is an explicit "I
-#   want this commit live" signal, so it doubles as a release marker
-#   in the git log and rules out accidental deploys from work-in-
-#   progress merges.
-#
-# TAG GRAMMAR (decides what runs):
+# TAG GRAMMAR (decides what builds + deploys):
 #
 #   api-v<X.Y.Z>      → deploy ONLY the Go API
-#                       e.g.  git tag api-v1.4.2 && git push --tags
+#                       e.g. git tag api-v1.4.2 && git push --tags
 #
 #   web-v<X.Y.Z>      → deploy ONLY the Next.js web app
-#                       e.g.  git tag web-v0.9.1 && git push --tags
+#                       e.g. git tag web-v0.9.1 && git push --tags
 #
-#   release-v<X.Y.Z>  → deploy BOTH (the "common" tag — use this when
-#                       a change crosses both halves and they need to
-#                       ship together, e.g. an API field that the web
-#                       reads on the very next page load)
-#                       e.g.  git tag release-v2.0.0 && git push --tags
+#   release-v<X.Y.Z>  → deploy BOTH (use when a change crosses both
+#                       halves and they need to ship together)
+#                       e.g. git tag release-v2.0.0 && git push --tags
 #
-# The job-level `if:` blocks below match the tag prefix and gate each
-# deploy. The version suffix (X.Y.Z) is informational — it ends up in
-# the deployed `RELEASE` file on the server so `formly --version`
-# style tooling can surface it.
+# Why split: a typo fix in the web costs ~3 min of API rebuild that
+# changed nothing. Splitting keeps API-only deploys to ~1.5 min and
+# rules out "did this web change affect the API?" anxiety.
 #
-# REQUIRED REPOSITORY SECRETS (set under Settings → Secrets → Actions):
+# The version suffix (X.Y.Z) ends up as the docker image tag in
+# ghcr.io and the VERSION ldflag in the Go binary, so /healthz can
+# echo it.
 #
-#   HOSTINGER_HOST       VPS hostname or public IP
-#   HOSTINGER_USER       SSH user with deploy permissions
-#                        (recommended: a dedicated `deploy` user — NOT
-#                        root — that owns /opt/formly and has sudo
-#                        only for `systemctl restart formly-*`)
-#   HOSTINGER_SSH_KEY    Private key (full PEM contents) authorised in
-#                        the deploy user's ~/.ssh/authorized_keys
-#   HOSTINGER_SSH_PORT   (optional) custom SSH port, default 22
+# DEPLOY MECHANICS (per tag):
+#   1. plan job parses the tag and decides which build job(s) run.
+#   2. Only the relevant image(s) get rebuilt + pushed to ghcr.io.
+#   3. deploy job SSHes to the VPS, rewrites the matching IMAGE
+#      line(s) in /opt/formly/.env, and runs:
+#        docker compose pull <changed services>
+#        docker compose up -d <changed services>
+#      Other containers (postgres, caddy, the half you didn't
+#      deploy) stay untouched.
 #
-# REQUIRED REPOSITORY VARIABLES (Settings → Variables → Actions):
+# REQUIRED REPO SECRETS:
+#   HOSTINGER_HOST       — VPS IP or hostname
+#   HOSTINGER_USER       — `deploy`
+#   HOSTINGER_SSH_KEY    — private key (PEM contents) for the deploy user
+#   HOSTINGER_SSH_PORT   — optional, default 22
 #
-#   API_DOMAIN           e.g. api.formly.example.com — used only for
-#                        the post-deploy smoke check (curl /v1/health)
-#   WEB_DOMAIN           e.g. formly.example.com
+# REQUIRED REPO VARS (Settings → Variables → Actions):
+#   API_DOMAIN           — api.drive360.nearbyme.app
+#   WEB_DOMAIN           — drive360.nearbyme.app
 #
-# ONE-TIME VPS SETUP:
-#
-#   The `scripts/deploy/bootstrap-vps.sh` script in this repo installs
-#   the OS packages (Postgres + pgvector, Redis, Tesseract w/ Tamil &
-#   Hindi packs, ImageMagick, poppler-utils, Node, Go is NOT needed —
-#   we ship a prebuilt binary), creates the `deploy` user, drops the
-#   systemd units in place, and prints the public key the user must
-#   register with GitHub. Run it once as root on a fresh Hostinger
-#   KVM VPS, then forget it.
+# REGISTRY:
+#   We push to ghcr.io/<owner>/<repo>-{api,web}. Auth uses the
+#   built-in GITHUB_TOKEN. For private repos either set the package
+#   to public OR provision a PAT with read:packages on the VPS.
 
 name: deploy
 
 on:
   push:
     tags:
-      # Three patterns; jobs below decide which half of the deploy
-      # actually runs. Listing all three here so a single workflow run
-      # covers every case (rather than three separate workflow files
-      # with duplicated SSH setup).
       - "api-v*"
       - "web-v*"
       - "release-v*"
-
-  # Manual trigger for the rare case where a deploy needs to happen
-  # without a tag (e.g. re-running a failed deploy of an existing
-  # tag). The `target` input takes the same values as the tag prefix.
   workflow_dispatch:
     inputs:
       target:
-        description: "Which side(s) to deploy"
+        description: "Which side(s) to deploy (manual override)"
         required: true
         type: choice
         default: release
@@ -81,206 +65,157 @@ on:
           - web
           - release
 
-# Cancel an in-flight deploy if a newer tag for the same target lands
-# while the previous one is still running. Prevents two parallel
-# rsyncs racing to write the same files.
+# Don't run two deploys to the same ref simultaneously — the second
+# one's `docker compose up` would race the first.
 concurrency:
   group: deploy-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  REGISTRY: ghcr.io
+
 jobs:
-  # ----------------------------------------------------------------
-  # Compute which halves should deploy and extract the version. We do
-  # this once and read the outputs from the deploy jobs so the tag
-  # parsing logic only lives in one place.
-  # ----------------------------------------------------------------
+  # ═════════════════════════════════════════════════════════════
+  # Parse the tag → decide which halves deploy + extract version.
+  # All downstream jobs read these outputs.
+  # ═════════════════════════════════════════════════════════════
   plan:
     runs-on: ubuntu-latest
     outputs:
       deploy_api: ${{ steps.decide.outputs.deploy_api }}
       deploy_web: ${{ steps.decide.outputs.deploy_web }}
-      version: ${{ steps.decide.outputs.version }}
+      image_tag:  ${{ steps.decide.outputs.image_tag }}
+      repo_lower: ${{ steps.decide.outputs.repo_lower }}
     steps:
       - id: decide
         shell: bash
         run: |
           set -euo pipefail
-          # Source: the tag (push event) or the manual input.
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             target="${{ inputs.target }}"
-            version="manual-$(date -u +%Y%m%d-%H%M%S)"
+            image_tag="manual-$(date -u +%Y%m%d-%H%M%S)"
           else
             ref="${GITHUB_REF#refs/tags/}"
             case "$ref" in
-              api-v*)     target=api;     version="${ref#api-v}";;
-              web-v*)     target=web;     version="${ref#web-v}";;
-              release-v*) target=release; version="${ref#release-v}";;
+              api-v*)     target=api;     image_tag="${ref#api-v}";;
+              web-v*)     target=web;     image_tag="${ref#web-v}";;
+              release-v*) target=release; image_tag="${ref#release-v}";;
               *) echo "::error::Unknown tag shape: $ref"; exit 1;;
             esac
           fi
-          # Map target → which jobs run.
           case "$target" in
             api)     api=true;  web=false ;;
             web)     api=false; web=true  ;;
             release) api=true;  web=true  ;;
           esac
+          repo_lower=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
           echo "deploy_api=$api"   >> "$GITHUB_OUTPUT"
           echo "deploy_web=$web"   >> "$GITHUB_OUTPUT"
-          echo "version=$version"  >> "$GITHUB_OUTPUT"
-          echo "Plan: api=$api web=$web version=$version"
+          echo "image_tag=$image_tag" >> "$GITHUB_OUTPUT"
+          echo "repo_lower=$repo_lower" >> "$GITHUB_OUTPUT"
+          echo "Plan: api=$api web=$web tag=$image_tag repo=$repo_lower"
 
-  # ----------------------------------------------------------------
-  # API deploy. Builds a static linux/amd64 Go binary on the runner
-  # (much faster than building on the VPS, and we don't need Go on
-  # the VPS at all this way), rsyncs the binary + migrations folder,
-  # and restarts the systemd service. Migrations auto-apply on boot
-  # — see runMigrations() in cmd/api/main.go.
-  # ----------------------------------------------------------------
-  deploy-api:
+  # ═════════════════════════════════════════════════════════════
+  # Build + push the API image. Skipped when deploy_api=false.
+  # ═════════════════════════════════════════════════════════════
+  build-api:
     needs: plan
     if: needs.plan.outputs.deploy_api == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    env:
-      VERSION: ${{ needs.plan.outputs.version }}
-      DEPLOY_HOST: ${{ secrets.HOSTINGER_HOST }}
-      DEPLOY_USER: ${{ secrets.HOSTINGER_USER }}
-      DEPLOY_PORT: ${{ secrets.HOSTINGER_SSH_PORT || '22' }}
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
         with:
-          # Pin to the version go.mod declares so a CI runner upgrade
-          # doesn't surprise us with a different toolchain.
-          go-version-file: api/go.mod
-          cache: true
-          cache-dependency-path: api/go.sum
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build linux/amd64 binary
-        working-directory: api
-        run: |
-          set -euo pipefail
-          mkdir -p ../dist/api
-          # CGO_ENABLED=0 → fully static, runs on any glibc-or-musl
-          # host without library version surprises. -trimpath +
-          # -ldflags=-s -w → smaller binary, no absolute build paths
-          # baked in. -X main.version stamps the release on the bin
-          # so /v1/health can return it.
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-            go build \
-              -trimpath \
-              -ldflags="-s -w -X main.version=${VERSION}" \
-              -o ../dist/api/formly-api \
-              ./cmd/api
-          # Ship the migrations folder alongside — runMigrations()
-          # globs migrations/*.sql relative to the working directory.
-          cp -R migrations ../dist/api/migrations
-          # Drop a small RELEASE file the install script will copy
-          # into /opt/formly/api/RELEASE so an admin can `cat` it.
-          printf 'api %s %s\n' "$VERSION" "$(git rev-parse --short HEAD)" > ../dist/api/RELEASE
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./api
+          file: ./api/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ needs.plan.outputs.repo_lower }}-api:${{ needs.plan.outputs.image_tag }}
+            ${{ env.REGISTRY }}/${{ needs.plan.outputs.repo_lower }}-api:latest
+          build-args: |
+            VERSION=${{ needs.plan.outputs.image_tag }}
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,scope=api,mode=max
 
-      - name: Stage install script
-        run: |
-          # Bundle the server-side install script into the artifact
-          # we ship — keeps the rsync target self-contained.
-          cp scripts/deploy/install-api.sh dist/api/install.sh
-          chmod +x dist/api/install.sh
-
-      - name: Configure SSH
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.HOSTINGER_SSH_KEY }}" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          # Strict host check would block first deploy; we accept and
-          # then capture the fingerprint to known_hosts so subsequent
-          # steps still get man-in-the-middle protection within the
-          # job. (For long-term hardening, pin the host key as a
-          # repository secret and prepopulate known_hosts.)
-          ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
-
-      - name: Rsync to VPS
-        run: |
-          set -euo pipefail
-          # --delete on the inner staging dir only — we DO NOT --delete
-          # the live /opt/formly/api directory, the install script does
-          # an atomic-symlink swap into a release-versioned directory.
-          rsync -az --delete \
-            -e "ssh -i ~/.ssh/deploy_key -p $DEPLOY_PORT" \
-            dist/api/ \
-            "$DEPLOY_USER@$DEPLOY_HOST:/opt/formly/incoming/api/"
-
-      - name: Run install script on VPS
-        run: |
-          ssh -i ~/.ssh/deploy_key -p "$DEPLOY_PORT" \
-            "$DEPLOY_USER@$DEPLOY_HOST" \
-            "VERSION='$VERSION' bash /opt/formly/incoming/api/install.sh"
-
-      - name: Smoke test
-        run: |
-          # Best-effort. If API_DOMAIN isn't set we skip — the deploy
-          # itself already succeeded, this is just a "is it answering
-          # requests" check. The systemd unit's WatchdogSec already
-          # catches a hard crash.
-          if [[ -z "${{ vars.API_DOMAIN }}" ]]; then
-            echo "API_DOMAIN not set; skipping smoke test."
-            exit 0
-          fi
-          for i in 1 2 3 4 5; do
-            if curl -fsS --max-time 5 "https://${{ vars.API_DOMAIN }}/v1/health" >/dev/null; then
-              echo "API healthy on attempt $i"
-              exit 0
-            fi
-            echo "attempt $i failed, retrying…"
-            sleep 3
-          done
-          echo "::error::API health check failed 5×"
-          exit 1
-
-  # ----------------------------------------------------------------
-  # Web deploy. We push source + lockfile and let the VPS run the
-  # build. Reasons over building-on-runner-and-shipping-.next:
-  #   1. next-swc + sharp ship native binaries that must match the
-  #      target glibc; building on the runner risks subtle ABI
-  #      mismatches.
-  #   2. node_modules is huge — far cheaper to npm-ci on the box.
-  #   3. The build step caches under .next/cache between deploys
-  #      when we keep node_modules warm on the VPS.
-  # ----------------------------------------------------------------
-  deploy-web:
+  # ═════════════════════════════════════════════════════════════
+  # Build + push the Web image. Skipped when deploy_web=false.
+  # NEXT_PUBLIC_API_URL is baked in at build time → must come from
+  # the API_DOMAIN repo variable.
+  # ═════════════════════════════════════════════════════════════
+  build-web:
     needs: plan
     if: needs.plan.outputs.deploy_web == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./web
+          file: ./web/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ needs.plan.outputs.repo_lower }}-web:${{ needs.plan.outputs.image_tag }}
+            ${{ env.REGISTRY }}/${{ needs.plan.outputs.repo_lower }}-web:latest
+          build-args: |
+            NEXT_PUBLIC_API_URL=https://${{ vars.API_DOMAIN }}
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,scope=web,mode=max
+
+  # ═════════════════════════════════════════════════════════════
+  # SSH to the VPS, rewrite the relevant IMAGE line(s) in .env,
+  # then `docker compose pull && up -d` ONLY the services that got
+  # rebuilt. Postgres / Redis / MinIO / ONLYOFFICE / the
+  # not-being-deployed half stay running.
+  #
+  # `if: !cancelled()` so this runs even when one of the build jobs
+  # is skipped (skipped is success-with-no-output, but the default
+  # `needs:` semantics treat skipped as "do not run the dependent").
+  # We override that by gating on the plan flags directly.
+  # ═════════════════════════════════════════════════════════════
+  deploy:
+    needs: [plan, build-api, build-web]
+    if: |
+      always() &&
+      needs.plan.result == 'success' &&
+      (needs.build-api.result == 'success' || needs.build-api.result == 'skipped') &&
+      (needs.build-web.result == 'success' || needs.build-web.result == 'skipped') &&
+      (needs.plan.outputs.deploy_api == 'true' || needs.plan.outputs.deploy_web == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
-      VERSION: ${{ needs.plan.outputs.version }}
       DEPLOY_HOST: ${{ secrets.HOSTINGER_HOST }}
       DEPLOY_USER: ${{ secrets.HOSTINGER_USER }}
       DEPLOY_PORT: ${{ secrets.HOSTINGER_SSH_PORT || '22' }}
+      DEPLOY_API: ${{ needs.plan.outputs.deploy_api }}
+      DEPLOY_WEB: ${{ needs.plan.outputs.deploy_web }}
+      IMAGE_TAG:  ${{ needs.plan.outputs.image_tag }}
+      API_IMAGE:  ${{ env.REGISTRY }}/${{ needs.plan.outputs.repo_lower }}-api:${{ needs.plan.outputs.image_tag }}
+      WEB_IMAGE:  ${{ env.REGISTRY }}/${{ needs.plan.outputs.repo_lower }}-web:${{ needs.plan.outputs.image_tag }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Stage release tarball
-        run: |
-          set -euo pipefail
-          mkdir -p dist/web
-          # Ship only what the server build needs. node_modules and
-          # .next are excluded — server runs `npm ci` + `npm run build`.
-          # tsbuildinfo / next-env.d.ts are dev-only.
-          rsync -a \
-            --exclude node_modules \
-            --exclude .next \
-            --exclude .turbo \
-            --exclude tsconfig.tsbuildinfo \
-            --exclude next-env.d.ts \
-            web/ dist/web/web/
-          cp scripts/deploy/install-web.sh dist/web/install.sh
-          chmod +x dist/web/install.sh
-          printf 'web %s %s\n' "$VERSION" "$(git rev-parse --short HEAD)" > dist/web/RELEASE
-
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
@@ -288,34 +223,79 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
-      - name: Rsync to VPS
+      - name: Update .env on VPS with new image tag(s)
         run: |
-          rsync -az --delete \
-            -e "ssh -i ~/.ssh/deploy_key -p $DEPLOY_PORT" \
-            dist/web/ \
-            "$DEPLOY_USER@$DEPLOY_HOST:/opt/formly/incoming/web/"
-
-      - name: Run install script on VPS
-        run: |
-          # The install script handles npm ci, next build, atomic
-          # symlink swap, and systemd restart. We surface its output
-          # verbatim so build errors land in the GitHub UI.
+          set -euo pipefail
+          # Conditionally rewrite only the IMAGE line(s) for halves
+          # we actually built. IMAGE_TAG always advances (it doubles
+          # as a release marker on the box).
           ssh -i ~/.ssh/deploy_key -p "$DEPLOY_PORT" \
-            "$DEPLOY_USER@$DEPLOY_HOST" \
-            "VERSION='$VERSION' bash /opt/formly/incoming/web/install.sh"
-
-      - name: Smoke test
-        run: |
-          if [[ -z "${{ vars.WEB_DOMAIN }}" ]]; then
-            echo "WEB_DOMAIN not set; skipping smoke test."
-            exit 0
+            "$DEPLOY_USER@$DEPLOY_HOST" bash -se <<EOF
+          set -euo pipefail
+          cd /opt/formly
+          if [ "$DEPLOY_API" = "true" ]; then
+            sed -i "s|^API_IMAGE=.*|API_IMAGE=$API_IMAGE|" .env
+            echo "Set API_IMAGE=$API_IMAGE"
           fi
-          for i in 1 2 3 4 5; do
+          if [ "$DEPLOY_WEB" = "true" ]; then
+            sed -i "s|^WEB_IMAGE=.*|WEB_IMAGE=$WEB_IMAGE|" .env
+            echo "Set WEB_IMAGE=$WEB_IMAGE"
+          fi
+          sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=$IMAGE_TAG|" .env
+          echo "---"
+          grep -E '^(API_IMAGE|WEB_IMAGE|IMAGE_TAG)=' .env
+          EOF
+
+      - name: Pull and recreate changed services
+        run: |
+          ssh -i ~/.ssh/deploy_key -p "$DEPLOY_PORT" \
+            "$DEPLOY_USER@$DEPLOY_HOST" bash -se <<EOF
+          set -euo pipefail
+          cd /opt/formly
+
+          services=""
+          [ "$DEPLOY_API" = "true" ] && services="\$services api"
+          [ "$DEPLOY_WEB" = "true" ] && services="\$services web"
+          services=\$(echo \$services | xargs)   # trim
+          echo "deploying: \$services"
+
+          # Pull only the services that changed. Compose otherwise
+          # would touch every image in the file.
+          docker compose pull \$services
+
+          # `up -d <services>` recreates only those containers.
+          # Compose is smart enough to leave dependents alone unless
+          # their config changed. --no-deps avoids restarting
+          # postgres / redis just because api depends on them.
+          docker compose up -d --no-deps \$services
+          docker compose ps
+          EOF
+
+      - name: Smoke test API
+        if: needs.plan.outputs.deploy_api == 'true'
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 12); do
+            if curl -fsS --max-time 5 "https://${{ vars.API_DOMAIN }}/healthz" >/dev/null; then
+              echo "API healthy on attempt $i"
+              exit 0
+            fi
+            echo "attempt $i failed, sleeping 5s…"
+            sleep 5
+          done
+          echo "::error::API health check failed after 60s"
+          exit 1
+
+      - name: Smoke test Web
+        if: needs.plan.outputs.deploy_web == 'true'
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 6); do
             if curl -fsS --max-time 8 "https://${{ vars.WEB_DOMAIN }}/" >/dev/null; then
               echo "Web healthy on attempt $i"
               exit 0
             fi
-            sleep 3
+            sleep 5
           done
-          echo "::error::Web smoke check failed 5×"
+          echo "::error::Web health check failed"
           exit 1
