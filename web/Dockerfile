@@ -64,8 +64,11 @@ ENV NEXT_TELEMETRY_DISABLED=1
 ENV PORT=3000
 ENV HOSTNAME=0.0.0.0
 
-# Non-root runtime user (matches API).
-RUN addgroup --system --gid 1000 formly \
+# Non-root runtime user (matches API uid/gid 1000 for volume parity).
+# node:alpine ships with a `node` user at 1000 — delete it first so
+# we can reclaim that uid/gid for our own user.
+RUN deluser --remove-home node 2>/dev/null || true \
+ && addgroup --system --gid 1000 formly \
  && adduser  --system --uid 1000 --ingroup formly --home /app --shell /sbin/nologin formly
 
 # tini for proper signal forwarding (same reason as the API image).

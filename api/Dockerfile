@@ -17,7 +17,7 @@
 # in main.go globs migrations/*.sql relative to WORKDIR at startup.
 
 # ---------- builder ----------
-FROM golang:1.23-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 WORKDIR /src
 
