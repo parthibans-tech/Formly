@@ -220,10 +220,29 @@ jobs:
       WEB_IMAGE:  ghcr.io/${{ needs.plan.outputs.repo_lower }}-web:${{ needs.plan.outputs.image_tag }}
     steps:
       - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.HOSTINGER_SSH_KEY }}
         run: |
+          set -euo pipefail
           mkdir -p ~/.ssh
-          echo "${{ secrets.HOSTINGER_SSH_KEY }}" > ~/.ssh/deploy_key
+          # Use printf, not echo — echo mangles backslashes on some
+          # shells and may eat a leading dash. The trailing \n is
+          # mandatory: openssh rejects a key that doesn't end in
+          # newline with "error in libcrypto".
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
+
+          # Validate the key parses. ssh-keygen -y derives the public
+          # key from the private one — if this fails, the secret is
+          # malformed (truncated, wrong format, or pasted as the
+          # public key by mistake). Fingerprint goes to logs without
+          # leaking the key itself.
+          if ! ssh-keygen -y -f ~/.ssh/deploy_key > /tmp/deploy_key.pub; then
+            echo "::error::HOSTINGER_SSH_KEY secret is not a valid private key. Re-paste the entire contents of your private key file (including BEGIN/END lines and trailing newline)."
+            exit 1
+          fi
+          echo "Key fingerprint: $(ssh-keygen -lf /tmp/deploy_key.pub)"
+
           ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
       - name: Update .env on VPS with new image tag(s)
