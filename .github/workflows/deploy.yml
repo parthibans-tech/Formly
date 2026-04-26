@@ -33,7 +33,10 @@
 # REQUIRED REPO SECRETS:
 #   HOSTINGER_HOST       — VPS IP or hostname
 #   HOSTINGER_USER       — `deploy`
-#   HOSTINGER_SSH_KEY    — private key (PEM contents) for the deploy user
+#   HOSTINGER_SSH_KEY    — private key (PEM) for the deploy user.
+#                          Use the SAME key/value as bookmypg's
+#                          working secret — that one is proven to
+#                          authenticate against this VPS.
 #   HOSTINGER_SSH_PORT   — optional, default 22
 #
 # REQUIRED REPO VARS (Settings → Variables → Actions):
@@ -219,6 +222,42 @@ jobs:
       API_IMAGE:  ghcr.io/${{ needs.plan.outputs.repo_lower }}-api:${{ needs.plan.outputs.image_tag }}
       WEB_IMAGE:  ghcr.io/${{ needs.plan.outputs.repo_lower }}-web:${{ needs.plan.outputs.image_tag }}
     steps:
+      # ────────── DEBUG ──────────
+      # Fingerprint-only diagnostic. Confirms the secret currently in
+      # HOSTINGER_SSH_KEY parses + which keypair it represents. The
+      # fingerprint must equal:
+      #   SHA256:CRZakjHBCvOblJveW9PIZpyI87OZpR7iXGu+kwKq8Yg
+      # (the public key installed in /home/deploy/.ssh/authorized_keys
+      # on the VPS — verified via `ssh-keygen -lf`).
+      # If the fingerprint differs OR the key fails to parse, the
+      # secret value is the problem. Remove this step once SSH is
+      # green.
+      - name: Verify SSH secret fingerprint
+        env:
+          SSH_KEY: ${{ secrets.HOSTINGER_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp)
+          trap 'rm -f "$tmp"' EXIT
+          printf '%s\n' "$SSH_KEY" > "$tmp"
+          chmod 600 "$tmp"
+          if ! ssh-keygen -y -f "$tmp" > "${tmp}.pub" 2>/tmp/keygen.err; then
+            echo "::error::HOSTINGER_SSH_KEY did not parse as a private key:"
+            cat /tmp/keygen.err
+            exit 1
+          fi
+          fp=$(ssh-keygen -lf "${tmp}.pub")
+          echo "Secret fingerprint: $fp"
+          expected="SHA256:CRZakjHBCvOblJveW9PIZpyI87OZpR7iXGu+kwKq8Yg"
+          if echo "$fp" | grep -q "$expected"; then
+            echo "✅ Fingerprint matches the public key on VPS authorized_keys."
+          else
+            echo "::error::Secret holds a DIFFERENT key than what's authorized on the VPS."
+            echo "::error::Expected $expected"
+            echo "::error::Re-upload with: gh secret set HOSTINGER_SSH_KEY < ~/.ssh/<correct-key-file>"
+            exit 1
+          fi
+
       # appleboy/ssh-action handles all the key-loading and known-hosts
       # gymnastics internally. The previous DIY approach (printf > file
       # + ssh) hit edge cases around trailing newlines, key formats,
