@@ -391,23 +391,43 @@ func builtinSpecs() []rawSpec {
 			Name:        "Aadhaar Card",
 			Description: "Indian Aadhaar — front or back. Tuned for the 12-digit number, name, DOB, gender.",
 			Icon:        "id-card",
-			PSM:         6,
-			Preprocess:  boolPtr(true),
-			Fields:      []string{"aadhaar_number", "name", "dob", "gender"},
+			// eng+tam+hin: Aadhaars print labels in Tamil/Hindi alongside
+			// English. Running tesseract with "eng" alone forces it to
+			// fit Tamil glyphs to Latin letterforms, producing garbage
+			// fragments ("ee ee Me", "SS 53 omagiayh") that pollute
+			// the regex output and confuse the LLM cleanup. Requires
+			// `tesseract-ocr-tam` and `tesseract-ocr-hin` packs at
+			// deploy time. See migration 048 for the rollout note.
+			Lang:       "eng+tam+hin",
+			PSM:        6,
+			Preprocess: boolPtr(true),
+			Fields:     []string{"aadhaar_number", "name", "dob", "gender"},
 			Extractors: map[string]string{
-				"aadhaar_number": `(?i)(\d{4}\s*\d{4}\s*\d{4})`,
+				// Word boundaries on the 4-4-4 number so a stray 13+
+				// digit run from a misread date can't capture a
+				// shifted slice.
+				"aadhaar_number": `(?i)\b(\d{4}\s+\d{4}\s+\d{4})\b`,
 				"dob":            `(?i)(?:DOB|D\.?O\.?B\.?|Date of Birth|Year of Birth)\s*[:\-]?\s*([\d/\-\.]{4,10})`,
 				"gender":         `(?i)\b(MALE|FEMALE|TRANSGENDER)\b`,
-				"name":           `(?m)^([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){1,3})\s*$`,
+				// Allow up to ~10 leading non-letter characters
+				// (Tesseract renders Tamil prefix glyphs as junk like
+				// "Tl —" before the genuine English transliteration).
+				"name": `(?m)^[^A-Za-z\n]{0,10}([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*$`,
 			},
-			LLMPrompt: `You are extracting fields from raw OCR text of an Indian Aadhaar card.
+			LLMPrompt: `You are extracting fields from raw OCR text of an Indian Aadhaar card. The OCR is often noisy — Tamil/Hindi labels frequently render as garbage Latin fragments mixed with the real English text.
 Return ONLY a JSON object (no prose, no code fences) with these keys:
   aadhaar_number  — 12-digit number, formatted as "XXXX XXXX XXXX"
-  name            — full name as printed
-  dob             — date of birth in DD/MM/YYYY format
+  name            — full name as printed (English transliteration line)
+  dob             — date of birth in DD/MM/YYYY format if present, else year only
   gender          — "Male", "Female", or "Transgender"
-If a field is missing or unreadable, set its value to null.
-Common OCR mistakes to fix: O↔0, I↔1, B↔8, S↔5 inside digit fields. Names should keep their original capitalisation.`,
+
+CRITICAL RULES:
+  • For aadhaar_number: locate a contiguous 12-digit sequence in the source text, typically formatted as three groups of four (e.g. "8169 1847 6605"). DO NOT invent digits. If no clean 12-digit sequence is present, return null.
+  • For name: pick the line that reads as Title Case English words ("Somasundaram Moorthy"). Strip any leading garbage tokens ("Tl —", punctuation, single Latin letters) that come from misread Tamil/Hindi glyphs. Do NOT include the father's name or the word "Father".
+  • For dob: if only the year is visible ("Year of Birth: 1999"), return "1999".
+  • Common OCR digit substitutions to fix INSIDE a candidate field only: O↔0, I↔1, B↔8, S↔5. Do not apply these to letters in names.
+
+If a field is missing or unreadable after applying the rules above, set its value to null. Never fabricate.`,
 		},
 		{
 			Slug:        "pan",

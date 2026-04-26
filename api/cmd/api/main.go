@@ -550,6 +550,10 @@ func main() {
 		r.Get("/v1/vault/status", vt.Status)
 		r.Post("/v1/vault/unlock", vt.Unlock)
 		r.Post("/v1/vault/lock", vt.Lock)
+		// Privacy telemetry: client beacons (PrintScreen, tab hidden,
+		// focus lost, etc.) while a vault-locked surface is mounted.
+		// Server logs as audit events; cannot prevent OS-level capture.
+		r.Post("/v1/vault/privacy-event", vt.PrivacyEvent)
 
 		// Shares (public token links).
 		r.Post("/v1/files/{id}/share", sh.Create)
@@ -780,7 +784,17 @@ func main() {
 		r.Delete("/v1/review-links/{id}", rl.Revoke)
 	})
 
-	addr := ":8080"
+	// Listen address. Default ":8080" preserves the historical behaviour
+	// for any caller that doesn't set the env. The blue-green deploy
+	// pipeline runs two instances of this binary side-by-side on
+	// different ports (8080 + 8081) and flips an nginx upstream
+	// between them — see scripts/deploy/install-api.sh. Without the
+	// env override, both instances would race for the same port and
+	// the second to start would crash the first deploy.
+	addr := os.Getenv("LISTEN_ADDR")
+	if addr == "" {
+		addr = ":8080"
+	}
 	logger.Info("api listening", "addr", addr)
 	if err := http.ListenAndServe(addr, r); err != nil {
 		logger.Error("serve", "err", err)

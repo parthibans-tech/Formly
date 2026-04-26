@@ -1,0 +1,321 @@
+# Formly — tag-based deploy pipeline for Hostinger VPS.
+#
+# WHY THIS IS TAG-BASED, NOT BRANCH-BASED:
+#   Pushing to `main` happens many times a day — most pushes don't
+#   need to ship to production immediately. A tag is an explicit "I
+#   want this commit live" signal, so it doubles as a release marker
+#   in the git log and rules out accidental deploys from work-in-
+#   progress merges.
+#
+# TAG GRAMMAR (decides what runs):
+#
+#   api-v<X.Y.Z>      → deploy ONLY the Go API
+#                       e.g.  git tag api-v1.4.2 && git push --tags
+#
+#   web-v<X.Y.Z>      → deploy ONLY the Next.js web app
+#                       e.g.  git tag web-v0.9.1 && git push --tags
+#
+#   release-v<X.Y.Z>  → deploy BOTH (the "common" tag — use this when
+#                       a change crosses both halves and they need to
+#                       ship together, e.g. an API field that the web
+#                       reads on the very next page load)
+#                       e.g.  git tag release-v2.0.0 && git push --tags
+#
+# The job-level `if:` blocks below match the tag prefix and gate each
+# deploy. The version suffix (X.Y.Z) is informational — it ends up in
+# the deployed `RELEASE` file on the server so `formly --version`
+# style tooling can surface it.
+#
+# REQUIRED REPOSITORY SECRETS (set under Settings → Secrets → Actions):
+#
+#   HOSTINGER_HOST       VPS hostname or public IP
+#   HOSTINGER_USER       SSH user with deploy permissions
+#                        (recommended: a dedicated `deploy` user — NOT
+#                        root — that owns /opt/formly and has sudo
+#                        only for `systemctl restart formly-*`)
+#   HOSTINGER_SSH_KEY    Private key (full PEM contents) authorised in
+#                        the deploy user's ~/.ssh/authorized_keys
+#   HOSTINGER_SSH_PORT   (optional) custom SSH port, default 22
+#
+# REQUIRED REPOSITORY VARIABLES (Settings → Variables → Actions):
+#
+#   API_DOMAIN           e.g. api.formly.example.com — used only for
+#                        the post-deploy smoke check (curl /v1/health)
+#   WEB_DOMAIN           e.g. formly.example.com
+#
+# ONE-TIME VPS SETUP:
+#
+#   The `scripts/deploy/bootstrap-vps.sh` script in this repo installs
+#   the OS packages (Postgres + pgvector, Redis, Tesseract w/ Tamil &
+#   Hindi packs, ImageMagick, poppler-utils, Node, Go is NOT needed —
+#   we ship a prebuilt binary), creates the `deploy` user, drops the
+#   systemd units in place, and prints the public key the user must
+#   register with GitHub. Run it once as root on a fresh Hostinger
+#   KVM VPS, then forget it.
+
+name: deploy
+
+on:
+  push:
+    tags:
+      # Three patterns; jobs below decide which half of the deploy
+      # actually runs. Listing all three here so a single workflow run
+      # covers every case (rather than three separate workflow files
+      # with duplicated SSH setup).
+      - "api-v*"
+      - "web-v*"
+      - "release-v*"
+
+  # Manual trigger for the rare case where a deploy needs to happen
+  # without a tag (e.g. re-running a failed deploy of an existing
+  # tag). The `target` input takes the same values as the tag prefix.
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Which side(s) to deploy"
+        required: true
+        type: choice
+        default: release
+        options:
+          - api
+          - web
+          - release
+
+# Cancel an in-flight deploy if a newer tag for the same target lands
+# while the previous one is still running. Prevents two parallel
+# rsyncs racing to write the same files.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ----------------------------------------------------------------
+  # Compute which halves should deploy and extract the version. We do
+  # this once and read the outputs from the deploy jobs so the tag
+  # parsing logic only lives in one place.
+  # ----------------------------------------------------------------
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      deploy_api: ${{ steps.decide.outputs.deploy_api }}
+      deploy_web: ${{ steps.decide.outputs.deploy_web }}
+      version: ${{ steps.decide.outputs.version }}
+    steps:
+      - id: decide
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Source: the tag (push event) or the manual input.
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            target="${{ inputs.target }}"
+            version="manual-$(date -u +%Y%m%d-%H%M%S)"
+          else
+            ref="${GITHUB_REF#refs/tags/}"
+            case "$ref" in
+              api-v*)     target=api;     version="${ref#api-v}";;
+              web-v*)     target=web;     version="${ref#web-v}";;
+              release-v*) target=release; version="${ref#release-v}";;
+              *) echo "::error::Unknown tag shape: $ref"; exit 1;;
+            esac
+          fi
+          # Map target → which jobs run.
+          case "$target" in
+            api)     api=true;  web=false ;;
+            web)     api=false; web=true  ;;
+            release) api=true;  web=true  ;;
+          esac
+          echo "deploy_api=$api"   >> "$GITHUB_OUTPUT"
+          echo "deploy_web=$web"   >> "$GITHUB_OUTPUT"
+          echo "version=$version"  >> "$GITHUB_OUTPUT"
+          echo "Plan: api=$api web=$web version=$version"
+
+  # ----------------------------------------------------------------
+  # API deploy. Builds a static linux/amd64 Go binary on the runner
+  # (much faster than building on the VPS, and we don't need Go on
+  # the VPS at all this way), rsyncs the binary + migrations folder,
+  # and restarts the systemd service. Migrations auto-apply on boot
+  # — see runMigrations() in cmd/api/main.go.
+  # ----------------------------------------------------------------
+  deploy-api:
+    needs: plan
+    if: needs.plan.outputs.deploy_api == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      DEPLOY_HOST: ${{ secrets.HOSTINGER_HOST }}
+      DEPLOY_USER: ${{ secrets.HOSTINGER_USER }}
+      DEPLOY_PORT: ${{ secrets.HOSTINGER_SSH_PORT || '22' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Pin to the version go.mod declares so a CI runner upgrade
+          # doesn't surprise us with a different toolchain.
+          go-version-file: api/go.mod
+          cache: true
+          cache-dependency-path: api/go.sum
+
+      - name: Build linux/amd64 binary
+        working-directory: api
+        run: |
+          set -euo pipefail
+          mkdir -p ../dist/api
+          # CGO_ENABLED=0 → fully static, runs on any glibc-or-musl
+          # host without library version surprises. -trimpath +
+          # -ldflags=-s -w → smaller binary, no absolute build paths
+          # baked in. -X main.version stamps the release on the bin
+          # so /v1/health can return it.
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build \
+              -trimpath \
+              -ldflags="-s -w -X main.version=${VERSION}" \
+              -o ../dist/api/formly-api \
+              ./cmd/api
+          # Ship the migrations folder alongside — runMigrations()
+          # globs migrations/*.sql relative to the working directory.
+          cp -R migrations ../dist/api/migrations
+          # Drop a small RELEASE file the install script will copy
+          # into /opt/formly/api/RELEASE so an admin can `cat` it.
+          printf 'api %s %s\n' "$VERSION" "$(git rev-parse --short HEAD)" > ../dist/api/RELEASE
+
+      - name: Stage install script
+        run: |
+          # Bundle the server-side install script into the artifact
+          # we ship — keeps the rsync target self-contained.
+          cp scripts/deploy/install-api.sh dist/api/install.sh
+          chmod +x dist/api/install.sh
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.HOSTINGER_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # Strict host check would block first deploy; we accept and
+          # then capture the fingerprint to known_hosts so subsequent
+          # steps still get man-in-the-middle protection within the
+          # job. (For long-term hardening, pin the host key as a
+          # repository secret and prepopulate known_hosts.)
+          ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Rsync to VPS
+        run: |
+          set -euo pipefail
+          # --delete on the inner staging dir only — we DO NOT --delete
+          # the live /opt/formly/api directory, the install script does
+          # an atomic-symlink swap into a release-versioned directory.
+          rsync -az --delete \
+            -e "ssh -i ~/.ssh/deploy_key -p $DEPLOY_PORT" \
+            dist/api/ \
+            "$DEPLOY_USER@$DEPLOY_HOST:/opt/formly/incoming/api/"
+
+      - name: Run install script on VPS
+        run: |
+          ssh -i ~/.ssh/deploy_key -p "$DEPLOY_PORT" \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            "VERSION='$VERSION' bash /opt/formly/incoming/api/install.sh"
+
+      - name: Smoke test
+        run: |
+          # Best-effort. If API_DOMAIN isn't set we skip — the deploy
+          # itself already succeeded, this is just a "is it answering
+          # requests" check. The systemd unit's WatchdogSec already
+          # catches a hard crash.
+          if [[ -z "${{ vars.API_DOMAIN }}" ]]; then
+            echo "API_DOMAIN not set; skipping smoke test."
+            exit 0
+          fi
+          for i in 1 2 3 4 5; do
+            if curl -fsS --max-time 5 "https://${{ vars.API_DOMAIN }}/v1/health" >/dev/null; then
+              echo "API healthy on attempt $i"
+              exit 0
+            fi
+            echo "attempt $i failed, retrying…"
+            sleep 3
+          done
+          echo "::error::API health check failed 5×"
+          exit 1
+
+  # ----------------------------------------------------------------
+  # Web deploy. We push source + lockfile and let the VPS run the
+  # build. Reasons over building-on-runner-and-shipping-.next:
+  #   1. next-swc + sharp ship native binaries that must match the
+  #      target glibc; building on the runner risks subtle ABI
+  #      mismatches.
+  #   2. node_modules is huge — far cheaper to npm-ci on the box.
+  #   3. The build step caches under .next/cache between deploys
+  #      when we keep node_modules warm on the VPS.
+  # ----------------------------------------------------------------
+  deploy-web:
+    needs: plan
+    if: needs.plan.outputs.deploy_web == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      DEPLOY_HOST: ${{ secrets.HOSTINGER_HOST }}
+      DEPLOY_USER: ${{ secrets.HOSTINGER_USER }}
+      DEPLOY_PORT: ${{ secrets.HOSTINGER_SSH_PORT || '22' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Stage release tarball
+        run: |
+          set -euo pipefail
+          mkdir -p dist/web
+          # Ship only what the server build needs. node_modules and
+          # .next are excluded — server runs `npm ci` + `npm run build`.
+          # tsbuildinfo / next-env.d.ts are dev-only.
+          rsync -a \
+            --exclude node_modules \
+            --exclude .next \
+            --exclude .turbo \
+            --exclude tsconfig.tsbuildinfo \
+            --exclude next-env.d.ts \
+            web/ dist/web/web/
+          cp scripts/deploy/install-web.sh dist/web/install.sh
+          chmod +x dist/web/install.sh
+          printf 'web %s %s\n' "$VERSION" "$(git rev-parse --short HEAD)" > dist/web/RELEASE
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.HOSTINGER_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Rsync to VPS
+        run: |
+          rsync -az --delete \
+            -e "ssh -i ~/.ssh/deploy_key -p $DEPLOY_PORT" \
+            dist/web/ \
+            "$DEPLOY_USER@$DEPLOY_HOST:/opt/formly/incoming/web/"
+
+      - name: Run install script on VPS
+        run: |
+          # The install script handles npm ci, next build, atomic
+          # symlink swap, and systemd restart. We surface its output
+          # verbatim so build errors land in the GitHub UI.
+          ssh -i ~/.ssh/deploy_key -p "$DEPLOY_PORT" \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            "VERSION='$VERSION' bash /opt/formly/incoming/web/install.sh"
+
+      - name: Smoke test
+        run: |
+          if [[ -z "${{ vars.WEB_DOMAIN }}" ]]; then
+            echo "WEB_DOMAIN not set; skipping smoke test."
+            exit 0
+          fi
+          for i in 1 2 3 4 5; do
+            if curl -fsS --max-time 8 "https://${{ vars.WEB_DOMAIN }}/" >/dev/null; then
+              echo "Web healthy on attempt $i"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::Web smoke check failed 5×"
+          exit 1

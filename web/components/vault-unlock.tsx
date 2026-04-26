@@ -212,6 +212,25 @@ function UnlockModal({
             5&nbsp;minutes. We&apos;ll lock again automatically.
           </DialogDescription>
         </DialogHeader>
+        {/*
+          Privacy disclosure. We can't actually block screen-sharing or
+          OS-level screenshots from a browser tab, so the honest framing
+          is: "you're being watched, attempts are logged." The shield
+          (vault-privacy-shield.tsx) blurs on tab-hide / focus-loss and
+          beacons every PrintScreen / copy attempt to the audit log.
+          Showing this here gives the user one explicit acknowledgement
+          per session.
+        */}
+        <div
+          role="note"
+          className="rounded-md border border-amber-200/60 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-900 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-100"
+        >
+          Files in this folder are confidential. While unlocked, we hide
+          the view if your tab loses focus and log every screenshot,
+          copy, and right-click attempt. Screen recordings made by other
+          apps cannot be blocked from a browser — please keep the tab
+          private.
+        </div>
         <form onSubmit={submit} className="space-y-3">
           <div>
             <Label htmlFor="vault-password">Password</Label>

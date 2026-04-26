@@ -67,6 +67,7 @@ import {
   type DownloadProgressState,
 } from "@/components/download-progress-card";
 import { CameraCaptureDialog } from "@/components/camera-capture-dialog";
+import { VaultPrivacyShield } from "@/components/vault-privacy-shield";
 import { MergeFilesDialog } from "@/components/merge-files-dialog";
 import { InsertPagesDialog } from "@/components/insert-pages-dialog";
 import { Button } from "@/components/ui/button";
@@ -913,6 +914,18 @@ export default function DrivePage() {
     [currentFolderId]
   );
 
+  // Privacy shield gate: active whenever the user is inside a folder
+  // that is itself locked or is a descendant of a locked folder. The
+  // breadcrumbs response includes the lock flag for every ancestor, so
+  // a single .some() covers both cases. Listing locked content already
+  // requires a vault session (server returns 423 otherwise), so we
+  // don't need to also gate on `vault.status.unlocked` — if we got
+  // here, the unlock has happened.
+  const inVaultContext = useMemo(
+    () => breadcrumbs.some((b) => !!b.locked),
+    [breadcrumbs]
+  );
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     let f = q
@@ -1498,6 +1511,10 @@ export default function DrivePage() {
           })
         }
       />
+      <VaultPrivacyShield
+        active={inVaultContext}
+        folderId={currentFolderId || undefined}
+      >
       <div>
         {/* Breadcrumb */}
         <nav aria-label="Breadcrumb" className="mb-3">
@@ -2757,6 +2774,7 @@ export default function DrivePage() {
           )}
         </div>
       </div>
+      </VaultPrivacyShield>
 
       {uploading && (
         <div className="fixed bottom-4 right-4 z-[60] w-80 animate-fade-in-up">
@@ -2828,6 +2846,11 @@ export default function DrivePage() {
             setShareFor(previewFor);
             setPreviewFor(null);
           }}
+          // Cascade lock state down so the preview installs the
+          // privacy shield watchdogs (visibility/blur/PrintScreen
+          // telemetry, copy suppression) when the file is inside a
+          // vault folder.
+          protectedFile={inVaultContext}
         />
       )}
 

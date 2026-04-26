@@ -1,0 +1,60 @@
+# formly-web@.service — parameterized template, mirrors
+# formly-api@.service. Two instances:
+#
+#   systemctl start formly-web@blue     # listens on 127.0.0.1:3000
+#   systemctl start formly-web@green    # listens on 127.0.0.1:3001
+#
+# Next.js reads $PORT and $HOSTNAME at startup, so each slot pins
+# them in its own env file (env.blue / env.green) under
+# /opt/formly/web/. Same blue-green flow as the API: deploy to idle
+# slot, health-check on its loopback port, atomically swap nginx,
+# stop old slot.
+
+[Unit]
+Description=Formly Web (slot %i)
+After=network-online.target formly-api@blue.service formly-api@green.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=formly
+Group=formly
+WorkingDirectory=/opt/formly/web/slots/%i
+
+# `npm exec next start` runs Next directly without an npm wrapper
+# process. Cleaner kill semantics on systemctl stop. PORT comes from
+# env.<slot>; --hostname forces 127.0.0.1 binding so nginx is the
+# only path to the app even if the firewall config is loose.
+ExecStart=/usr/bin/npm exec --offline -- next start
+
+EnvironmentFile=/opt/formly/web/env
+EnvironmentFile=/opt/formly/web/env.%i
+
+Restart=on-failure
+RestartSec=2
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+ReadWritePaths=/var/log/formly /opt/formly/web/releases /opt/formly/web/slots
+
+LimitNOFILE=65536
+# Next.js holds more in memory than the Go API; 768 MB gives one
+# slot enough headroom for a moderately complex page tree, and two
+# slots overlapping during deploy stays under 2 GB total.
+MemoryMax=768M
+
+KillSignal=SIGTERM
+TimeoutStopSec=20s
+
+[Install]
+WantedBy=multi-user.target

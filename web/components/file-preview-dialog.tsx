@@ -20,6 +20,7 @@ import { Button } from "@/components/ui/button";
 import { api } from "@/lib/api";
 import { useToast } from "@/components/toast";
 import { PdfViewerDialog } from "@/components/pdf-viewer-dialog";
+import { useVaultPrivacyShield } from "@/components/vault-privacy-shield";
 
 export interface FilePreviewDialogProps {
   fileId: string;
@@ -30,6 +31,13 @@ export interface FilePreviewDialogProps {
    *  that invokes this callback. The parent is responsible for opening
    *  the actual ShareModal. */
   onShare?: () => void;
+  /** Set when the file lives inside a vault-locked folder. Activates
+   *  the privacy shield (visibility/blur/PrintScreen telemetry +
+   *  copy/right-click suppression) for the duration of the preview.
+   *  The shield is headless here because PdfViewerDialog portals out,
+   *  so we can't wrap it visually — the protections install on
+   *  document/window. */
+  protectedFile?: boolean;
 }
 
 export function FilePreviewDialog({
@@ -38,9 +46,15 @@ export function FilePreviewDialog({
   open,
   onOpenChange,
   onShare,
+  protectedFile,
 }: FilePreviewDialogProps) {
   const toast = useToast();
   const [url, setUrl] = useState<string | null>(null);
+
+  // Active only while the dialog is open AND the file is in a vault
+  // folder. Beacon "shield_mounted" fires once per page load anyway, so
+  // toggling on/off as the user opens different previews is cheap.
+  useVaultPrivacyShield(open && !!protectedFile, { fileId });
 
   useEffect(() => {
     if (!open) {
