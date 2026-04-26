@@ -1,54 +1,48 @@
-# Formly — docker-compose-based deploy pipeline.
+# Formly — docker-compose deploy pipeline.
+#
+# FLOW:
+#   git tag → push → GHA builds images → ghcr.io →
+#     SSH to VPS → docker pull → docker compose up
 #
 # TAG GRAMMAR (decides what builds + deploys):
 #
 #   api-v<X.Y.Z>      → deploy ONLY the Go API
-#                       e.g. git tag api-v1.4.2 && git push --tags
-#
 #   web-v<X.Y.Z>      → deploy ONLY the Next.js web app
-#                       e.g. git tag web-v0.9.1 && git push --tags
-#
 #   release-v<X.Y.Z>  → deploy BOTH (use when a change crosses both
 #                       halves and they need to ship together)
-#                       e.g. git tag release-v2.0.0 && git push --tags
 #
 # Why split: a typo fix in the web costs ~3 min of API rebuild that
 # changed nothing. Splitting keeps API-only deploys to ~1.5 min and
 # rules out "did this web change affect the API?" anxiety.
 #
-# The version suffix (X.Y.Z) ends up as the docker image tag in
-# ghcr.io and the VERSION ldflag in the Go binary, so /healthz can
-# echo it.
-#
-# DEPLOY MECHANICS (per tag) — mirrors scripts/deploy/manual-deploy.sh:
-#
-#   1. plan job        — parses the tag, decides which build job(s) run.
-#   2. build-* jobs    — docker buildx → push to ghcr.io.
-#                        Runner does the heavy lifting; VPS CPU stays free.
-#   3. deploy job      — SSHes to the VPS via appleboy/ssh-action and:
-#                        a. docker login ghcr.io   (so we can pull)
-#                        b. docker pull <new image(s)>
-#                        c. rewrite IMAGE_* lines in /opt/formly/.env
-#                        d. docker compose up -d --no-deps <changed services>
-#                        Containers we didn't redeploy keep running.
-#   4. smoke tests     — curl /healthz to confirm the new image is live.
-#
 # REQUIRED REPO SECRETS:
 #   HOSTINGER_HOST       — VPS IP or hostname
 #   HOSTINGER_USER       — `deploy`
 #   HOSTINGER_SSH_KEY    — private key (PEM) for the deploy user.
+#                          IMPORTANT: set via:
+#                            gh secret set HOSTINGER_SSH_KEY < ~/.ssh/formly_deploy
+#                          The web UI mangles newlines and corrupts the key.
 #   HOSTINGER_SSH_PORT   — optional, default 22
+#   GHCR_PAT             — classic PAT, scopes: write:packages, read:packages
+#                          Used by both runner (push) and VPS (pull). Required
+#                          because GITHUB_TOKEN can't reliably push/pull from
+#                          user-namespace ghcr.io packages without manual UI
+#                          linkage. PAT bypasses that.
 #
-# REQUIRED REPO VARS (Settings → Variables → Actions):
+# REQUIRED REPO VARIABLES (Settings → Variables → Actions):
 #   API_DOMAIN           — api.drive360.nearbyme.app
 #   WEB_DOMAIN           — drive360.nearbyme.app
 #
-# REGISTRY:
-#   Pushed to ghcr.io/<owner>/<repo>-{api,web}. Auth on both push
-#   (runner) and pull (VPS) uses the auto-generated GITHUB_TOKEN —
-#   it's valid for the duration of the workflow run, which is more
-#   than enough for the VPS to docker-login + pull. No long-lived PAT
-#   needed.
+# ONE-TIME VPS BOOTSTRAP (must be done BEFORE first CI deploy):
+#   1. Run scripts/deploy/bootstrap-vps.sh on the VPS as root.
+#      That installs Docker, creates the `deploy` user, lays out
+#      /opt/formly/ with compose files + a starter .env.
+#   2. Add the laptop's pubkey AND the runner's pubkey to
+#      /home/deploy/.ssh/authorized_keys.
+#   3. Edit /opt/formly/.env — set ACME_EMAIL.
+#   4. Point DNS A records (api.drive360, drive360) at the VPS IP.
+#
+# After bootstrap, every deploy is just: `git tag … && git push --tags`.
 
 name: deploy
 
@@ -61,14 +55,11 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: "Which side(s) to deploy (manual override)"
+        description: "Which side(s) to deploy"
         required: true
         type: choice
         default: release
-        options:
-          - api
-          - web
-          - release
+        options: [api, web, release]
 
 # Don't run two deploys to the same ref simultaneously — the second
 # one's `docker compose up` would race the first.
@@ -79,10 +70,13 @@ concurrency:
 env:
   REGISTRY: ghcr.io
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   # ═════════════════════════════════════════════════════════════
-  # Parse the tag → decide which halves deploy + extract version.
-  # All downstream jobs read these outputs.
+  # 1. PLAN — parse the tag, decide what to build/deploy.
   # ═════════════════════════════════════════════════════════════
   plan:
     runs-on: ubuntu-latest
@@ -114,32 +108,106 @@ jobs:
             release) api=true;  web=true  ;;
           esac
           repo_lower=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          echo "deploy_api=$api"   >> "$GITHUB_OUTPUT"
-          echo "deploy_web=$web"   >> "$GITHUB_OUTPUT"
-          echo "image_tag=$image_tag" >> "$GITHUB_OUTPUT"
-          echo "repo_lower=$repo_lower" >> "$GITHUB_OUTPUT"
+
+          # Required-vars check — fail HERE, not in the middle of a deploy.
+          missing=""
+          [ -z "${{ vars.API_DOMAIN }}" ] && missing="$missing API_DOMAIN"
+          [ -z "${{ vars.WEB_DOMAIN }}" ] && missing="$missing WEB_DOMAIN"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repo Variables:$missing"
+            echo "  Set at: Settings → Secrets and variables → Actions → Variables"
+            exit 1
+          fi
+
+          {
+            echo "deploy_api=$api"
+            echo "deploy_web=$web"
+            echo "image_tag=$image_tag"
+            echo "repo_lower=$repo_lower"
+          } >> "$GITHUB_OUTPUT"
           echo "Plan: api=$api web=$web tag=$image_tag repo=$repo_lower"
 
   # ═════════════════════════════════════════════════════════════
-  # Build + push the API image. Skipped when deploy_api=false.
+  # 2. PREFLIGHT — verify SSH + Docker on the VPS before spending
+  #    5 minutes on a build that can't deploy. Fail-fast with the
+  #    exact remediation step.
+  # ═════════════════════════════════════════════════════════════
+  preflight:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Verify SSH key secret format
+        env:
+          KEY: ${{ secrets.HOSTINGER_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEY:-}" ]; then
+            echo "::error::HOSTINGER_SSH_KEY secret is empty"
+            exit 1
+          fi
+          if ! printf '%s' "$KEY" | head -1 | grep -qE 'BEGIN (OPENSSH|RSA|EC|ED25519) PRIVATE KEY'; then
+            echo "::error::HOSTINGER_SSH_KEY does not start with a valid PEM header."
+            echo "  Symptom: 'error in libcrypto' or 'no key found'."
+            echo "  Fix: from your laptop, replace via gh CLI (bypasses UI mangling):"
+            echo "    gh secret set HOSTINGER_SSH_KEY < ~/.ssh/formly_deploy"
+            exit 1
+          fi
+          echo "key header looks valid"
+
+      - name: SSH + Docker reachability check
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOSTINGER_HOST }}
+          username: ${{ secrets.HOSTINGER_USER }}
+          key: ${{ secrets.HOSTINGER_SSH_KEY }}
+          port: ${{ secrets.HOSTINGER_SSH_PORT || 22 }}
+          command_timeout: 30s
+          script: |
+            set -euo pipefail
+            echo "ssh ok"
+            if ! docker ps >/dev/null 2>&1; then
+              echo "::error::deploy user can't talk to docker daemon."
+              echo "  Fix on VPS as root:"
+              echo "    usermod -aG docker $USER && pkill -KILL -u $USER"
+              exit 1
+            fi
+            echo "docker ok"
+            if [ ! -f /opt/formly/docker-compose.yml ]; then
+              echo "::error::/opt/formly/docker-compose.yml missing — bootstrap not run."
+              echo "  Fix: run scripts/deploy/bootstrap-vps.sh on the VPS as root."
+              exit 1
+            fi
+            if [ ! -f /opt/formly/.env ]; then
+              echo "::error::/opt/formly/.env missing — bootstrap incomplete."
+              echo "  Fix: run scripts/deploy/bootstrap-vps.sh on the VPS as root."
+              exit 1
+            fi
+            echo "/opt/formly layout ok"
+
+  # ═════════════════════════════════════════════════════════════
+  # 3. BUILD-API — docker buildx → push to ghcr.io.
   # ═════════════════════════════════════════════════════════════
   build-api:
-    needs: plan
+    needs: [plan, preflight]
     if: needs.plan.outputs.deploy_api == 'true'
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
       - uses: docker/setup-buildx-action@v3
 
-      - uses: docker/login-action@v3
+      - name: Login to ghcr.io
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # Why GHCR_PAT, not GITHUB_TOKEN: GITHUB_TOKEN can fail to
+          # push to user-namespace ghcr.io packages unless the package
+          # has been manually linked to this repo in the UI. PAT
+          # (classic, write:packages) bypasses that linkage rule.
+          password: ${{ secrets.GHCR_PAT }}
 
       - uses: docker/build-push-action@v6
         with:
@@ -155,27 +223,25 @@ jobs:
           cache-to: type=gha,scope=api,mode=max
 
   # ═════════════════════════════════════════════════════════════
-  # Build + push the Web image. Skipped when deploy_web=false.
-  # NEXT_PUBLIC_API_URL is baked in at build time → must come from
-  # the API_DOMAIN repo variable.
+  # 4. BUILD-WEB — docker buildx → push to ghcr.io.
+  #    NEXT_PUBLIC_API_URL gets baked into the JS bundle here.
   # ═════════════════════════════════════════════════════════════
   build-web:
-    needs: plan
+    needs: [plan, preflight]
     if: needs.plan.outputs.deploy_web == 'true'
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
       - uses: docker/setup-buildx-action@v3
 
-      - uses: docker/login-action@v3
+      - name: Login to ghcr.io
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GHCR_PAT }}
 
       - uses: docker/build-push-action@v6
         with:
@@ -191,21 +257,18 @@ jobs:
           cache-to: type=gha,scope=web,mode=max
 
   # ═════════════════════════════════════════════════════════════
-  # SSH to the VPS → docker login ghcr.io → docker pull → rewrite
-  # /opt/formly/.env → docker compose up. Only the services that
-  # got rebuilt are recreated; postgres / redis / minio / caddy /
-  # the not-being-deployed half keep running.
+  # 5. DEPLOY — sync compose files, pull images, recreate services.
   #
-  # The complex `if:` runs the deploy even when one build job is
-  # skipped (api-only or web-only deploys). Default needs-semantics
-  # treat skipped as "block dependents" — we override that by
-  # checking the plan flags directly.
+  # Runs even when one build job is skipped (api-only or web-only
+  # tags). The complex `if` overrides the default needs-semantics
+  # that treat `skipped` as failure.
   # ═════════════════════════════════════════════════════════════
   deploy:
-    needs: [plan, build-api, build-web]
+    needs: [plan, preflight, build-api, build-web]
     if: |
       always() &&
       needs.plan.result == 'success' &&
+      needs.preflight.result == 'success' &&
       (needs.build-api.result == 'success' || needs.build-api.result == 'skipped') &&
       (needs.build-web.result == 'success' || needs.build-web.result == 'skipped') &&
       (needs.plan.outputs.deploy_api == 'true' || needs.plan.outputs.deploy_web == 'true')
@@ -215,23 +278,32 @@ jobs:
       DEPLOY_API: ${{ needs.plan.outputs.deploy_api }}
       DEPLOY_WEB: ${{ needs.plan.outputs.deploy_web }}
       IMAGE_TAG:  ${{ needs.plan.outputs.image_tag }}
-      # NB: ghcr.io is hardcoded here (not ${{ env.REGISTRY }})
-      # because the `env` context is not in scope inside a job-level
-      # `env:` block — GHA only resolves it inside steps.
+      # ghcr.io is hardcoded — env.REGISTRY isn't in scope inside
+      # a job-level env block (GHA quirk).
       API_IMAGE:  ghcr.io/${{ needs.plan.outputs.repo_lower }}-api:${{ needs.plan.outputs.image_tag }}
       WEB_IMAGE:  ghcr.io/${{ needs.plan.outputs.repo_lower }}-web:${{ needs.plan.outputs.image_tag }}
-      # GHCR_USER / GHCR_TOKEN are passed through to the VPS so it
-      # can `docker login ghcr.io` and pull. github.actor is the user
-      # that triggered the run; GITHUB_TOKEN has read:packages for
-      # this repo's packages. Both have ~hours-of-validity, plenty
-      # for the deploy step.
       GHCR_USER:  ${{ github.actor }}
-      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GHCR_TOKEN: ${{ secrets.GHCR_PAT }}
     steps:
-      # ─── 1. Login + pull on the VPS ──────────────────────────
-      # Mirrors `manual-deploy.sh` step 5: the VPS authenticates to
-      # ghcr.io with a short-lived token piped from the runner, then
-      # pulls only the image(s) we just built.
+      - uses: actions/checkout@v4
+
+      # ─── 5a. Sync infra/compose/* → /opt/formly/ ─────────────
+      # Picks up changes to docker-compose.yml, Caddyfile, etc.
+      # without a manual scp. The .env is NEVER overwritten — it
+      # holds secrets/domain config the CI doesn't own.
+      - name: VPS — sync compose files
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.HOSTINGER_HOST }}
+          username: ${{ secrets.HOSTINGER_USER }}
+          key: ${{ secrets.HOSTINGER_SSH_KEY }}
+          port: ${{ secrets.HOSTINGER_SSH_PORT || 22 }}
+          source: "infra/compose/docker-compose.yml,infra/compose/Caddyfile,infra/compose/postgres-init.sql"
+          target: "/opt/formly/"
+          strip_components: 2
+          overwrite: true
+
+      # ─── 5b. docker login + pull on VPS ──────────────────────
       - name: VPS — docker login + pull image(s)
         uses: appleboy/ssh-action@v1.2.0
         with:
@@ -240,7 +312,7 @@ jobs:
           key: ${{ secrets.HOSTINGER_SSH_KEY }}
           port: ${{ secrets.HOSTINGER_SSH_PORT || 22 }}
           envs: DEPLOY_API,DEPLOY_WEB,API_IMAGE,WEB_IMAGE,GHCR_USER,GHCR_TOKEN
-          command_timeout: 10m
+          command_timeout: 5m
           script: |
             set -euo pipefail
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
@@ -253,11 +325,11 @@ jobs:
               docker pull "$WEB_IMAGE"
             fi
 
-      # ─── 2. Rewrite /opt/formly/.env ─────────────────────────
-      # Compose reads ${API_IMAGE} / ${WEB_IMAGE} from .env. Updating
-      # those lines is how we tell compose to use the freshly-pulled
-      # image on the next `up -d`.
-      - name: VPS — update /opt/formly/.env with new image tag(s)
+      # ─── 5c. Update /opt/formly/.env + compose up ────────────
+      # One SSH session for both — saves a second handshake. The
+      # update-then-up sequence must stay atomic; running them in
+      # separate steps risks compose seeing stale env vars.
+      - name: VPS — update .env and bring stack up
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.HOSTINGER_HOST }}
@@ -265,9 +337,18 @@ jobs:
           key: ${{ secrets.HOSTINGER_SSH_KEY }}
           port: ${{ secrets.HOSTINGER_SSH_PORT || 22 }}
           envs: DEPLOY_API,DEPLOY_WEB,API_IMAGE,WEB_IMAGE,IMAGE_TAG
+          command_timeout: 10m
           script: |
             set -euo pipefail
             cd /opt/formly
+
+            # Append IMAGE_* lines to .env if they don't exist yet.
+            # Lets a freshly-bootstrapped host work even if .env.example
+            # didn't include them. Idempotent: grep gates the append.
+            grep -q '^API_IMAGE=' .env || echo "API_IMAGE=" >> .env
+            grep -q '^WEB_IMAGE=' .env || echo "WEB_IMAGE=" >> .env
+            grep -q '^IMAGE_TAG=' .env || echo "IMAGE_TAG=" >> .env
+
             if [ "$DEPLOY_API" = "true" ]; then
               sed -i "s|^API_IMAGE=.*|API_IMAGE=$API_IMAGE|" .env
             fi
@@ -277,24 +358,6 @@ jobs:
             sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=$IMAGE_TAG|" .env
             echo "--- post-edit:"
             grep -E '^(API_IMAGE|WEB_IMAGE|IMAGE_TAG)=' .env
-
-      # ─── 3. Recreate only the changed services ───────────────
-      # First-time deploys bring up the whole stack (postgres, caddy,
-      # everything). Subsequent deploys only recreate api/web with
-      # --no-deps so the database doesn't get bounced just because
-      # api depends on it.
-      - name: VPS — docker compose up
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.HOSTINGER_HOST }}
-          username: ${{ secrets.HOSTINGER_USER }}
-          key: ${{ secrets.HOSTINGER_SSH_KEY }}
-          port: ${{ secrets.HOSTINGER_SSH_PORT || 22 }}
-          envs: DEPLOY_API,DEPLOY_WEB
-          command_timeout: 10m
-          script: |
-            set -euo pipefail
-            cd /opt/formly
 
             services=""
             [ "$DEPLOY_API" = "true" ] && services="$services api"
@@ -308,18 +371,27 @@ jobs:
               echo "(incremental — recreating: $services)"
               docker compose up -d --no-deps $services
             fi
+            echo
             docker compose ps
 
-      # ─── 4. Smoke tests ──────────────────────────────────────
-      # Hit the public domain so we're testing through Caddy / TLS /
-      # DNS — not just the container's local port. Generous retry
-      # window because Caddy fetches a fresh Let's Encrypt cert on
-      # cold-start of a new domain (happens on first deploy only).
+            # Trim images older than a week so the disk doesn't fill.
+            docker image prune -af --filter "until=168h" || true
 
+  # ═════════════════════════════════════════════════════════════
+  # 6. SMOKE TESTS — separate job so a deploy-success/test-failure
+  #    is visually distinct from a deploy failure in GHA UI.
+  # ═════════════════════════════════════════════════════════════
+  smoke:
+    needs: [plan, deploy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
       - name: Smoke test API
         if: needs.plan.outputs.deploy_api == 'true'
         run: |
           set -euo pipefail
+          # Generous retry: Caddy may be fetching a Let's Encrypt cert
+          # on first deploy of a new domain (~30-60s).
           for i in $(seq 1 12); do
             if curl -fsS --max-time 5 "https://${{ vars.API_DOMAIN }}/healthz" >/dev/null; then
               echo "API healthy on attempt $i"
@@ -344,3 +416,14 @@ jobs:
           done
           echo "::error::Web health check failed"
           exit 1
+
+      - name: Deployment summary
+        if: success()
+        run: |
+          {
+            echo "## Deploy succeeded ✅"
+            echo "- Tag: \`${GITHUB_REF_NAME}\`"
+            echo "- Image tag: \`${{ needs.plan.outputs.image_tag }}\`"
+            echo "- API: ${{ needs.plan.outputs.deploy_api }}"
+            echo "- Web: ${{ needs.plan.outputs.deploy_web }}"
+          } >> "$GITHUB_STEP_SUMMARY"
