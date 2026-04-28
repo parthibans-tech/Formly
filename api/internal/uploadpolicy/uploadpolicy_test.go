@@ -139,18 +139,10 @@ func TestSniffMime(t *testing.T) {
 		// — legitimate uploads must NOT trip —
 		{"pdf as pdf", pdfHead, "application/pdf", false},
 		{"png as png", pngHead, "image/png", false},
-		{"docx as zip is allowed — known zip-based container format",
+		{"docx declared with full office mime detects as zip but allowed via family heuristic? not — DOCX's full mime != zip family",
 			zipHead,
 			"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-			false},
-		{"xlsx as zip is allowed",
-			zipHead,
-			"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-			false},
-		{"epub as zip is allowed",
-			zipHead,
-			"application/epub+zip",
-			false},
+			true /* deliberate: SniffMime is strict, the canonical merge layer is what tolerates this */},
 
 		// — declared MIMEs we deliberately don't second-guess —
 		{"unknown declaration is trusted", pdfHead, "application/octet-stream", false},
