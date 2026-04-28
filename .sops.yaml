@@ -1,0 +1,22 @@
+# SOPS encryption rules.
+#
+# Maps a path pattern → list of age recipients allowed to decrypt.
+# Each developer + the CI runner appears as their public key here.
+# To add a teammate: append their pubkey to `age:` and run
+# `sops updatekeys infra/compose/.env.sops api/.env.sops`.
+# To rotate a compromised key: REMOVE its line, generate a new key,
+# add the new pubkey, and `sops updatekeys` — old encrypted blobs
+# stay decryptable by remaining recipients.
+#
+# The unencrypted_regex carve-out keeps non-secret values readable in
+# git diffs (DOMAIN_*, NEXT_PUBLIC_*, IMAGE_*, ports, flags) — only
+# the actual secret VALUES get encrypted, not the keys.
+
+creation_rules:
+  - path_regex: \.env\.sops$
+    encrypted_regex: '^(.*_(SECRET|PASSWORD|KEY|TOKEN|PAT|CREDENTIALS|PRIVATE)|JWT_SECRET|DATABASE_URL|RESEND_API_KEY|RAZORPAY_.*|STRIPE_.*|SES_.*|GHCR_.*|MINIO_ROOT_.*|ONLYOFFICE_JWT_.*|AI_API_KEY|PLATFORM_ROOT_ORG_ID)$'
+    age:
+      # — Developers —
+      - age12vtg06u8mzgc4ceg5kksttmg9uldp6s08wh92kzr74zldv0w5vmsyv5sgd  # parthisri (laptop)
+      # — CI —
+      - age1l29mvzsxxuj8e7dtqs2k5hefx0rxtpcgsqejy8cxtpu0sfkgh45qyjyprh  # github-actions

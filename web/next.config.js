@@ -95,17 +95,28 @@ function buildDefaultCSP() {
   // except via /inline-preview which is the API origin).
   const storageOrigin = originOf(storageUrl);
   const apiOrigin = originOf(apiUrl);
+  // ONLYOFFICE document server origin. We inject its api.js (script-src),
+  // it XHRs back to itself (connect-src), and the editor renders inside
+  // an iframe it owns (frame-src). All three directives must allow it.
+  const onlyOfficeOrigin = process.env.NEXT_PUBLIC_ONLYOFFICE_URL
+    ? originOf(process.env.NEXT_PUBLIC_ONLYOFFICE_URL)
+    : "";
   // frame-src needs both: PDF previews iframe storage URLs directly,
-  // image/text previews iframe the API's /inline-preview endpoint.
-  const frameOrigins = Array.from(new Set([apiOrigin, storageOrigin])).join(
-    " ",
-  );
+  // image/text previews iframe the API's /inline-preview endpoint,
+  // and ONLYOFFICE renders the editor in its own iframe.
+  const frameOrigins = Array.from(
+    new Set([apiOrigin, storageOrigin, onlyOfficeOrigin].filter(Boolean)),
+  ).join(" ");
+  const scriptOrigins = onlyOfficeOrigin ? ` ${onlyOfficeOrigin}` : "";
+  const connectAll = Array.from(
+    new Set([apiOrigin, storageOrigin, onlyOfficeOrigin].filter(Boolean)),
+  ).join(" ");
   return [
     "default-src 'self'",
-    "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+    `script-src 'self' 'unsafe-inline' 'unsafe-eval'${scriptOrigins}`,
     "style-src 'self' 'unsafe-inline'",
     `img-src 'self' data: blob: https: ${storageOrigin}`,
-    `connect-src 'self' ${connectOrigins}`,
+    `connect-src 'self' ${connectAll}`,
     "font-src 'self' data:",
     `frame-src 'self' ${frameOrigins}`,
     `media-src 'self' blob: ${storageOrigin}`,

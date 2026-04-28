@@ -253,6 +253,8 @@ jobs:
             ${{ env.REGISTRY }}/${{ needs.plan.outputs.repo_lower }}-web:latest
           build-args: |
             NEXT_PUBLIC_API_URL=https://${{ vars.API_DOMAIN }}
+            NEXT_PUBLIC_STORAGE_URL=https://${{ vars.S3_DOMAIN || vars.API_DOMAIN }}
+            NEXT_PUBLIC_ONLYOFFICE_URL=https://${{ vars.OFFICE_DOMAIN || vars.API_DOMAIN }}
           cache-from: type=gha,scope=web
           cache-to: type=gha,scope=web,mode=max
 
@@ -287,10 +289,41 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ─── 5a. Sync infra/compose/* → /opt/formly/ ─────────────
-      # Picks up changes to docker-compose.yml, Caddyfile, etc.
-      # without a manual scp. The .env is NEVER overwritten — it
-      # holds secrets/domain config the CI doesn't own.
+      # ─── 5a. Sync infra/compose/* + decrypt secrets → /opt/formly/
+      # docker-compose.yml + Caddyfile sync from the repo. The .env is
+      # decrypted from infra/compose/.env.sops on the runner using the
+      # SOPS_AGE_KEY secret, then scp'd as .env.decrypted and renamed
+      # to .env on the VPS. Whoever has the age private key is the
+      # source of truth for production secrets — not the VPS itself.
+      # Decrypt the SOPS-encrypted .env on the runner BEFORE shipping
+      # to the VPS. The runner's age private key is the SOPS_AGE_KEY
+      # secret; it never lands on disk on the VPS.
+      - name: Install sops + age
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/getsops/sops/releases/download/v3.9.1/sops-v3.9.1.linux.amd64" \
+            -o /usr/local/bin/sops
+          chmod +x /usr/local/bin/sops
+          sudo apt-get install -y age
+          sops --version
+
+      - name: Decrypt .env from infra/compose/.env.sops
+        env:
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SOPS_AGE_KEY:-}" ]; then
+            echo "::error::SOPS_AGE_KEY secret is empty"
+            echo "  Generate a CI keypair, add the pubkey to .sops.yaml,"
+            echo "  re-encrypt with \`sops updatekeys\`, then:"
+            echo "    gh secret set SOPS_AGE_KEY < /path/to/ci-private-key.txt"
+            exit 1
+          fi
+          sops --decrypt --input-type dotenv --output-type dotenv \
+            infra/compose/.env.sops > infra/compose/.env.decrypted
+          chmod 600 infra/compose/.env.decrypted
+          echo "decrypted $(wc -l < infra/compose/.env.decrypted) lines"
+
       - name: VPS — sync compose files
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -298,10 +331,23 @@ jobs:
           username: ${{ secrets.HOSTINGER_USER }}
           key: ${{ secrets.HOSTINGER_SSH_KEY }}
           port: ${{ secrets.HOSTINGER_SSH_PORT || 22 }}
-          source: "infra/compose/docker-compose.yml,infra/compose/Caddyfile,infra/compose/postgres-init.sql"
+          source: "infra/compose/docker-compose.yml,infra/compose/Caddyfile,infra/compose/postgres-init.sql,infra/compose/.env.decrypted"
           target: "/opt/formly/"
           strip_components: 2
           overwrite: true
+
+      - name: VPS — install decrypted env
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOSTINGER_HOST }}
+          username: ${{ secrets.HOSTINGER_USER }}
+          key: ${{ secrets.HOSTINGER_SSH_KEY }}
+          port: ${{ secrets.HOSTINGER_SSH_PORT || 22 }}
+          script: |
+            set -euo pipefail
+            cd /opt/formly
+            mv .env.decrypted .env
+            chmod 600 .env
 
       # ─── 5b. docker login + pull on VPS ──────────────────────
       - name: VPS — docker login + pull image(s)

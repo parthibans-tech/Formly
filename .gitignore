@@ -1,6 +1,13 @@
-# env
+# env — plaintext secrets MUST stay out of git. Encrypted siblings
+# (*.env.sops) live in the repo and are decrypted via SOPS.
 api/.env
+infra/compose/.env
 web/.env.local
+# Belt-and-suspenders: catch any *.env at any depth, but allow .sops
+# encrypted files and the committed .env.example template.
+*.env
+!*.env.sops
+!*.env.example
 
 # node / next
 web/node_modules/

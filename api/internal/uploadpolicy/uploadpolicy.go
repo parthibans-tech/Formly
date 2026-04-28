@@ -405,7 +405,35 @@ func SniffMime(headBytes []byte, declared string) (detected string, mismatch boo
 		// text/plain vs text/html etc. — too noisy to flag.
 		return detected, false
 	}
+	// ZIP-based container formats (docx, xlsx, pptx, odt, ods, odp, epub,
+	// jar, apk, …) all legitimately sniff as application/zip because they
+	// ARE zip archives. Don't flag the mismatch — the declared MIME wins
+	// via CanonicalMime once we get past this gate. Match against the raw
+	// declaration (pre-family) so suffixes like +zip / +xml are kept.
+	if d1 == "application/zip" && isZipBasedFormat(strings.ToLower(strings.TrimSpace(declared))) {
+		return detected, false
+	}
 	return detected, d1 != d2
+}
+
+// isZipBasedFormat reports whether the declared MIME is a known
+// container format whose underlying bytes are a ZIP archive. Used by
+// SniffMime to suppress false-positive mismatches (DOCX, XLSX, etc.).
+func isZipBasedFormat(declared string) bool {
+	switch declared {
+	case
+		"application/vnd.openxmlformats-officedocument.wordprocessingml.document", // .docx
+		"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",       // .xlsx
+		"application/vnd.openxmlformats-officedocument.presentationml.presentation", // .pptx
+		"application/vnd.oasis.opendocument.text",         // .odt
+		"application/vnd.oasis.opendocument.spreadsheet",  // .ods
+		"application/vnd.oasis.opendocument.presentation", // .odp
+		"application/epub+zip",                            // .epub
+		"application/java-archive",                        // .jar
+		"application/vnd.android.package-archive":         // .apk
+		return true
+	}
+	return false
 }
 
 // CanonicalMime decides which MIME to PERSIST after a successful upload.

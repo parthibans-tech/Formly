@@ -1,0 +1,119 @@
+# Hybrid dev: backing services only.
+#
+# Runs postgres, redis, minio (+ optional onlyoffice / ollama) in Docker
+# with ports exposed to the host. The api, worker and web run natively
+# via `go run` / `npm run dev` and reach these services on localhost.
+#
+# Usage:
+#   docker compose -f infra/compose/docker-compose.deps.yml up -d
+#   docker compose -f infra/compose/docker-compose.deps.yml --profile office up -d
+#   docker compose -f infra/compose/docker-compose.deps.yml --profile ai up -d
+#
+# Or use the wrapper: scripts/dev.sh
+
+name: formly-dev
+
+networks:
+  default:
+    name: formly-dev
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: docforge
+      POSTGRES_PASSWORD: docforge
+      POSTGRES_DB: docforge
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/01-vector.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docforge -d docforge"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # console
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  minio-mc:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/docforge &&
+      mc anonymous set download local/docforge || true;
+      echo 'minio bucket ready';
+      "
+    restart: "no"
+
+  # Heavy services — opt in via --profile.
+  onlyoffice:
+    image: onlyoffice/documentserver:latest
+    profiles: ["office"]
+    restart: unless-stopped
+    ports:
+      - "8090:80"
+    environment:
+      JWT_ENABLED: "true"
+      JWT_SECRET: dev-onlyoffice-secret
+      JWT_HEADER: AuthorizationJwt
+    # Lets the doc server reach the natively-run API at host.docker.internal:8080
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - onlyoffice_data:/var/www/onlyoffice/Data
+      - onlyoffice_log:/var/log/onlyoffice
+      - onlyoffice_cache:/var/lib/onlyoffice
+      - onlyoffice_db:/var/lib/postgresql
+
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["ai"]
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+volumes:
+  postgres_data:
+  minio_data:
+  onlyoffice_data:
+  onlyoffice_log:
+  onlyoffice_cache:
+  onlyoffice_db:
+  ollama_data:
