@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 #
-# Formly API — multi-stage build.
+# Drive360 API — multi-stage build.
 #
 # Stage 1 (builder): pull deps, compile a static linux/amd64 binary.
 #   Why static: the runtime stage is `scratch`-class (distroless),
@@ -43,7 +43,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     go build \
         -trimpath \
         -ldflags="-s -w -X main.version=${VERSION}" \
-        -o /out/formly-api \
+        -o /out/drive360-api \
         ./cmd/api
 
 # ---------- runtime ----------
@@ -72,19 +72,19 @@ RUN apt-get update \
 # loosening this avoids surprise breakage if a downstream feature
 # reaches for `convert`.
 RUN if [ -f /etc/ImageMagick-6/policy.xml ]; then \
-      sed -i 's|<policy domain="coder" rights="none" pattern="PDF" />|<!-- pdf coder allowed for formly -->|' \
+      sed -i 's|<policy domain="coder" rights="none" pattern="PDF" />|<!-- pdf coder allowed for drive360 -->|' \
         /etc/ImageMagick-6/policy.xml || true; \
     fi
 
 # Non-root runtime user.
-RUN groupadd --system --gid 1000 formly \
- && useradd  --system --uid 1000 --gid formly --home-dir /app --shell /usr/sbin/nologin formly
+RUN groupadd --system --gid 1000 drive360 \
+ && useradd  --system --uid 1000 --gid drive360 --home-dir /app --shell /usr/sbin/nologin drive360
 
 WORKDIR /app
-COPY --from=builder /out/formly-api /app/formly-api
+COPY --from=builder /out/drive360-api /app/drive360-api
 COPY migrations /app/migrations
-RUN chown -R formly:formly /app
-USER formly
+RUN chown -R drive360:drive360 /app
+USER drive360
 
 # LISTEN_ADDR is read by main.go (see cmd/api/main.go). Default
 # binds to all interfaces inside the container — Docker network
@@ -97,4 +97,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD curl -fsS http://127.0.0.1:8080/healthz || exit 1
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["/app/formly-api"]
+CMD ["/app/drive360-api"]

@@ -4,13 +4,16 @@
 #
 # This is the DOCKER-COMPOSE flavour of bootstrap. Everything that
 # runs the application is a container managed by
-# /opt/formly/docker-compose.yml. This script:
+# /opt/drive360/docker-compose.yml. This script:
+#
+# nginx (host-level) is managed separately — see
+# infra/nginx/drive360.conf and the one-time setup notes there.
 #
 #   1. Installs Docker engine + compose plugin.
 #   2. Installs git (to fetch infra/compose/ files) and curl.
 #   3. Creates a `deploy` user with SSH access and Docker
 #      privileges (member of the `docker` group).
-#   4. Lays out /opt/formly/ with the compose stack files.
+#   4. Lays out /opt/drive360/ with the compose stack files.
 #   5. Generates a starter .env from .env.example, with random
 #      passwords pre-filled (you still need to set domain values).
 #   6. Sets up UFW for ports 22, 80, 443.
@@ -32,7 +35,7 @@
 # Usage:
 #   sudo bash scripts/deploy/bootstrap-vps.sh
 #   # or with overrides:
-#   sudo DEPLOY_USER=deploy COMPOSE_DIR=/opt/formly bash bootstrap-vps.sh
+#   sudo DEPLOY_USER=deploy COMPOSE_DIR=/opt/drive360 bash bootstrap-vps.sh
 
 set -euo pipefail
 
@@ -42,7 +45,7 @@ if [ "${EUID:-$(id -u)}" -ne 0 ]; then
 fi
 
 DEPLOY_USER="${DEPLOY_USER:-deploy}"
-COMPOSE_DIR="${COMPOSE_DIR:-/opt/formly}"
+COMPOSE_DIR="${COMPOSE_DIR:-/opt/drive360}"
 
 echo "==> [1/6] OS packages"
 export DEBIAN_FRONTEND=noninteractive
@@ -87,7 +90,7 @@ touch "/home/$DEPLOY_USER/.ssh/authorized_keys"
 chown "$DEPLOY_USER:$DEPLOY_USER" "/home/$DEPLOY_USER/.ssh/authorized_keys"
 chmod 600 "/home/$DEPLOY_USER/.ssh/authorized_keys"
 
-echo "==> [4/6] /opt/formly layout"
+echo "==> [4/6] /opt/drive360 layout"
 install -d -o "$DEPLOY_USER" -g "$DEPLOY_USER" "$COMPOSE_DIR"
 
 # Copy compose stack files. The script lives at
@@ -100,15 +103,13 @@ if [ -f "$COMPOSE_SRC/docker-compose.yml" ]; then
   install -m 644 -o "$DEPLOY_USER" -g "$DEPLOY_USER" \
     "$COMPOSE_SRC/docker-compose.yml" "$COMPOSE_DIR/docker-compose.yml"
   install -m 644 -o "$DEPLOY_USER" -g "$DEPLOY_USER" \
-    "$COMPOSE_SRC/Caddyfile" "$COMPOSE_DIR/Caddyfile"
-  install -m 644 -o "$DEPLOY_USER" -g "$DEPLOY_USER" \
     "$COMPOSE_SRC/postgres-init.sql" "$COMPOSE_DIR/postgres-init.sql"
   install -m 644 -o "$DEPLOY_USER" -g "$DEPLOY_USER" \
     "$COMPOSE_SRC/.env.example" "$COMPOSE_DIR/.env.example"
 else
   echo "(repo not present locally — fetching from github)"
-  base="https://raw.githubusercontent.com/your-github-username/Formly/main/infra/compose"
-  for f in docker-compose.yml Caddyfile postgres-init.sql .env.example; do
+  base="https://raw.githubusercontent.com/your-github-username/Drive360/main/infra/compose"
+  for f in docker-compose.yml postgres-init.sql .env.example; do
     curl -fsSL "$base/$f" -o "$COMPOSE_DIR/$f"
     chown "$DEPLOY_USER:$DEPLOY_USER" "$COMPOSE_DIR/$f"
   done
@@ -159,7 +160,6 @@ cat <<EOF
   2. Edit $COMPOSE_DIR/.env and set:
        DOMAIN_WEB=drive360.nearbyme.app
        DOMAIN_API=api.drive360.nearbyme.app
-       ACME_EMAIL=you@nearbyme.app
      (Random secrets are already pre-filled.)
 
   3. Point DNS A records at this VPS:

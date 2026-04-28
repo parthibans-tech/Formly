@@ -29,11 +29,11 @@
 #   ./scripts/deploy/manual-deploy.sh
 #
 # Optional environment overrides:
-#   GHCR_REPO     — owner/repo path on ghcr.io  (default $GHCR_USER/formly)
+#   GHCR_REPO     — owner/repo path on ghcr.io  (default $GHCR_USER/drive360)
 #   VPS_HOST      — VPS IP / hostname           (default 72.62.243.151)
 #   VPS_USER      — SSH user                    (default deploy)
 #   VPS_PORT      — SSH port                    (default 22)
-#   SSH_KEY       — path to private key         (default ~/.ssh/formly_deploy)
+#   SSH_KEY       — path to private key         (default ~/.ssh/hostinger_deploy)
 #   IMAGE_TAG     — image tag                   (default git short SHA)
 #   ONLY          — api / web / both            (default both)
 #   PLATFORM      — target arch                 (default linux/amd64)
@@ -47,13 +47,13 @@ set -euo pipefail
 
 # Lowercase the user — ghcr requires lowercase image paths.
 GHCR_USER_LOWER="$(echo "$GHCR_USER" | tr '[:upper:]' '[:lower:]')"
-GHCR_REPO="${GHCR_REPO:-${GHCR_USER_LOWER}/formly}"
+GHCR_REPO="${GHCR_REPO:-${GHCR_USER_LOWER}/drive360}"
 GHCR_REPO="$(echo "$GHCR_REPO" | tr '[:upper:]' '[:lower:]')"
 
 VPS_HOST="${VPS_HOST:-72.62.243.151}"
 VPS_USER="${VPS_USER:-deploy}"
 VPS_PORT="${VPS_PORT:-22}"
-SSH_KEY="${SSH_KEY:-$HOME/.ssh/formly_deploy}"
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/hostinger_deploy}"
 ONLY="${ONLY:-both}"
 PLATFORM="${PLATFORM:-linux/amd64}"
 
@@ -117,8 +117,8 @@ echo "    ok"
 # script runs on an Apple Silicon Mac. Buildx + --push streams the
 # image straight to ghcr.io without a local intermediate copy.
 echo "==> [4/6] Building + pushing image(s) — this is the slow step"
-docker buildx inspect formly-builder >/dev/null 2>&1 \
-  || docker buildx create --name formly-builder --use >/dev/null
+docker buildx inspect drive360-builder >/dev/null 2>&1 \
+  || docker buildx create --name drive360-builder --use >/dev/null
 
 build_and_push() {
   local context="$1"
@@ -145,11 +145,11 @@ esac
 case "$ONLY" in
   web|both)
     # NEXT_PUBLIC_API_URL is baked into the JS bundle at build time.
-    # Pull it from /opt/formly/.env on the VPS so we use whatever
+    # Pull it from /opt/drive360/.env on the VPS so we use whatever
     # DOMAIN_API the operator set.
-    API_DOMAIN="$(ssh_run "grep '^DOMAIN_API=' /opt/formly/.env | cut -d= -f2-")"
+    API_DOMAIN="$(ssh_run "grep '^DOMAIN_API=' /opt/drive360/.env | cut -d= -f2-")"
     if [ -z "$API_DOMAIN" ]; then
-      echo "❌ DOMAIN_API not set in /opt/formly/.env on the VPS" >&2
+      echo "❌ DOMAIN_API not set in /opt/drive360/.env on the VPS" >&2
       exit 1
     fi
     build_and_push "$REPO_ROOT/web" "$WEB_IMAGE" \
@@ -170,7 +170,7 @@ ssh -i "$SSH_KEY" -p "$VPS_PORT" \
      IMAGE_TAG='$IMAGE_TAG' ONLY='$ONLY' bash -se" <<'REMOTE'
 set -euo pipefail
 
-cd /opt/formly
+cd /opt/drive360
 
 echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
@@ -204,7 +204,7 @@ ssh -i "$SSH_KEY" -p "$VPS_PORT" \
     "$VPS_USER@$VPS_HOST" \
     "SERVICES='$SERVICES' bash -se" <<'REMOTE'
 set -euo pipefail
-cd /opt/formly
+cd /opt/drive360
 # First time? Bring up the world. After that, only recreate changed services.
 if ! docker compose ps --quiet | grep -q .; then
   echo "(first run — starting full stack)"
@@ -232,10 +232,10 @@ cat <<EOF
     curl -fsSI https://drive360.nearbyme.app/
 
   Logs:
-    ssh $VPS_USER@$VPS_HOST 'cd /opt/formly && docker compose logs -f api web'
+    ssh $VPS_USER@$VPS_HOST 'cd /opt/drive360 && docker compose logs -f api web'
 
   Rollback to a previous tag (run on VPS):
-    cd /opt/formly
+    cd /opt/drive360
     sed -i 's|^API_IMAGE=.*|API_IMAGE=ghcr.io/${GHCR_REPO}-api:<old-tag>|' .env
     sed -i 's|^WEB_IMAGE=.*|WEB_IMAGE=ghcr.io/${GHCR_REPO}-web:<old-tag>|' .env
     docker compose up -d --no-deps api web

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 #
-# Formly Web — multi-stage Next.js build using `output: standalone`.
+# Drive360 Web — multi-stage Next.js build using `output: standalone`.
 #
 # Stage 1 (deps):     install node_modules with the lockfile.
 # Stage 2 (builder):  copy deps + source, run `next build`.
@@ -70,8 +70,8 @@ ENV HOSTNAME=0.0.0.0
 # node:alpine ships with a `node` user at 1000 — delete it first so
 # we can reclaim that uid/gid for our own user.
 RUN deluser --remove-home node 2>/dev/null || true \
- && addgroup --system --gid 1000 formly \
- && adduser  --system --uid 1000 --ingroup formly --home /app --shell /sbin/nologin formly
+ && addgroup --system --gid 1000 drive360 \
+ && adduser  --system --uid 1000 --ingroup drive360 --home /app --shell /sbin/nologin drive360
 
 # tini for proper signal forwarding (same reason as the API image).
 RUN apk add --no-cache tini curl
@@ -79,11 +79,11 @@ RUN apk add --no-cache tini curl
 # Standalone tree + static + public. The standalone build emits a
 # server.js that's the entrypoint. Static and public are excluded
 # from the standalone tree by Next, so we copy them explicitly.
-COPY --from=builder --chown=formly:formly /app/.next/standalone ./
-COPY --from=builder --chown=formly:formly /app/.next/static ./.next/static
-COPY --from=builder --chown=formly:formly /app/public ./public
+COPY --from=builder --chown=drive360:drive360 /app/.next/standalone ./
+COPY --from=builder --chown=drive360:drive360 /app/.next/static ./.next/static
+COPY --from=builder --chown=drive360:drive360 /app/public ./public
 
-USER formly
+USER drive360
 
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
