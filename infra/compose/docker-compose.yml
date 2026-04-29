@@ -87,7 +87,13 @@ services:
       AI_TIMEOUT_SEC: ${AI_TIMEOUT_SEC:-180}
       DOCCHAT_TIMEOUT_SEC: ${DOCCHAT_TIMEOUT_SEC:-180}
       # ── ONLYOFFICE ──
-      ONLYOFFICE_URL: http://onlyoffice
+      # ONLYOFFICE_PUBLIC_URL is the URL the BROWSER loads api.js from.
+      # Must be HTTPS in prod (matches DOMAIN_OFFICE behind nginx).
+      # ONLYOFFICE_INTERNAL_API_URL is the URL the document server uses
+      # to call BACK to the API (download / save callbacks). Inside
+      # the docker network the API is reachable as http://api:8080.
+      ONLYOFFICE_PUBLIC_URL: ${ONLYOFFICE_PUBLIC_URL:-https://${DOMAIN_OFFICE}}
+      ONLYOFFICE_INTERNAL_API_URL: ${ONLYOFFICE_INTERNAL_API_URL:-http://api:8080}
       ONLYOFFICE_JWT_SECRET: ${ONLYOFFICE_JWT_SECRET}
       # ── Misc ──
       LISTEN_ADDR: ":8080"
@@ -125,9 +131,16 @@ services:
       context: ../../web
       dockerfile: Dockerfile
       args:
-        # NEXT_PUBLIC_* baked into the bundle at build time.
+        # NEXT_PUBLIC_* baked into the bundle at build time. Changing
+        # these requires a fresh `web` image — the values are compiled
+        # into the JS bundle and CSP headers, NOT read at runtime.
         NEXT_PUBLIC_API_URL: https://${DOMAIN_API}
-        NEXT_PUBLIC_STORAGE_URL: ${PUBLIC_STORAGE_URL:-https://${DOMAIN_API}}
+        # Storage URL is the public MinIO host (DOMAIN_S3). Browsers
+        # POST presigned uploads here, and the CSP connect-src/frame-src
+        # directives in next.config.js whitelist exactly this origin.
+        # Falls back to the API domain only if DOMAIN_S3 isn't set
+        # (e.g. uploads proxied through the API instead).
+        NEXT_PUBLIC_STORAGE_URL: ${PUBLIC_STORAGE_URL:-https://${DOMAIN_S3:-${DOMAIN_API}}}
     restart: unless-stopped
     environment:
       # Server-side env (the Next.js node process). Anything the SSR

@@ -37,6 +37,9 @@
 # REQUIRED REPO VARIABLES (Settings → Variables → Actions):
 #   API_DOMAIN           — api.drive360.nearbyme.app
 #   WEB_DOMAIN           — drive360.nearbyme.app
+#   S3_DOMAIN            — s3.drive360.nearbyme.app
+#                          Baked into the web bundle's CSP at build time.
+#                          Required for direct browser→MinIO uploads.
 #
 # ONE-TIME VPS BOOTSTRAP (must be done BEFORE first CI deploy):
 #   1. Run scripts/deploy/bootstrap-vps.sh on the VPS as root.
@@ -120,6 +123,7 @@ jobs:
           missing=""
           [ -z "${{ vars.API_DOMAIN }}" ] && missing="$missing API_DOMAIN"
           [ -z "${{ vars.WEB_DOMAIN }}" ] && missing="$missing WEB_DOMAIN"
+          [ -z "${{ vars.S3_DOMAIN }}"  ] && missing="$missing S3_DOMAIN"
           if [ -n "$missing" ]; then
             echo "::error::Missing repo Variables:$missing"
             echo "  Set at: Settings → Secrets and variables → Actions → Variables"
@@ -260,6 +264,7 @@ jobs:
             ${{ env.REGISTRY }}/${{ needs.plan.outputs.repo_lower }}-web:latest
           build-args: |
             NEXT_PUBLIC_API_URL=https://${{ vars.API_DOMAIN }}
+            NEXT_PUBLIC_STORAGE_URL=https://${{ vars.S3_DOMAIN }}
           cache-from: type=gha,scope=web
           cache-to: type=gha,scope=web,mode=max
 
