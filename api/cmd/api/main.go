@@ -670,10 +670,10 @@ func main() {
 		// stays a clean default for normal users.
 		r.Get("/v1/admin/email/sends", mh.ListSendsAdmin)
 
-		// Super-admin user management. The middleware checks role=admin
-		// and (when set) PLATFORM_ROOT_ORG_ID — letting org admins keep
-		// their per-workspace controls untouched while reserving these
-		// platform-wide endpoints for the operator org.
+		// Super-admin user management. requireSuperAdmin checks the
+		// users.is_super_admin column (via Claims.IsSuper) — letting
+		// org admins keep their per-workspace controls untouched while
+		// reserving these platform-wide endpoints for the operator.
 		r.Route("/v1/admin/users", func(r chi.Router) {
 			r.Use(requireSuperAdmin)
 			r.Get("/", pu.List)
@@ -917,15 +917,9 @@ func (a teamMailerAdapter) Send(ctx context.Context, opts team.NotifyOptions) (s
 
 // requireSuperAdmin gates the /v1/admin/users/* routes.
 //
-// Two-step check:
-//  1. Caller must already be authenticated as an admin (role=admin) —
-//     same gate the per-org admin endpoints use.
-//  2. If PLATFORM_ROOT_ORG_ID is set in the environment, the caller's
-//     org must match it. This is what separates "I'm the admin of my
-//     own little workspace" from "I run the platform." If the env var
-//     is unset (typical in dev), step 2 is skipped so a single admin
-//     can wear both hats — useful before you have a dedicated
-//     operator org provisioned.
+// Authoritative source: users.is_super_admin (migration 049), surfaced
+// onto the JWT via Claims.IsSuper. Org-level admins (admin of their
+// own workspace) get 403 here; only the platform operator passes.
 //
 // The middleware writes nothing — handlers do their own audit logging
 // once they know the action succeeded.

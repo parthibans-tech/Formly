@@ -58,9 +58,9 @@ type Item = {
   // The API still enforces authorization — this is purely cosmetic so
   // users don't see links that 403 the moment they're clicked.
   roles?: Role[];
-  // superAdmin: when true, only platform operators (admin of the
-  // PLATFORM_ROOT_ORG_ID workspace) see this. Org admins of other
-  // workspaces won't, even though their role is still "admin".
+  // superAdmin: when true, only platform operators (users with
+  // is_super_admin = true) see this. Org admins of regular workspaces
+  // won't, even though their role is still "admin".
   superAdmin?: boolean;
   // Hint shown under the label in search results so users can tell apart
   // similarly-named items (e.g. "Audit log" vs "Platform audit").
@@ -228,10 +228,10 @@ const SECTIONS: Section[] = [
     id: "platform",
     title: "Platform",
     superAdminOnly: true,
-    // Items here run cross-org and are gated by requireSuperAdmin on the
-    // server (admin of PLATFORM_ROOT_ORG_ID). We mirror that gate on the
-    // client via superAdmin: true so org admins of regular workspaces
-    // don't see links the API would 403 anyway.
+    // Items here run cross-org and are gated by requireSuperAdmin on
+    // the server (users.is_super_admin column). We mirror that gate on
+    // the client via superAdmin: true so org admins of regular
+    // workspaces don't see links the API would 403 anyway.
     items: [
       {
         href: "/settings/admin",

@@ -8,8 +8,8 @@
 //     can't keep mutating data after the tombstone is set.
 //   - org.frozen_at IS NOT NULL  → 423 Locked for non-GET/HEAD/OPTIONS
 //     methods. Reads stay open so an operator can audit before
-//     unfreezing. Super-admin requests (role=admin and, when set,
-//     PLATFORM_ROOT_ORG_ID match) bypass the freeze entirely.
+//     unfreezing. Super-admin requests (claims.IsSuperAdmin via the
+//     users.is_super_admin column) bypass the freeze entirely.
 //
 // We cache the (frozen_at, deleted_at) pair per-org for `cacheTTL` to
 // avoid a DB round-trip on every authenticated request. The cache is
@@ -19,8 +19,6 @@ package orggate
 
 import (
 	"net/http"
-	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -64,7 +62,6 @@ func (c *cache) set(orgID string, s orgState) {
 // according to each org's frozen / deleted flags.
 func Middleware(db *pgxpool.Pool) func(http.Handler) http.Handler {
 	c := &cache{}
-	rootOrg := strings.TrimSpace(os.Getenv("PLATFORM_ROOT_ORG_ID"))
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			claims, _ := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
@@ -72,11 +69,9 @@ func Middleware(db *pgxpool.Pool) func(http.Handler) http.Handler {
 				next.ServeHTTP(w, r)
 				return
 			}
-			// Super-admin from the platform org bypasses the gate
-			// entirely — they need to mutate frozen/deleted orgs to
-			// recover them.
-			isSuper := claims.IsAdmin() && (rootOrg == "" || claims.OrgID == rootOrg)
-			if isSuper {
+			// Super-admin bypasses the gate entirely — they need to
+			// mutate frozen/deleted orgs to recover them.
+			if claims.IsSuperAdmin() {
 				next.ServeHTTP(w, r)
 				return
 			}

@@ -30,10 +30,11 @@ type ctxKey string
 const UserCtxKey ctxKey = "user"
 
 type Claims struct {
-	UserID string `json:"uid"`
-	OrgID  string `json:"oid"`
-	Email  string `json:"email"`
-	Role   string `json:"role,omitempty"` // admin | editor | viewer
+	UserID  string `json:"uid"`
+	OrgID   string `json:"oid"`
+	Email   string `json:"email"`
+	Role    string `json:"role,omitempty"` // admin | editor | viewer
+	IsSuper bool   `json:"sa,omitempty"`   // mirrors users.is_super_admin
 	jwt.RegisteredClaims
 }
 
@@ -49,32 +50,16 @@ const (
 // claims attached to the request context.
 func (c *Claims) IsAdmin() bool { return c != nil && c.Role == RoleAdmin }
 
-// IsSuperAdmin reports whether (role, orgID) qualifies as a platform
-// operator. The model is intentionally simple: there's no super_admin
-// role column. Instead, super-admin = "admin of the designated platform
-// root org", configured via PLATFORM_ROOT_ORG_ID. When that env var is
-// unset (typical in dev / single-tenant) any admin qualifies, so a
-// solo operator can wear both hats without provisioning a separate org.
+// IsSuperAdmin on Claims is the canonical check — it reads the bit
+// minted into the JWT at login from users.is_super_admin (migration 049).
 //
-// Use this in API handlers when you need the boolean (e.g. to decorate
-// the /v1/me response so the web client can hide platform-only nav).
-// HTTP-level enforcement still flows through requireSuperAdmin in
-// cmd/api so the rule is centralized.
-func IsSuperAdmin(role, orgID string) bool {
-	if role != RoleAdmin {
-		return false
-	}
-	rootOrg := strings.TrimSpace(os.Getenv("PLATFORM_ROOT_ORG_ID"))
-	if rootOrg == "" {
-		return true
-	}
-	return orgID == rootOrg
-}
-
-// IsSuperAdmin on Claims is the convenience method that the same value
-// can be derived directly from a request's claims.
+// Why a column, not env var: the previous model derived super-admin from
+// PLATFORM_ROOT_ORG_ID, which had to be backfilled AFTER the first
+// signup created the platform org. Until then every admin became super-
+// admin, which is a security footgun. The column-backed model boots
+// secure on a fresh DB (the migration seeds exactly one operator).
 func (c *Claims) IsSuperAdmin() bool {
-	return c != nil && IsSuperAdmin(c.Role, c.OrgID)
+	return c != nil && c.IsSuper
 }
 
 type Handler struct {
@@ -127,9 +112,8 @@ type user struct {
 	Name  string `json:"name"`
 	OrgID string `json:"orgId"`
 	Role  string `json:"role,omitempty"`
-	// IsSuperAdmin is derived from (role, orgID) at response time — see
-	// IsSuperAdmin(). It's surfaced so the web client can gate platform-
-	// only UI without re-implementing the env-var rule.
+	// IsSuperAdmin mirrors users.is_super_admin — surfaced so the web
+	// client can gate platform-only UI without making a second call.
 	IsSuperAdmin bool `json:"isSuperAdmin,omitempty"`
 }
 
@@ -181,10 +165,12 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "commit", err.Error())
 		return
 	}
-	token, _ := h.issueToken(userID, orgID, req.Email, RoleAdmin)
+	// New signups never become super-admin. Promotion is a deliberate
+	// platform-operator action (or the seed migration), not a side
+	// effect of self-service registration.
+	token, _ := h.issueTokenSuper(userID, orgID, req.Email, RoleAdmin, false)
 	writeJSON(w, 200, authResp{Token: token, User: user{
 		ID: userID, Email: req.Email, Name: req.Name, OrgID: orgID, Role: RoleAdmin,
-		IsSuperAdmin: IsSuperAdmin(RoleAdmin, orgID),
 	}})
 }
 
@@ -220,6 +206,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 
 	var (
 		id, orgID, name, hash, role string
+		isSuper                     bool
 		lockedAt                    *time.Time
 		lockedReason                *string
 		forcePwReset                bool
@@ -227,12 +214,13 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	)
 	err := h.DB.QueryRow(r.Context(),
 		`SELECT u.id, u.org_id, u.name, u.password_hash, COALESCE(u.role,'editor'),
+		        COALESCE(u.is_super_admin, FALSE),
 		        u.locked_at, u.locked_reason, u.force_pw_reset,
 		        o.deleted_at
 		   FROM users u
 		   LEFT JOIN organizations o ON o.id = u.org_id
 		  WHERE u.email=$1`, req.Email,
-	).Scan(&id, &orgID, &name, &hash, &role, &lockedAt, &lockedReason,
+	).Scan(&id, &orgID, &name, &hash, &role, &isSuper, &lockedAt, &lockedReason,
 		&forcePwReset, &orgDeletedAt)
 	if err != nil {
 		writeErr(w, 401, "invalid_credentials", "bad email or password")
@@ -288,7 +276,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	token, _ := h.issueToken(id, orgID, req.Email, role)
+	token, _ := h.issueTokenSuper(id, orgID, req.Email, role, isSuper)
 	if h.OnLogin != nil {
 		h.OnLogin(r.Context(), id, orgID, token, clientIP(r), r.UserAgent())
 	}
@@ -298,7 +286,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		Token: token,
 		User: user{
 			ID: id, Email: req.Email, Name: name, OrgID: orgID, Role: role,
-			IsSuperAdmin: IsSuperAdmin(role, orgID),
+			IsSuperAdmin: isSuper,
 		},
 		ForcePasswordReset: forcePwReset,
 	})
@@ -417,8 +405,12 @@ func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) issueToken(uid, oid, email, role string) (string, error) {
+	return h.issueTokenSuper(uid, oid, email, role, false)
+}
+
+func (h *Handler) issueTokenSuper(uid, oid, email, role string, isSuper bool) (string, error) {
 	c := Claims{
-		UserID: uid, OrgID: oid, Email: email, Role: role,
+		UserID: uid, OrgID: oid, Email: email, Role: role, IsSuper: isSuper,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
@@ -429,7 +421,8 @@ func (h *Handler) issueToken(uid, oid, email, role string) (string, error) {
 }
 
 // IssueTokenForUser is used by the team-invite accept handler to hand the new
-// user a session token in the same shape Login produces.
+// user a session token in the same shape Login produces. Invitees never
+// arrive as super-admins — that bit is set by migration or platform action.
 func (h *Handler) IssueTokenForUser(uid, oid, email, role string) (string, error) {
 	return h.issueToken(uid, oid, email, role)
 }
