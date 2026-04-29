@@ -80,6 +80,20 @@ function friendlyMessage(status: number, code: string, raw: string): string {
     return "The service is having trouble right now. Please try again in a moment.";
   }
   if (status === 401) {
+    // 401 has multiple distinct meanings on this surface:
+    //   - `invalid_credentials` from /login when the user typed the
+    //     wrong email/password — a fresh failure, NOT a session issue.
+    //   - `invalid_mfa` when the supplied MFA code didn't verify.
+    //   - everything else (`unauthorized`, expired token, missing
+    //     bearer header) — the user had a session and it's gone.
+    // Branching on `code` keeps the login form from telling someone
+    // who's never signed in that their "session has expired".
+    if (code === "invalid_credentials") {
+      return "That email and password didn't match. Please try again.";
+    }
+    if (code === "invalid_mfa") {
+      return "That verification code isn't valid. Please try again.";
+    }
     return "Your session has expired. Please sign in again.";
   }
   if (status === 408 || status === 504) {

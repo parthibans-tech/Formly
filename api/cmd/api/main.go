@@ -53,6 +53,17 @@ import (
 	"github.com/docforge/api/internal/security"
 	"github.com/docforge/api/internal/sessions"
 	"github.com/docforge/api/internal/sharing"
+	"github.com/docforge/api/internal/starterai"
+	"github.com/docforge/api/internal/starterbilling"
+	"github.com/docforge/api/internal/legalai"
+	"github.com/docforge/api/internal/hrai"
+	"github.com/docforge/api/internal/certai"
+	"github.com/docforge/api/internal/letterai"
+	"github.com/docforge/api/internal/reportsai"
+	"github.com/docforge/api/internal/marketingai"
+	"github.com/docforge/api/internal/opsai"
+	"github.com/docforge/api/internal/eventtools"
+	"github.com/docforge/api/internal/eduai"
 	"github.com/docforge/api/internal/storage"
 	"github.com/docforge/api/internal/team"
 	"github.com/docforge/api/internal/templates"
@@ -232,6 +243,27 @@ func main() {
 	opH := ocrprofiles.NewHandler(pool)
 	dcH := docchat.New(pool, store, aiClient, logger).WithOCR(ocrCfg)
 	dcH.Profiles = opH.Registry
+	// Resume / certificate designer surface. Owns the AI cards
+	// (/profile-summary, /cover-letter, /review) and the inline-HTML
+	// render pipeline (/export, /save-to-drive) that powers the
+	// designer's Download and "Save to Drive" buttons. Reuses the
+	// shared aiClient and storage instances; no extra deps.
+	saH := starterai.New(pool, store, aiClient, logger)
+
+	// Category-level starter handlers. Each owns the AI / pure-function
+	// surface for one starter category (Billing, Legal, HR, etc.). All
+	// share the aiClient + logger; none own DB state of their own.
+	// Mount points are documented per-package — see internal/<pkg>/<pkg>.go.
+	sbH := starterbilling.New(aiClient, logger)
+	laH := legalai.New(aiClient, logger)
+	hrH := hrai.New(aiClient, logger)
+	caH := certai.New(aiClient, logger)
+	leH := letterai.New(aiClient, logger)
+	raH := reportsai.New(aiClient, logger)
+	maH := marketingai.New(aiClient, logger)
+	osH := opsai.New(aiClient, logger)
+	etH := eventtools.New(logger)
+	euH := eduai.New(aiClient, logger)
 
 	// Super-admin user management (Phase 1 — list, lock, MFA reset,
 	// session revoke). Routes are protected by the requireSuperAdmin
@@ -466,6 +498,29 @@ func main() {
 		// other AI surfaces; the handler enforces sharing.CanAccessFile
 		// + scanner gate per request, identical to /v1/files/{id}/download.
 		dcH.Mount(r)
+		// Starter / resume designer routes (AI cards + Download +
+		// Save to Drive). Mounted next to the other AI surfaces; the
+		// LLM endpoints share docchat's "ai_disabled when off" gate
+		// and the export ones reuse the same chromium pipeline as the
+		// document-mode renderer.
+		saH.Mount(r)
+		// Category-level starter routes (Billing recalc, Legal redline,
+		// HR JD, Certificates citation, Letter rewrite, Reports
+		// extract-actions / summarize, Marketing section / headline,
+		// Ops SOP, Event ICS / QR, Edu syllabus). Each handler does its
+		// own ai_disabled gating where applicable; the pure-function
+		// endpoints (recalc, redline, ICS, QR) ignore the AI client
+		// entirely.
+		sbH.Mount(r)
+		laH.Mount(r)
+		hrH.Mount(r)
+		caH.Mount(r)
+		leH.Mount(r)
+		raH.Mount(r)
+		maH.Mount(r)
+		osH.Mount(r)
+		etH.Mount(r)
+		euH.Mount(r)
 		// OCR profiles — small read-only list, used by the Extract
 		// Text picker on every designer/preview surface.
 		opH.Mount(r)

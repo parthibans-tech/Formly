@@ -9,13 +9,13 @@ services:
     # `vector` won't be available at all without this image).
     image: pgvector/pgvector:pg16
     environment:
-      POSTGRES_USER: docforge
-      POSTGRES_PASSWORD: docforge
-      POSTGRES_DB: docforge
+      POSTGRES_USER: drive360
+      POSTGRES_PASSWORD: drive360
+      POSTGRES_DB: drive360
     ports: ["5432:5432"]
     volumes: [pgdata:/var/lib/postgresql/data]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U docforge"]
+      test: ["CMD-SHELL", "pg_isready -U drive360"]
       interval: 5s
 
   redis:
@@ -41,7 +41,7 @@ services:
       /bin/sh -c "
       sleep 3 &&
       mc alias set local http://minio:9000 minioadmin minioadmin &&
-      mc mb --ignore-existing local/docforge || true
+      mc mb --ignore-existing local/drive360 || true
       "
 
   # ONLYOFFICE Document Server (Community Edition, AGPL).

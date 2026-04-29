@@ -4,6 +4,7 @@ export type StarterCategory =
   | "Billing"
   | "Legal"
   | "HR"
+  | "Resume"
   | "Certificates"
   | "Commerce"
   | "Correspondence"
