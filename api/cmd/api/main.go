@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/docforge/api/internal/ai"
@@ -348,8 +349,19 @@ func main() {
 	// Mounted after RequestID so captured errors carry X-Request-Id.
 	r.Use(obsAgg.Middleware())
 	r.Use(observability.ErrorCapture(pool))
+	// CORS_ALLOWED_ORIGINS is a comma-separated list of origins. Falls back
+	// to localhost dev so a fresh checkout works without env config.
+	corsOrigins := []string{"http://localhost:3000"}
+	if v := strings.TrimSpace(os.Getenv("CORS_ALLOWED_ORIGINS")); v != "" {
+		corsOrigins = nil
+		for _, o := range strings.Split(v, ",") {
+			if o = strings.TrimSpace(o); o != "" {
+				corsOrigins = append(corsOrigins, o)
+			}
+		}
+	}
 	r.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   []string{"http://localhost:3000"},
+		AllowedOrigins:   corsOrigins,
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"},
 		AllowedHeaders:   []string{"Authorization", "Content-Type"},
 		AllowCredentials: true,
