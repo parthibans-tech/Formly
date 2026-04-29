@@ -40,6 +40,9 @@
 #   S3_DOMAIN            — s3.drive360.nearbyme.app
 #                          Baked into the web bundle's CSP at build time.
 #                          Required for direct browser→MinIO uploads.
+#   OFFICE_DOMAIN        — office.drive360.nearbyme.app
+#                          Baked into the web bundle's CSP. Required so
+#                          the editor can load ONLYOFFICE api.js + iframe.
 #
 # ONE-TIME VPS BOOTSTRAP (must be done BEFORE first CI deploy):
 #   1. Run scripts/deploy/bootstrap-vps.sh on the VPS as root.
@@ -124,6 +127,7 @@ jobs:
           [ -z "${{ vars.API_DOMAIN }}" ] && missing="$missing API_DOMAIN"
           [ -z "${{ vars.WEB_DOMAIN }}" ] && missing="$missing WEB_DOMAIN"
           [ -z "${{ vars.S3_DOMAIN }}"  ] && missing="$missing S3_DOMAIN"
+          [ -z "${{ vars.OFFICE_DOMAIN }}" ] && missing="$missing OFFICE_DOMAIN"
           if [ -n "$missing" ]; then
             echo "::error::Missing repo Variables:$missing"
             echo "  Set at: Settings → Secrets and variables → Actions → Variables"
@@ -265,6 +269,7 @@ jobs:
           build-args: |
             NEXT_PUBLIC_API_URL=https://${{ vars.API_DOMAIN }}
             NEXT_PUBLIC_STORAGE_URL=https://${{ vars.S3_DOMAIN }}
+            NEXT_PUBLIC_OFFICE_URL=https://${{ vars.OFFICE_DOMAIN }}
           cache-from: type=gha,scope=web
           cache-to: type=gha,scope=web,mode=max
 

@@ -84,25 +84,32 @@ function buildDefaultCSP() {
   // dev` works out of the box.
   const storageUrl =
     process.env.NEXT_PUBLIC_STORAGE_URL || "http://localhost:9000";
+  // ONLYOFFICE document server. The editor page injects api.js from
+  // this origin AND iframes the editor itself, so it needs to land in
+  // both script-src and frame-src. Empty (omit) when the deploy
+  // doesn't run ONLYOFFICE — leaving the directive locked to 'self'.
+  const officeUrl = process.env.NEXT_PUBLIC_OFFICE_URL || "";
+  const officeOrigin = officeUrl ? originOf(officeUrl) : "";
   // De-dupe in case API and storage share an origin (some deploys put
   // an upload-proxy in front of S3 on the same hostname).
   const connectOrigins = Array.from(
     new Set([originOf(apiUrl), originOf(storageUrl)]),
   ).join(" ");
-  // Storage origin alone (de-duped). Used by directives that need
-  // storage but NOT the API (img/frame/media all read presigned URLs
-  // straight from S3/MinIO; the API never serves the bytes itself
-  // except via /inline-preview which is the API origin).
   const storageOrigin = originOf(storageUrl);
   const apiOrigin = originOf(apiUrl);
-  // frame-src needs both: PDF previews iframe storage URLs directly,
-  // image/text previews iframe the API's /inline-preview endpoint.
-  const frameOrigins = Array.from(new Set([apiOrigin, storageOrigin])).join(
-    " ",
-  );
+  // frame-src needs API + storage + office: PDF previews iframe storage
+  // URLs directly, image/text previews iframe the API's /inline-preview
+  // endpoint, and the editor iframes ONLYOFFICE.
+  const frameOrigins = Array.from(
+    new Set([apiOrigin, storageOrigin, officeOrigin].filter(Boolean)),
+  ).join(" ");
+  // script-src needs office because the editor page injects api.js as
+  // a <script> tag from there. Keep 'unsafe-inline'/'unsafe-eval' for
+  // Next.js dev features and ONLYOFFICE's runtime.
+  const scriptExtras = officeOrigin ? ` ${officeOrigin}` : "";
   return [
     "default-src 'self'",
-    "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+    `script-src 'self' 'unsafe-inline' 'unsafe-eval'${scriptExtras}`,
     "style-src 'self' 'unsafe-inline'",
     `img-src 'self' data: blob: https: ${storageOrigin}`,
     `connect-src 'self' ${connectOrigins}`,
