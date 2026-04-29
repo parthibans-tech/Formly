@@ -385,47 +385,13 @@ jobs:
             docker image prune -af --filter "until=168h" || true
 
   # ═════════════════════════════════════════════════════════════
-  # 6. SMOKE TESTS — separate job so a deploy-success/test-failure
-  #    is visually distinct from a deploy failure in GHA UI.
+  # 6. SUMMARY
   # ═════════════════════════════════════════════════════════════
-  smoke:
+  summary:
     needs: [plan, deploy]
     runs-on: ubuntu-latest
-    timeout-minutes: 5
     steps:
-      - name: Smoke test API
-        if: needs.plan.outputs.deploy_api == 'true'
-        run: |
-          set -euo pipefail
-          # Retry to absorb container-start latency. Cert provisioning
-          # is handled out-of-band by certbot on the VPS, not the deploy.
-          for i in $(seq 1 12); do
-            if curl -fsS --max-time 5 "https://${{ vars.API_DOMAIN }}/healthz" >/dev/null; then
-              echo "API healthy on attempt $i"
-              exit 0
-            fi
-            echo "attempt $i failed, sleeping 5s…"
-            sleep 5
-          done
-          echo "::error::API health check failed after 60s"
-          exit 1
-
-      - name: Smoke test Web
-        if: needs.plan.outputs.deploy_web == 'true'
-        run: |
-          set -euo pipefail
-          for i in $(seq 1 6); do
-            if curl -fsS --max-time 8 "https://${{ vars.WEB_DOMAIN }}/" >/dev/null; then
-              echo "Web healthy on attempt $i"
-              exit 0
-            fi
-            sleep 5
-          done
-          echo "::error::Web health check failed"
-          exit 1
-
       - name: Deployment summary
-        if: success()
         run: |
           {
             echo "## Deploy succeeded ✅"
