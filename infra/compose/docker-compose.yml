@@ -62,13 +62,16 @@ services:
       REDIS_URL: redis://redis:6379/0
       # ── Auth ──
       JWT_SECRET: ${JWT_SECRET}
-      # ── S3 (MinIO inside the network) ──
-      S3_ENDPOINT: http://minio:9000
-      S3_REGION: us-east-1
-      S3_BUCKET: ${S3_BUCKET:-drive360}
-      S3_ACCESS_KEY: ${MINIO_ROOT_USER}
-      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
-      S3_FORCE_PATH_STYLE: "true"   # MinIO needs path-style addressing
+      # ── MinIO (S3-compatible) — names match api/internal/storage/storage.go ──
+      # MINIO_ENDPOINT is host:port (no scheme) — passed straight to minio.New().
+      # MINIO_PUBLIC_ENDPOINT is what the browser sees in presigned URLs; falls
+      # back to the API domain when not set.
+      MINIO_ENDPOINT: minio:9000
+      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-${DOMAIN_API}}
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: ${S3_BUCKET:-drive360}
+      MINIO_SSL: "false"
       # ── AI (Ollama in this same compose, optional) ──
       AI_ENABLED: ${AI_ENABLED:-false}
       AI_PROVIDER: ${AI_PROVIDER:-ollama}
