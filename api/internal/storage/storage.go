@@ -27,18 +27,27 @@ func New() (*Client, error) {
 	access := getenv("MINIO_ACCESS_KEY", "minioadmin")
 	secret := getenv("MINIO_SECRET_KEY", "minioadmin")
 	bucket := getenv("MINIO_BUCKET", "docforge")
+	region := getenv("MINIO_REGION", "us-east-1")
 	useSSL := os.Getenv("MINIO_SSL") == "true"
+	publicUseSSL := useSSL
+	if v := os.Getenv("MINIO_PUBLIC_SSL"); v != "" {
+		publicUseSSL = v == "true"
+	}
 
 	creds := credentials.NewStaticV4(access, secret, "")
 
-	mc, err := minio.New(endpoint, &minio.Options{Creds: creds, Secure: useSSL})
+	// Region is set explicitly so PresignedPostPolicy / GetBucketLocation
+	// don't probe the network at request time. Without this, the public
+	// client tries to HEAD the public endpoint and chokes if anything
+	// (nginx redirects, TLS quirks) is in front of MinIO.
+	mc, err := minio.New(endpoint, &minio.Options{Creds: creds, Secure: useSSL, Region: region})
 	if err != nil {
 		return nil, err
 	}
 
 	publicMC := mc
-	if publicEndpoint != endpoint {
-		publicMC, err = minio.New(publicEndpoint, &minio.Options{Creds: creds, Secure: useSSL})
+	if publicEndpoint != endpoint || publicUseSSL != useSSL {
+		publicMC, err = minio.New(publicEndpoint, &minio.Options{Creds: creds, Secure: publicUseSSL, Region: region})
 		if err != nil {
 			return nil, err
 		}

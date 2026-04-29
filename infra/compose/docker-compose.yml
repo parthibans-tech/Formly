@@ -63,14 +63,19 @@ services:
       # ── Auth ──
       JWT_SECRET: ${JWT_SECRET}
       # ── MinIO (S3-compatible) — names match api/internal/storage/storage.go ──
-      # MINIO_ENDPOINT is host:port (no scheme) — passed straight to minio.New().
-      # MINIO_PUBLIC_ENDPOINT is what the browser sees in presigned URLs; falls
-      # back to the API domain when not set.
+      # MINIO_ENDPOINT (internal) is host:port, no scheme. Always minio:9000.
+      # MINIO_PUBLIC_ENDPOINT is what the browser sees in presigned URLs:
+      #   - leave blank → presigns use the internal endpoint (only OK if
+      #     uploads are proxied through the API, NOT direct browser→MinIO)
+      #   - set to e.g. s3.drive360.nearbyme.app (no scheme) AND set
+      #     MINIO_PUBLIC_SSL=true once nginx fronts MinIO with TLS
       MINIO_ENDPOINT: minio:9000
-      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-${DOMAIN_API}}
+      MINIO_PUBLIC_ENDPOINT: ${DOMAIN_S3:-}
+      MINIO_PUBLIC_SSL: ${MINIO_PUBLIC_SSL:-true}
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
       MINIO_BUCKET: ${S3_BUCKET:-drive360}
+      MINIO_REGION: us-east-1
       MINIO_SSL: "false"
       # ── AI (Ollama in this same compose, optional) ──
       AI_ENABLED: ${AI_ENABLED:-false}
