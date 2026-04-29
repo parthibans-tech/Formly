@@ -549,6 +549,7 @@ func main() {
 
 		// Folders
 		r.Post("/v1/folders", fh.Create)
+		r.Post("/v1/folders/ensure-path", fh.EnsurePath)
 		r.Get("/v1/folders", fh.List)
 		r.Get("/v1/folders/{id}/breadcrumbs", fh.Breadcrumbs)
 		r.Patch("/v1/folders/{id}", fh.Patch)

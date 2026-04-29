@@ -95,13 +95,6 @@ const SECTIONS: Section[] = [
       { href: "/drive", label: "My Drive", icon: HardDrive },
       { href: "/drive/shared", label: "Shared with me", icon: Share2 },
       { href: "/drive/starred", label: "Starred", icon: Star },
-      {
-        href: "/drive/smart-search",
-        label: "Smart search",
-        icon: Sparkles,
-        aiFeature: "smartSearch",
-        hint: "AI semantic search",
-      },
       { href: "/drive/templates", label: "Templates", icon: Files },
       { href: "/merge-recipes", label: "Merge recipes", icon: Layers },
       { href: "/drive/recent", label: "Recent", icon: Clock },

@@ -33,6 +33,12 @@ export function updateUser(patch: Record<string, any>) {
 // validation response) instead of trying to parse a concatenated
 // message string. Legacy `catch (e) { e.message }` callers still work
 // because ApiError extends Error.
+//
+// `.message` is intentionally a *user-friendly* string — the raw
+// server message lives on `.raw.error.message` for callers that need
+// it (e.g. surfacing field-level validation hints). This way a
+// `toast.show("error", e.message)` never leaks "pq: connection
+// refused" or stack traces to end users.
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string;
@@ -40,6 +46,9 @@ export class ApiError extends Error {
   // field with `field` (PDF field name), `dataKey`, and `message`.
   readonly fields?: Array<{ field: string; dataKey: string; message: string }>;
   readonly raw: any;
+  // The unmassaged server-side message (or fetch error string), kept
+  // separate from the polished `.message` shown to users.
+  readonly rawMessage: string;
 
   constructor(
     status: number,
@@ -48,13 +57,66 @@ export class ApiError extends Error {
     raw: any,
     fields?: ApiError["fields"]
   ) {
-    super(message);
+    super(friendlyMessage(status, code, message));
     this.name = "ApiError";
     this.status = status;
     this.code = code;
     this.raw = raw;
     this.fields = fields;
+    this.rawMessage = message;
   }
+}
+
+// Map low-level / internal errors to language a user can act on.
+// Anything 5xx or network-level becomes a generic "service trouble"
+// line; auth and rate-limit errors get specific guidance; for the
+// 4xx tier we trust the server message *unless* it looks like a
+// stack trace / database driver string.
+function friendlyMessage(status: number, code: string, raw: string): string {
+  if (status === 0) {
+    return "Can't reach the server. Check your connection and try again.";
+  }
+  if (status >= 500) {
+    return "The service is having trouble right now. Please try again in a moment.";
+  }
+  if (status === 401) {
+    return "Your session has expired. Please sign in again.";
+  }
+  if (status === 408 || status === 504) {
+    return "That request took too long. Please try again.";
+  }
+  if (status === 429) {
+    return "Too many requests. Please slow down and try again shortly.";
+  }
+  // 4xx: server messages are usually meaningful (validation, conflict,
+  // permission). Pass them through unless they look like leaked
+  // internals — driver / connection / panic / SQL strings.
+  if (raw && !looksInternal(raw)) return raw;
+  if (status === 403) return "You don't have permission to do that.";
+  if (status === 404) return "We couldn't find what you're looking for.";
+  if (status === 409) return "That conflicts with an existing item.";
+  if (status === 413) return "That file is too large.";
+  if (status === 415) return "That file type isn't supported.";
+  if (status === 423) return "This item is locked.";
+  return "Something went wrong. Please try again.";
+}
+
+function looksInternal(s: string): boolean {
+  const t = s.toLowerCase();
+  return (
+    t.includes("pq:") ||
+    t.includes("pgx:") ||
+    t.includes("dial tcp") ||
+    t.includes("connection refused") ||
+    t.includes("eof") ||
+    t.includes("panic:") ||
+    t.includes("goroutine") ||
+    t.includes("runtime error") ||
+    t.includes("sql:") ||
+    t.includes("driver:") ||
+    t.includes("fatal:") ||
+    t.startsWith("error 0x")
+  );
 }
 
 // vaultUnlocker is set by the <VaultUnlockProvider> at the app root.
@@ -81,14 +143,27 @@ async function doFetch(path: string, init: RequestInit) {
 }
 
 export async function api<T = any>(path: string, init: RequestInit = {}): Promise<T> {
-  let res = await doFetch(path, init);
+  let res: Response;
+  try {
+    res = await doFetch(path, init);
+  } catch (e: any) {
+    // fetch() throws on DNS failures, offline, CORS, aborts, etc. We
+    // surface a synthetic ApiError(status=0) so callers always see the
+    // same shape and the user sees a "can't reach server" line instead
+    // of "TypeError: Failed to fetch".
+    throw new ApiError(0, "network_error", e?.message || "network error", null);
+  }
   // 423 = folder vault locked. Pop the re-auth modal and retry once.
   // The retry is single-shot: if the modal closes without unlocking
   // (or unlock fails), we fall through to the normal error path.
   if (res.status === 423 && vaultUnlocker) {
     const unlocked = await vaultUnlocker();
     if (unlocked) {
-      res = await doFetch(path, init);
+      try {
+        res = await doFetch(path, init);
+      } catch (e: any) {
+        throw new ApiError(0, "network_error", e?.message || "network error", null);
+      }
     }
   }
   if (!res.ok) {

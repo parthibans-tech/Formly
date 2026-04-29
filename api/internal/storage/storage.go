@@ -7,11 +7,38 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
+
+// normalizeEndpoint coerces an env-supplied MinIO endpoint into the bare
+// `host[:port]` form minio-go expects. Operators routinely set values
+// like `https://s3.example.com/` or `s3.example.com:443/` — the leading
+// scheme corrupts the canonical Host the SDK signs against, producing
+// SignatureDoesNotMatch errors that look like a credentials problem.
+//
+// We strip:
+//   - any leading scheme (http:// or https://)
+//   - any path component (everything after the first '/')
+//   - trailing whitespace
+//
+// Returns the cleaned host:port. Leaves an empty input empty.
+func normalizeEndpoint(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return s
+	}
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	if i := strings.IndexByte(s, '/'); i >= 0 {
+		s = s[:i]
+	}
+	return s
+}
 
 func bytesReader(b []byte) io.Reader { return bytes.NewReader(b) }
 
@@ -22,8 +49,11 @@ type Client struct {
 }
 
 func New() (*Client, error) {
-	endpoint := getenv("MINIO_ENDPOINT", "localhost:9000")
-	publicEndpoint := getenv("MINIO_PUBLIC_ENDPOINT", endpoint)
+	endpoint := normalizeEndpoint(getenv("MINIO_ENDPOINT", "localhost:9000"))
+	publicEndpoint := normalizeEndpoint(getenv("MINIO_PUBLIC_ENDPOINT", endpoint))
+	if publicEndpoint == "" {
+		publicEndpoint = endpoint
+	}
 	access := getenv("MINIO_ACCESS_KEY", "minioadmin")
 	secret := getenv("MINIO_SECRET_KEY", "minioadmin")
 	bucket := getenv("MINIO_BUCKET", "docforge")

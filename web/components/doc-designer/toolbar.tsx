@@ -319,27 +319,15 @@ export function DocToolbar({
       <Divider />
 
       {/* Data-bound inserters — the key differentiators vs a plain WYSIWYG. */}
-      <Btn
-        title="Insert field (data placeholder)"
-        onClick={pickField}
-        className="text-sky-700 hover:text-sky-900"
-      >
+      <Btn title="Insert field (data placeholder)" onClick={pickField}>
         <Tag size={15} />
         <span className="ml-1 text-[11px] font-medium">Field</span>
       </Btn>
-      <Btn
-        title="Insert repeat block"
-        onClick={promptRepeat}
-        className="text-indigo-700 hover:text-indigo-900"
-      >
+      <Btn title="Insert repeat block" onClick={promptRepeat}>
         <Repeat2 size={15} />
         <span className="ml-1 text-[11px] font-medium">Repeat</span>
       </Btn>
-      <Btn
-        title="Insert conditional block"
-        onClick={promptIf}
-        className="text-amber-700 hover:text-amber-900"
-      >
+      <Btn title="Insert conditional block" onClick={promptIf}>
         <GitBranch size={15} />
         <span className="ml-1 text-[11px] font-medium">If</span>
       </Btn>

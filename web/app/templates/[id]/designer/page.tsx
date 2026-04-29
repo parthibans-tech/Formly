@@ -17,6 +17,9 @@ import StaticDesigner from "@/components/static-designer";
 import HtmlDesigner from "@/components/html-designer";
 import MarkdownDesigner from "@/components/markdown-designer";
 import { AcroFormDesigner } from "@/components/acroform/acroform-designer";
+import DocDesigner, {
+  type DocDesignerTemplate,
+} from "@/components/doc-designer/designer";
 import ImageDesigner from "@/components/image-designer";
 import { TemplateViewer } from "@/components/template-viewer";
 import { BatchDialog } from "@/components/batch-dialog";
@@ -341,6 +344,22 @@ export default function DesignerPage() {
           mode: tpl.mode,
           version: tpl.version,
           config: tpl.config || {},
+        }}
+        fileId={tpl.fileId}
+      />
+    );
+  }
+
+  if (tpl.mode === "doc") {
+    return (
+      <DocDesigner
+        tpl={{
+          id: tpl.id,
+          name: tpl.name,
+          mode: tpl.mode,
+          version: tpl.version,
+          fileId: tpl.fileId,
+          config: (tpl.config as DocDesignerTemplate["config"]) || {},
         }}
         fileId={tpl.fileId}
       />

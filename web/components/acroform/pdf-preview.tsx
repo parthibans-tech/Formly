@@ -288,7 +288,7 @@ export function PdfPreview({ url, scale = 1, buffer = 2, overlayForPage }: Props
                 key={pageNum}
                 ref={setPageRef(pageNum)}
                 data-page={pageNum}
-                className="relative mx-auto mb-6 shadow-sm ring-1 ring-border"
+                className="relative mx-auto mb-6 bg-white shadow-sm ring-1 ring-border"
                 style={{
                   width,
                   // When a page is unmounted we still need a height so
@@ -296,7 +296,6 @@ export function PdfPreview({ url, scale = 1, buffer = 2, overlayForPage }: Props
                   // For mounted pages, let <Page> set its own height so
                   // we don't fight its canvas.
                   height: shouldRender ? undefined : height,
-                  background: shouldRender ? undefined : "var(--muted, #f4f4f5)",
                 }}
               >
                 {shouldRender ? (

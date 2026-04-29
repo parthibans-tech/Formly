@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, usePathname } from "next/navigation";
 import {
   LogOut,
   Menu,
@@ -27,6 +27,11 @@ import {
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { useConfirm } from "@/components/ui/confirm";
 import { OrgSwitcher } from "@/components/org-switcher";
+import {
+  Breadcrumbs,
+  autoCrumbs,
+  type Crumb,
+} from "@/components/breadcrumbs";
 
 type Props = {
   children: React.ReactNode;
@@ -42,10 +47,24 @@ type Props = {
   };
   /** Extra actions rendered on the right side of the top bar, before the avatar. */
   headerRight?: React.ReactNode;
+  /**
+   * Optional breadcrumb override. By default the shell derives crumbs
+   * from the URL path; pages with dynamic hierarchy (e.g. /drive
+   * folder nesting, template names) supply their own list. Pass an
+   * empty array to suppress the auto trail entirely.
+   */
+  breadcrumbs?: Crumb[];
 };
 
-export function AppShell({ children, search, headerRight }: Props) {
+export function AppShell({
+  children,
+  search,
+  headerRight,
+  breadcrumbs,
+}: Props) {
   const router = useRouter();
+  const pathname = usePathname() || "";
+  const crumbs = breadcrumbs ?? autoCrumbs(pathname);
   const confirm = useConfirm();
   const [user, setUser] = useState<any>(null);
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -196,6 +215,7 @@ export function AppShell({ children, search, headerRight }: Props) {
         </header>
 
         <main className="mx-auto max-w-7xl px-4 py-6 md:px-6 md:py-8">
+          <Breadcrumbs items={crumbs} />
           {children}
         </main>
       </div>

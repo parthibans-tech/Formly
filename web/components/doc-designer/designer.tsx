@@ -45,7 +45,6 @@ import {
 import { api, ApiError } from "@/lib/api";
 import { useToast } from "@/components/toast";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 
 import {
@@ -116,6 +115,7 @@ export default function DocDesigner({
   const [lastSavedVersion, setLastSavedVersion] = useState(initialTpl.version);
   const [previewMode, setPreviewMode] = useState<"live" | "source">("live");
   const [themeDrawerOpen, setThemeDrawerOpen] = useState(false);
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const editorRef = useRef<Editor | null>(null);
 
   // -------------------------------------------------------------------------
@@ -268,11 +268,17 @@ export default function DocDesigner({
           </div>
         </div>
         {rendered.diagnostics.length > 0 ? (
-          <Badge variant="secondary" className="gap-1">
-            <TriangleAlert size={12} />
+          <button
+            type="button"
+            onClick={() => setDiagnosticsOpen((v) => !v)}
+            className="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-800 hover:bg-amber-100"
+            aria-pressed={diagnosticsOpen}
+            title={diagnosticsOpen ? "Hide issues" : "Show issues"}
+          >
+            <TriangleAlert size={11} />
             {rendered.diagnostics.length} issue
             {rendered.diagnostics.length === 1 ? "" : "s"}
-          </Badge>
+          </button>
         ) : null}
         {/* OCR + AI for the source upload — opens right-side drawers
             so the doc editor stays readable behind them. */}
@@ -355,19 +361,21 @@ export default function DocDesigner({
         />
 
         {/* Middle: editor */}
-        <div className="flex flex-col min-w-0 border-r bg-background">
+        <div className="flex flex-col min-w-0 border-r bg-muted/30">
           <div className="flex-1 min-h-0 overflow-auto">
             {loading ? (
               <div className="px-6 py-8 text-sm text-muted-foreground">
                 Loading…
               </div>
             ) : (
-              <DocEditor
-                value={doc}
-                onChange={setDoc}
-                editorRef={editorRef}
-                onPickField={handlePickField}
-              />
+              <div className="mx-auto my-6 max-w-[760px] rounded-md bg-white shadow-sm ring-1 ring-border">
+                <DocEditor
+                  value={doc}
+                  onChange={setDoc}
+                  editorRef={editorRef}
+                  onPickField={handlePickField}
+                />
+              </div>
             )}
           </div>
           <SampleDataPane
@@ -390,8 +398,11 @@ export default function DocDesigner({
               {rendered.html}
             </pre>
           )}
-          {rendered.diagnostics.length > 0 ? (
-            <DiagnosticsStrip diagnostics={rendered.diagnostics} />
+          {rendered.diagnostics.length > 0 && diagnosticsOpen ? (
+            <DiagnosticsStrip
+              diagnostics={rendered.diagnostics}
+              onClose={() => setDiagnosticsOpen(false)}
+            />
           ) : null}
         </div>
       </div>
@@ -502,17 +513,35 @@ function ThemeDrawer({
 
 function DiagnosticsStrip({
   diagnostics,
+  onClose,
 }: {
   diagnostics: { severity: string; message: string }[];
+  onClose: () => void;
 }) {
   return (
-    <div className="max-h-32 overflow-auto border-t bg-amber-50/70 text-[11px] text-amber-900 px-3 py-1.5 space-y-0.5">
-      {diagnostics.map((d, i) => (
-        <div key={i} className="flex gap-2">
-          <span className="uppercase font-semibold">{d.severity}</span>
-          <span className="flex-1">{d.message}</span>
-        </div>
-      ))}
+    <div className="max-h-40 overflow-auto border-t bg-amber-50/80 text-[11px] text-amber-900">
+      <div className="sticky top-0 flex items-center gap-2 border-b border-amber-200/60 bg-amber-50 px-3 py-1">
+        <TriangleAlert size={11} />
+        <span className="font-semibold uppercase tracking-wide text-[10px]">
+          Issues
+        </span>
+        <button
+          type="button"
+          className="ml-auto rounded p-0.5 hover:bg-amber-200/60"
+          onClick={onClose}
+          aria-label="Hide issues"
+        >
+          <X size={12} />
+        </button>
+      </div>
+      <div className="px-3 py-1.5 space-y-0.5">
+        {diagnostics.map((d, i) => (
+          <div key={i} className="flex gap-2">
+            <span className="uppercase font-semibold">{d.severity}</span>
+            <span className="flex-1">{d.message}</span>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

@@ -4,8 +4,17 @@
 import * as React from "react";
 import type { ToastActionElement, ToastProps } from "@/components/ui/toast";
 
-const TOAST_LIMIT = 5;
-const TOAST_REMOVE_DELAY = 4000;
+// How many toasts can stack at once. More than three feels noisy.
+const TOAST_LIMIT = 3;
+// Delay between Radix calling onOpenChange(false) and us actually
+// dropping the toast from state. Short enough that closed toasts
+// don't pile up invisibly, long enough for the slide-out animation
+// to finish (~200ms).
+const TOAST_REMOVE_DELAY = 400;
+// Auto-dismiss duration handed to each Toast.Root via the `duration`
+// prop. Radix counts this from when the toast mounts; hovering the
+// viewport pauses it (built-in).
+export const TOAST_AUTO_CLOSE_MS = 3500;
 
 type ToasterToast = ToastProps & {
   id: string;

@@ -8,8 +8,8 @@ import {
   ArrowUpAZ,
   Check,
   CheckSquare,
-  ChevronRight,
   Camera,
+  ChevronDown,
   Copy,
   Download,
   Eye,
@@ -19,10 +19,10 @@ import {
   FileType2,
   Hash,
   FolderPlus,
+  FolderUp,
   FolderOpen,
   Folder as FolderIcon,
   Grid3x3,
-  Home,
   KeyRound,
   LayoutList,
   Link2,
@@ -61,7 +61,7 @@ import {
   type ConflictChoice,
   type UploadConflict,
 } from "@/components/upload-conflict-dialog";
-import { UploadDropzone } from "@/components/upload-dropzone";
+import { UploadDropzone, type UploadItem } from "@/components/upload-dropzone";
 import {
   DownloadProgressCard,
   type DownloadProgressState,
@@ -299,6 +299,7 @@ export default function DrivePage() {
   const [insertFor, setInsertFor] = useState<{ id: string; name: string } | null>(null);
   const [dropTargetFolder, setDropTargetFolder] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -350,10 +351,18 @@ export default function DrivePage() {
 
   async function upload(
     file: File,
-    conflictStrategy?: "replace" | "keep"
+    conflictStrategy?: "replace" | "keep",
+    folderIdOverride?: string | null
   ) {
     setErr(null);
     setUploading({ name: file.name, pct: 0 });
+    // undefined = caller didn't specify; fall back to the visible
+    // folder. null/"" = explicit root. A non-empty string overrides
+    // the current folder (folder-upload paths route here).
+    const targetFolderId =
+      folderIdOverride === undefined
+        ? currentFolderId || undefined
+        : folderIdOverride || undefined;
     try {
       // Ask for an upload URL. The server checks for a same-name + same-type
       // file in the current folder first; a 409 means the user has to pick
@@ -376,7 +385,7 @@ export default function DrivePage() {
             // before issuing a presign — saves us from streaming a GB
             // just to learn it's over the limit.
             size: file.size,
-            folderId: currentFolderId || undefined,
+            folderId: targetFolderId,
             conflict: conflictStrategy,
           }),
         });
@@ -401,7 +410,7 @@ export default function DrivePage() {
             toast.show("info", "Upload cancelled");
             return;
           }
-          await upload(file, choice);
+          await upload(file, choice, folderIdOverride);
           return;
         }
         throw e;
@@ -474,8 +483,35 @@ export default function DrivePage() {
   //     UX would devolve into confusion.
   //   - load() runs once at the end so the file list updates in a
   //     single re-render instead of flickering on every completion.
-  async function uploadMany(files: File[]) {
-    for (const f of files) {
+  async function uploadMany(items: UploadItem[]) {
+    // Cache resolved directory ids for this batch so we don't hit
+    // /folders/ensure-path once per file when 200 files share the
+    // same parent directory inside a dropped folder.
+    const dirCache = new Map<string, string | null>();
+    async function resolveDir(relativePath: string): Promise<string | null> {
+      // Strip the basename — only the directory portion matters.
+      const lastSlash = relativePath.lastIndexOf("/");
+      const dir = lastSlash >= 0 ? relativePath.slice(0, lastSlash) : "";
+      if (!dir) return currentFolderId || null;
+      const cached = dirCache.get(dir);
+      if (cached !== undefined) return cached;
+      const res = await api<{ folderId: string | null }>(
+        "/v1/folders/ensure-path",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            parentId: currentFolderId || undefined,
+            path: dir,
+          }),
+        }
+      );
+      const id = res.folderId || null;
+      dirCache.set(dir, id);
+      return id;
+    }
+
+    for (const it of items) {
+      const f = it.file;
       // Skip files that show up empty (rare but possible — e.g. user
       // drops a 0-byte file on macOS). The presign endpoint would
       // accept it; we'd just have a useless empty file in Drive.
@@ -483,11 +519,30 @@ export default function DrivePage() {
         toast.show("info", `Skipped empty file ${f.name}`);
         continue;
       }
+      // Files that came out of a dropped/picked folder carry a
+      // relativePath like "MyDocs/Q3/report.pdf". Resolve the
+      // directory chain once via ensure-path, then auto-"keep" any
+      // name conflicts so a 1000-file folder upload never blocks on
+      // a dialog. Plain file drops keep the interactive prompt.
+      let folderOverride: string | null | undefined = undefined;
+      let conflict: "replace" | "keep" | undefined;
+      if (it.relativePath && it.relativePath.includes("/")) {
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          folderOverride = await resolveDir(it.relativePath);
+        } catch (e: any) {
+          toast.show("error", `Couldn't create folder for ${f.name}`, {
+            description: e?.message,
+          });
+          continue;
+        }
+        conflict = "keep";
+      }
       // upload() already handles its own toasts and conflict prompt.
       // Awaiting in serial means the conflict dialog can't be
       // double-mounted by a second drop arriving mid-prompt.
       // eslint-disable-next-line no-await-in-loop
-      await upload(f);
+      await upload(f, conflict, folderOverride);
     }
   }
 
@@ -848,25 +903,26 @@ export default function DrivePage() {
   }
 
   async function createFromStarter(s: Starter) {
+    // In-built starters open in fill mode (form + live preview) so non-tech
+    // users never see raw placeholders. Only the blank starter falls through
+    // to the designer for full authoring.
+    if (s.id !== "blank") {
+      setCreatingStarterId(s.id);
+      setBrowserOpen(false);
+      router.push(`/starters/${s.id}`);
+      return;
+    }
+
     setCreatingStarterId(s.id);
     try {
-      const suggestedName =
-        s.id === "blank" ? "Untitled template" : `${s.name} — ${new Date().toLocaleDateString()}`;
-
-      // Convert the starter's HTML+Go-template source into the doc AST
-      // and seed a doc-mode template.  getStarterDoc uses the browser's
-      // native DOMParser here.  Any info-level diagnostics (e.g. a <dl>
-      // with embedded control flow that downgraded to a Raw block) are
-      // surfaced as a secondary toast so users know something was
-      // preserved rather than lost.
       const { stored, diagnostics } = getStarterDoc(s);
       const { templateId } = await createDocTemplate({
-        name: suggestedName,
+        name: "Untitled template",
         seedDoc: stored.doc,
         themeCss: stored.themeCss,
         folderId: currentFolderId || undefined,
       });
-      toast.show("success", `Created ${s.name}`, {
+      toast.show("success", "Created blank template", {
         description:
           diagnostics.length > 0
             ? `${diagnostics.length} block${diagnostics.length === 1 ? "" : "s"} kept as raw HTML — open the doc to clean up. Opening the editor…`
@@ -1490,6 +1546,16 @@ export default function DrivePage() {
         onChange: setSearch,
         placeholder: "Search files and folders…",
       }}
+      breadcrumbs={[
+        { label: "My Drive", href: currentFolderId ? "/drive" : undefined },
+        ...breadcrumbs.map((b, i) => ({
+          label: b.name,
+          href:
+            i === breadcrumbs.length - 1
+              ? undefined
+              : `/drive?folder=${b.id}`,
+        })),
+      ]}
     >
       {/* Drag-and-drop upload. Listens at window level so the user
           can drop anywhere inside /drive — the visual overlay only
@@ -1504,44 +1570,13 @@ export default function DrivePage() {
             ? `Uploading to ${breadcrumbs[breadcrumbs.length - 1].name}`
             : "Uploading to My Drive"
         }
-        onFiles={(files) => void uploadMany(files)}
-        onFolderRejected={() =>
-          toast.show("info", "Folder uploads aren't supported yet", {
-            description: "Drop individual files, or zip the folder first.",
-          })
-        }
+        onFiles={(items) => void uploadMany(items)}
       />
       <VaultPrivacyShield
         active={inVaultContext}
         folderId={currentFolderId || undefined}
       >
       <div>
-        {/* Breadcrumb */}
-        <nav aria-label="Breadcrumb" className="mb-3">
-          <ol className="flex flex-wrap items-center gap-0.5 text-xs">
-            <li>
-              <Link
-                href="/drive"
-                className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-              >
-                <Home className="h-3 w-3" />
-                My Drive
-              </Link>
-            </li>
-            {breadcrumbs.map((b) => (
-              <li key={b.id} className="flex items-center gap-0.5">
-                <ChevronRight className="h-3 w-3 text-muted-foreground/50" />
-                <Link
-                  href={`/drive?folder=${b.id}`}
-                  className="rounded px-1.5 py-0.5 font-medium text-foreground/80 transition-colors hover:bg-accent hover:text-foreground"
-                >
-                  {b.name}
-                </Link>
-              </li>
-            ))}
-          </ol>
-        </nav>
-
         {/* Hero: title + description + primary actions */}
         <div className="mb-5 flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
           <div>
@@ -1580,77 +1615,112 @@ export default function DrivePage() {
               <FolderPlus className="h-4 w-4" />
               New folder
             </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => inputRef.current?.click()}
-              className="h-9"
-            >
-              <Upload className="h-4 w-4" />
-              Upload
-            </Button>
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
-                <Button size="sm" loading={creating} className="h-9">
-                  <Plus className="h-4 w-4" />
-                  Create
+                <Button variant="outline" size="sm" className="h-9">
+                  <Upload className="h-4 w-4" />
+                  Upload
                 </Button>
               </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-72">
-                <DropdownMenuLabel>New document</DropdownMenuLabel>
-                <DropdownMenuItem onClick={() => setBrowserOpen(true)}>
-                  <BookTemplate className="h-4 w-4" />
-                  Browse templates…
-                  <span className="ml-auto text-[10px] text-muted-foreground">
-                    Starters
-                  </span>
-                </DropdownMenuItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuLabel className="text-[10px]">
-                  Blank
-                </DropdownMenuLabel>
-                <DropdownMenuItem onClick={createHtml}>
-                  <FileCode2 className="h-4 w-4" />
-                  HTML template
-                  <span className="ml-auto text-[10px] text-muted-foreground">
-                    Rich editor
-                  </span>
-                </DropdownMenuItem>
-                <DropdownMenuItem onClick={createMarkdown}>
-                  <Hash className="h-4 w-4" />
-                  Markdown template
-                  <span className="ml-auto text-[10px] text-muted-foreground">
-                    .md → PDF
-                  </span>
-                </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => setBlankPdfOpen(true)}>
-                  <FileType2 className="h-4 w-4" />
-                  Blank PDF
-                  <span className="ml-auto text-[10px] text-muted-foreground">
-                    Static designer
-                  </span>
-                </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => setFormBuilderOpen(true)}>
-                  <ClipboardList className="h-4 w-4" />
-                  Form builder
-                  <span className="ml-auto text-[10px] text-muted-foreground">
-                    Auto-layout
-                  </span>
-                </DropdownMenuItem>
-                <DropdownMenuSeparator />
+              <DropdownMenuContent align="end" className="w-52">
                 <DropdownMenuItem onClick={() => inputRef.current?.click()}>
                   <Upload className="h-4 w-4" />
-                  Upload a file…
+                  <span className="whitespace-nowrap">Upload files…</span>
                 </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => setCameraOpen(true)}>
-                  <Camera className="h-4 w-4" />
-                  Capture image…
-                  <span className="ml-auto text-[10px] text-muted-foreground">
-                    Camera
-                  </span>
+                <DropdownMenuItem
+                  onClick={() => folderInputRef.current?.click()}
+                >
+                  <FolderUp className="h-4 w-4" />
+                  <span className="whitespace-nowrap">Upload folder…</span>
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
+            {/* Split button: clicking the main label jumps straight into
+                the starter gallery (the default path users want), while
+                the chevron exposes blank-format and upload paths for
+                power users who don't want a designed starter. */}
+            <div className="inline-flex">
+              <Button
+                size="sm"
+                loading={creating}
+                className="h-9 rounded-r-none pr-2.5"
+                onClick={() => setBrowserOpen(true)}
+              >
+                <Plus className="h-4 w-4" />
+                Create
+              </Button>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    size="sm"
+                    className="h-9 rounded-l-none border-l border-primary-foreground/25 px-1.5"
+                    aria-label="More create options"
+                  >
+                    <ChevronDown className="h-4 w-4" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-72">
+                  <DropdownMenuLabel>New document</DropdownMenuLabel>
+                  <DropdownMenuItem onClick={() => setBrowserOpen(true)}>
+                    <BookTemplate className="h-4 w-4" />
+                    Browse templates…
+                    <span className="ml-auto text-[10px] text-muted-foreground">
+                      Starters
+                    </span>
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuLabel className="text-[10px]">
+                    Start blank
+                  </DropdownMenuLabel>
+                  <DropdownMenuItem onClick={createHtml}>
+                    <FileCode2 className="h-4 w-4" />
+                    HTML template
+                    <span className="ml-auto text-[10px] text-muted-foreground">
+                      Rich editor
+                    </span>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={createMarkdown}>
+                    <Hash className="h-4 w-4" />
+                    Markdown template
+                    <span className="ml-auto text-[10px] text-muted-foreground">
+                      .md → PDF
+                    </span>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => setBlankPdfOpen(true)}>
+                    <FileType2 className="h-4 w-4" />
+                    Blank PDF
+                    <span className="ml-auto text-[10px] text-muted-foreground">
+                      Static designer
+                    </span>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => setFormBuilderOpen(true)}>
+                    <ClipboardList className="h-4 w-4" />
+                    Form builder
+                    <span className="ml-auto text-[10px] text-muted-foreground">
+                      Auto-layout
+                    </span>
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem onClick={() => inputRef.current?.click()}>
+                    <Upload className="h-4 w-4" />
+                    Upload a file…
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onClick={() => folderInputRef.current?.click()}
+                  >
+                    <FolderUp className="h-4 w-4" />
+                    Upload a folder…
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => setCameraOpen(true)}>
+                    <Camera className="h-4 w-4" />
+                    Capture image…
+                    <span className="ml-auto text-[10px] text-muted-foreground">
+                      Camera
+                    </span>
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
             <input
               ref={inputRef}
               type="file"
@@ -1662,9 +1732,46 @@ export default function DrivePage() {
                 // uploads, single re-render at the end.
                 const list = e.target.files;
                 if (list && list.length > 0) {
-                  const files: File[] = [];
-                  for (let i = 0; i < list.length; i++) files.push(list[i]);
-                  void uploadMany(files);
+                  const items: UploadItem[] = [];
+                  for (let i = 0; i < list.length; i++) {
+                    items.push({ file: list[i] });
+                  }
+                  void uploadMany(items);
+                }
+                e.target.value = "";
+              }}
+            />
+            {/* Folder picker. webkitdirectory is non-standard but
+                supported by all evergreen browsers; the OS dialog
+                switches to "Select folder" mode and every File in
+                the resulting list carries a webkitRelativePath
+                like "MyFolder/sub/report.pdf" — we use that to
+                drive ensure-path on the server. */}
+            <input
+              ref={folderInputRef}
+              type="file"
+              multiple
+              className="hidden"
+              // @ts-expect-error — webkitdirectory is a non-standard
+              // attribute that React's typings don't include but every
+              // major browser implements.
+              webkitdirectory=""
+              directory=""
+              onChange={(e) => {
+                const list = e.target.files;
+                if (list && list.length > 0) {
+                  const items: UploadItem[] = [];
+                  for (let i = 0; i < list.length; i++) {
+                    const f = list[i];
+                    const rel =
+                      (f as File & { webkitRelativePath?: string })
+                        .webkitRelativePath || "";
+                    items.push({
+                      file: f,
+                      relativePath: rel || undefined,
+                    });
+                  }
+                  void uploadMany(items);
                 }
                 e.target.value = "";
               }}

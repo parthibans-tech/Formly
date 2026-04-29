@@ -11,6 +11,7 @@ import (
 	"github.com/docforge/api/internal/sharing"
 	"github.com/docforge/api/internal/vault"
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -68,6 +69,89 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, folderDTO{ID: id, ParentID: req.ParentID, Name: req.Name, CreatedAt: time.Now()})
+}
+
+type ensurePathReq struct {
+	ParentID *string `json:"parentId"`
+	Path     string  `json:"path"`
+}
+
+// EnsurePath walks/creates a "/"-separated folder chain under the given
+// parent (or root) and returns the leaf folder id. Idempotent: existing
+// segments are reused by name. Used by the folder-upload pipeline so the
+// client can mirror an OS directory tree in one round-trip per branch.
+func (h *Handler) EnsurePath(w http.ResponseWriter, r *http.Request) {
+	c := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
+	var req ensurePathReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, "invalid_body", err.Error())
+		return
+	}
+	segs := splitFolderPath(req.Path)
+	var current *string
+	if req.ParentID != nil && *req.ParentID != "" {
+		var ok bool
+		_ = h.DB.QueryRow(r.Context(),
+			`SELECT EXISTS(SELECT 1 FROM folders WHERE id=$1 AND org_id=$2)`, *req.ParentID, c.OrgID,
+		).Scan(&ok)
+		if !ok {
+			writeErr(w, 400, "bad_parent", "parent folder not found")
+			return
+		}
+		current = req.ParentID
+	}
+	if len(segs) == 0 {
+		writeJSON(w, 200, map[string]any{"folderId": current})
+		return
+	}
+	for _, name := range segs {
+		var id string
+		var err error
+		if current == nil {
+			err = h.DB.QueryRow(r.Context(),
+				`SELECT id FROM folders WHERE org_id=$1 AND parent_id IS NULL AND name=$2 LIMIT 1`,
+				c.OrgID, name).Scan(&id)
+		} else {
+			err = h.DB.QueryRow(r.Context(),
+				`SELECT id FROM folders WHERE org_id=$1 AND parent_id=$2 AND name=$3 LIMIT 1`,
+				c.OrgID, *current, name).Scan(&id)
+		}
+		if errors.Is(err, pgx.ErrNoRows) {
+			if err = h.DB.QueryRow(r.Context(),
+				`INSERT INTO folders (org_id, parent_id, name, owner_id) VALUES ($1,$2,$3,$4) RETURNING id`,
+				c.OrgID, current, name, c.UserID,
+			).Scan(&id); err != nil {
+				writeErr(w, 500, "db_error", err.Error())
+				return
+			}
+		} else if err != nil {
+			writeErr(w, 500, "db_error", err.Error())
+			return
+		}
+		next := id
+		current = &next
+	}
+	writeJSON(w, 200, map[string]any{"folderId": current})
+}
+
+func splitFolderPath(p string) []string {
+	out := []string{}
+	cur := ""
+	flush := func() {
+		if cur != "" {
+			out = append(out, cur)
+			cur = ""
+		}
+	}
+	for _, r := range p {
+		if r == '/' || r == '\\' {
+			flush()
+			continue
+		}
+		cur += string(r)
+	}
+	flush()
+	return out
 }
 
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {

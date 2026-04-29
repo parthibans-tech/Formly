@@ -49,20 +49,45 @@ const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
     ref
   ) => {
     const Comp = asChild ? Slot : "button";
+    // When `asChild` is true, Radix Slot requires exactly one child element,
+    // so we can't add the spinner overlay. Fall back to the simple swap.
+    if (asChild) {
+      return (
+        <Comp
+          className={cn(buttonVariants({ variant, size, className }))}
+          ref={ref}
+          disabled={disabled || loading}
+          {...props}
+        >
+          {children}
+        </Comp>
+      );
+    }
+    // Hide the original content and overlay a centered spinner. Keeps
+    // the button's width, height, and content alignment stable so the
+    // icon doesn't visibly jump when `loading` flips.
     return (
       <Comp
-        className={cn(buttonVariants({ variant, size, className }))}
+        className={cn(buttonVariants({ variant, size, className }), "relative")}
         ref={ref}
         disabled={disabled || loading}
         {...props}
       >
-        {loading ? (
-          <>
-            <Loader2 className="animate-spin" aria-hidden />
-            <span>{children}</span>
-          </>
-        ) : (
-          children
+        <span
+          className={cn(
+            "inline-flex items-center justify-center gap-2",
+            loading && "invisible"
+          )}
+        >
+          {children}
+        </span>
+        {loading && (
+          <span
+            aria-hidden
+            className="absolute inset-0 flex items-center justify-center"
+          >
+            <Loader2 className="animate-spin" />
+          </span>
         )}
       </Comp>
     );

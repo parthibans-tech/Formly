@@ -125,18 +125,17 @@ function FieldChip(props: ReactNodeViewProps) {
       as="span"
       contentEditable={false}
       className={[
-        "inline-flex items-center gap-1 align-baseline px-1.5 py-0.5 mx-0.5 rounded text-[12px] font-medium select-none",
+        "inline align-baseline px-0.5 -mx-0.5 rounded-sm select-none transition-colors",
         palette(kind),
-        selected ? "ring-2 ring-offset-1 ring-sky-400" : "",
+        selected ? "ring-1 ring-sky-400 ring-offset-1" : "",
       ].join(" ")}
       data-formly-field={path}
       data-formly-kind={kind}
       title={path + (fmtHint ? ` · ${fmtHint}` : "")}
     >
-      <span className="truncate max-w-[200px]">{label || "(unnamed)"}</span>
-      {fmtHint ? (
-        <span className="opacity-60 text-[10px] font-normal">· {fmtHint}</span>
-      ) : null}
+      <span className="inline-block max-w-[260px] truncate align-baseline">
+        {label || "(unnamed)"}
+      </span>
     </NodeViewWrapper>
   );
 }
@@ -151,14 +150,14 @@ function FieldChip(props: ReactNodeViewProps) {
 function palette(kind: string): string {
   switch (kind) {
     case "currency":
-      return "bg-emerald-100 text-emerald-800 border border-emerald-200";
+      return "bg-emerald-50/80 text-emerald-800 decoration-emerald-300 underline decoration-dotted underline-offset-[3px] hover:bg-emerald-100/80";
     case "number":
     case "percent":
-      return "bg-amber-100 text-amber-800 border border-amber-200";
+      return "bg-amber-50/80 text-amber-800 decoration-amber-300 underline decoration-dotted underline-offset-[3px] hover:bg-amber-100/80";
     case "date":
-      return "bg-violet-100 text-violet-800 border border-violet-200";
+      return "bg-violet-50/80 text-violet-800 decoration-violet-300 underline decoration-dotted underline-offset-[3px] hover:bg-violet-100/80";
     default:
-      return "bg-sky-100 text-blue-700 border border-sky-200";
+      return "bg-sky-50/80 text-sky-800 decoration-sky-300 underline decoration-dotted underline-offset-[3px] hover:bg-sky-100/80";
   }
 }
 

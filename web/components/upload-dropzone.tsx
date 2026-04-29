@@ -1,9 +1,9 @@
 "use client";
 
-// UploadDropzone — drag a file from your OS onto the browser window and
-// the drive picks it up. Mounted once on a page; renders an overlay
-// only while a drag is in progress, so it doesn't interfere with normal
-// pointer events the rest of the time.
+// UploadDropzone — drag a file or folder from your OS onto the browser
+// window and the drive picks it up. Mounted once on a page; renders an
+// overlay only while a drag is in progress, so it doesn't interfere
+// with normal pointer events the rest of the time.
 //
 // Why a window-level listener and not a `onDrop` on a container
 //
@@ -16,20 +16,27 @@
 //
 // Folder drops
 //
-// HTML5 drag-drop only carries File objects; folders need
-// `webkitGetAsEntry` to walk recursively. We keep this scope to
-// "files only" for now and surface a quiet toast if the user tries to
-// drop a folder, so the failure mode is "nothing happens + you see
-// why" rather than a silent no-op.
+// HTML5 drag-drop only carries File objects; folder structure is
+// recovered via `webkitGetAsEntry` and the FileSystemEntry API. We
+// recurse the tree, attaching a relativePath to each File so the
+// upload pipeline can mirror the directory structure server-side.
 
 import { useEffect, useRef, useState } from "react";
 import { UploadCloud } from "lucide-react";
 
+export type UploadItem = {
+  file: File;
+  // relativePath is set when the file came out of a dropped folder
+  // (or a webkitdirectory picker). For a plain file drop it is
+  // undefined and the upload lands directly in the current folder.
+  relativePath?: string;
+};
+
 type Props = {
-  // onFiles is called once per drop with the dropped files. Multiple
+  // onFiles is called once per drop with the dropped items. Multiple
   // files in a single drop arrive together; the parent decides whether
   // to upload them in parallel or sequentially.
-  onFiles: (files: File[]) => void;
+  onFiles: (items: UploadItem[]) => void;
   // disabled lets the parent skip the dropzone (e.g. while a modal is
   // open or a previous upload is still running) without unmounting.
   disabled?: boolean;
@@ -38,17 +45,68 @@ type Props = {
   label?: string;
   // sublabel shows secondary context (e.g. "Uploading to: Marketing").
   sublabel?: string;
-  // onFolderRejected fires when the user drops something that smells
-  // like a folder. The parent typically hooks this to a toast.
-  onFolderRejected?: () => void;
 };
+
+type FSEntry = {
+  isFile: boolean;
+  isDirectory: boolean;
+  name: string;
+  file?: (cb: (f: File) => void, err?: () => void) => void;
+  createReader?: () => {
+    readEntries: (cb: (entries: FSEntry[]) => void, err?: () => void) => void;
+  };
+};
+
+// Walk a FileSystemEntry recursively, returning every leaf File along
+// with its path relative to the dropped root.
+async function walkEntry(
+  entry: FSEntry,
+  parentPath: string
+): Promise<UploadItem[]> {
+  if (entry.isFile && entry.file) {
+    const f = await new Promise<File | null>((resolve) => {
+      entry.file!(
+        (file) => resolve(file),
+        () => resolve(null)
+      );
+    });
+    if (!f) return [];
+    const relativePath = parentPath
+      ? `${parentPath}/${entry.name}`
+      : entry.name;
+    return [{ file: f, relativePath }];
+  }
+  if (entry.isDirectory && entry.createReader) {
+    const reader = entry.createReader();
+    const childBase = parentPath
+      ? `${parentPath}/${entry.name}`
+      : entry.name;
+    const out: UploadItem[] = [];
+    // readEntries returns batches (Chrome caps at ~100 per call);
+    // keep reading until an empty batch comes back.
+    while (true) {
+      const batch = await new Promise<FSEntry[]>((resolve) => {
+        reader.readEntries(
+          (entries) => resolve(entries),
+          () => resolve([])
+        );
+      });
+      if (batch.length === 0) break;
+      for (const child of batch) {
+        const sub = await walkEntry(child, childBase);
+        out.push(...sub);
+      }
+    }
+    return out;
+  }
+  return [];
+}
 
 export function UploadDropzone({
   onFiles,
   disabled,
   label = "Drop files to upload",
   sublabel,
-  onFolderRejected,
 }: Props) {
   const [active, setActive] = useState(false);
   // Drag events fire dragenter on every child element entered, then
@@ -56,6 +114,12 @@ export function UploadDropzone({
   // false on leave" toggles madly when the user moves over nested
   // elements. Counting enters and leaves balances them.
   const counterRef = useRef(0);
+  // Keep onFiles fresh without resubscribing the window listeners on
+  // every parent re-render.
+  const onFilesRef = useRef(onFiles);
+  useEffect(() => {
+    onFilesRef.current = onFiles;
+  }, [onFiles]);
 
   useEffect(() => {
     if (disabled) return;
@@ -67,8 +131,6 @@ export function UploadDropzone({
     const isFileDrag = (e: DragEvent) => {
       const t = e.dataTransfer?.types;
       if (!t) return false;
-      // DataTransferItemList vs array depending on browser; both
-      // expose .includes() / iteration for "Files".
       for (let i = 0; i < t.length; i++) {
         if (t[i] === "Files") return true;
       }
@@ -96,7 +158,7 @@ export function UploadDropzone({
       if (counterRef.current === 0) setActive(false);
     };
 
-    const onDrop = (e: DragEvent) => {
+    const onDrop = async (e: DragEvent) => {
       if (!isFileDrag(e)) return;
       e.preventDefault();
       counterRef.current = 0;
@@ -105,38 +167,50 @@ export function UploadDropzone({
       const dt = e.dataTransfer;
       if (!dt) return;
 
-      // Folder detection: if any item exposes a directory entry via
-      // webkitGetAsEntry, it's a folder. We don't recurse (yet) — the
-      // upload pipeline only takes File objects — so we surface the
-      // rejection and skip those entries.
-      let sawFolder = false;
-      const files: File[] = [];
       const items = dt.items;
+      const out: UploadItem[] = [];
+
       if (items && items.length > 0) {
+        // Snapshot the entry list synchronously — DataTransferItem
+        // objects become inert after the drop event tick, so any
+        // attempt to call webkitGetAsEntry() inside an awaited
+        // promise later would return null.
+        const entries: Array<FSEntry | null> = [];
+        const fallbackFiles: Array<File | null> = [];
         for (let i = 0; i < items.length; i++) {
           const item = items[i];
-          if (item.kind !== "file") continue;
-          // webkitGetAsEntry is non-standard but ubiquitous; the cast
-          // keeps TS quiet without pulling in a polyfill type pack.
-          const entry = (item as DataTransferItem & {
-            webkitGetAsEntry?: () => { isDirectory: boolean } | null;
-          }).webkitGetAsEntry?.();
-          if (entry?.isDirectory) {
-            sawFolder = true;
+          if (item.kind !== "file") {
+            entries.push(null);
+            fallbackFiles.push(null);
             continue;
           }
-          const f = item.getAsFile();
-          if (f) files.push(f);
+          const entry = (
+            item as DataTransferItem & {
+              webkitGetAsEntry?: () => FSEntry | null;
+            }
+          ).webkitGetAsEntry?.();
+          entries.push(entry || null);
+          fallbackFiles.push(item.getAsFile());
+        }
+
+        for (let i = 0; i < entries.length; i++) {
+          const entry = entries[i];
+          if (entry?.isDirectory) {
+            const sub = await walkEntry(entry, "");
+            out.push(...sub);
+          } else {
+            const f = fallbackFiles[i];
+            if (f) out.push({ file: f });
+          }
         }
       } else {
         // Older browsers — no items list, just files. Folders won't
-        // appear here at all so no rejection check needed.
+        // appear here at all so we treat everything as a flat drop.
         const fl = dt.files;
-        for (let i = 0; i < fl.length; i++) files.push(fl[i]);
+        for (let i = 0; i < fl.length; i++) out.push({ file: fl[i] });
       }
 
-      if (sawFolder && onFolderRejected) onFolderRejected();
-      if (files.length > 0) onFiles(files);
+      if (out.length > 0) onFilesRef.current(out);
     };
 
     window.addEventListener("dragenter", onDragEnter);
@@ -149,7 +223,7 @@ export function UploadDropzone({
       window.removeEventListener("dragleave", onDragLeave);
       window.removeEventListener("drop", onDrop);
     };
-  }, [disabled, onFiles, onFolderRejected]);
+  }, [disabled]);
 
   if (!active) return null;
 
