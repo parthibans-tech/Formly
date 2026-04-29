@@ -1,16 +1,61 @@
 import "./globals.css";
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { ToastProvider } from "@/components/toast";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ConfirmProvider } from "@/components/ui/confirm";
 import { PromptProvider } from "@/components/ui/prompt";
 import { VaultUnlockProvider } from "@/components/vault-unlock";
+import { siteUrl } from "@/lib/site";
 
 export const metadata: Metadata = {
-  title: "Drive360 — Document automation platform",
+  metadataBase: new URL(siteUrl()),
+  title: {
+    default: "Drive360 — Document automation for modern teams",
+    template: "%s · Drive360",
+  },
   description:
-    "Design, fill, and share PDF & HTML documents. Upload forms, map fields, generate in bulk.",
+    "Design, fill, sign, and share PDF & HTML documents at scale. Bulk-generate from CSV, embed forms anywhere, and automate the paperwork your team still does by hand.",
+  applicationName: "Drive360",
+  keywords: [
+    "document automation",
+    "PDF generation",
+    "e-signature",
+    "form builder",
+    "bulk PDF",
+    "document workflow",
+    "AcroForm",
+    "OCR",
+  ],
+  authors: [{ name: "Drive360" }],
+  creator: "Drive360",
+  publisher: "Drive360",
+  formatDetection: { email: false, address: false, telephone: false },
+  openGraph: {
+    type: "website",
+    siteName: "Drive360",
+    locale: "en_US",
+  },
+  twitter: { card: "summary_large_image", creator: "@drive360" },
+  robots: {
+    index: true,
+    follow: true,
+    googleBot: {
+      index: true,
+      follow: true,
+      "max-image-preview": "large",
+      "max-snippet": -1,
+    },
+  },
+};
+
+export const viewport: Viewport = {
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#ffffff" },
+    { media: "(prefers-color-scheme: dark)", color: "#0b1020" },
+  ],
+  width: "device-width",
+  initialScale: 1,
 };
 
 const themeInitScript = `(function(){try{var s=localStorage.getItem('df_theme');var d=(s==='dark')||((!s||s==='system')&&window.matchMedia('(prefers-color-scheme: dark)').matches);document.documentElement.classList.toggle('dark',d);}catch(e){}})();`;

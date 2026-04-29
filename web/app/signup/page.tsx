@@ -84,14 +84,9 @@ export default function SignupPage() {
   return (
     <AuthLayout>
       <div className="space-y-6">
-        <div className="space-y-1.5">
-          <h1 className="text-2xl font-semibold tracking-tight">
-            Create your account
-          </h1>
-          <p className="text-sm text-muted-foreground">
-            Start designing documents in minutes. No credit card required.
-          </p>
-        </div>
+        <h1 className="text-center text-2xl font-semibold tracking-tight">
+          Create your account
+        </h1>
 
         <Form {...form}>
           <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">

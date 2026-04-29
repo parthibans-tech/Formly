@@ -131,6 +131,31 @@
     @apply inline-flex h-5 min-w-5 items-center justify-center rounded border border-border bg-muted px-1 font-mono text-[10px] font-medium text-muted-foreground shadow-subtle;
   }
 
+  /* Marketing-page floating gradient blobs (used by AnimatedMesh).
+     Kept in CSS rather than tailwind.config so the @media reduced-motion
+     guard sits with them. */
+  @keyframes blob-1 {
+    0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
+    33%      { transform: translate3d(40px, -30px, 0) scale(1.08); }
+    66%      { transform: translate3d(-20px, 20px, 0) scale(0.96); }
+  }
+  @keyframes blob-2 {
+    0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
+    33%      { transform: translate3d(-30px, 20px, 0) scale(1.05); }
+    66%      { transform: translate3d(20px, -10px, 0) scale(0.98); }
+  }
+  @keyframes blob-3 {
+    0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
+    33%      { transform: translate3d(20px, 30px, 0) scale(1.06); }
+    66%      { transform: translate3d(-30px, -20px, 0) scale(0.94); }
+  }
+  .animate-blob-1 { animation: blob-1 18s ease-in-out infinite; }
+  .animate-blob-2 { animation: blob-2 22s ease-in-out infinite; }
+  .animate-blob-3 { animation: blob-3 26s ease-in-out infinite; }
+  @media (prefers-reduced-motion: reduce) {
+    .animate-blob-1, .animate-blob-2, .animate-blob-3 { animation: none; }
+  }
+
   /* Subtle surface gradient used for hero/stat cards */
   .surface-gradient {
     background-image: radial-gradient(

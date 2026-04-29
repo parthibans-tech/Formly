@@ -133,21 +133,14 @@ export default function LoginPage() {
     return (
       <AuthLayout>
         <div className="space-y-6">
-          <div className="space-y-1.5">
+          <div className="space-y-2 text-center">
             <div className="inline-flex items-center gap-2 rounded-full bg-primary/10 px-3 py-1 text-xs font-medium text-primary">
               <ShieldCheck className="h-3.5 w-3.5" />
               Two-factor authentication
             </div>
             <h1 className="text-2xl font-semibold tracking-tight">
-              Enter your verification code
+              Enter your code
             </h1>
-            <p className="text-sm text-muted-foreground">
-              Open your authenticator app and enter the 6-digit code for{" "}
-              <span className="font-medium text-foreground">
-                {pending?.email}
-              </span>
-              . Or use one of your recovery codes.
-            </p>
           </div>
           <form onSubmit={onMfaSubmit} className="space-y-4">
             <div>
@@ -198,12 +191,9 @@ export default function LoginPage() {
   return (
     <AuthLayout>
       <div className="space-y-6">
-        <div className="space-y-1.5">
-          <h1 className="text-2xl font-semibold tracking-tight">Welcome back</h1>
-          <p className="text-sm text-muted-foreground">
-            Sign in to your Drive360 workspace to continue.
-          </p>
-        </div>
+        <h1 className="text-center text-2xl font-semibold tracking-tight">
+          Welcome back
+        </h1>
 
         <Form {...form}>
           <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">

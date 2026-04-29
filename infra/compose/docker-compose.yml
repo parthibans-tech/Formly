@@ -86,6 +86,13 @@ services:
       AI_VISION_MODEL: ${AI_VISION_MODEL:-}
       AI_TIMEOUT_SEC: ${AI_TIMEOUT_SEC:-180}
       DOCCHAT_TIMEOUT_SEC: ${DOCCHAT_TIMEOUT_SEC:-180}
+      # ── OCR (tesseract + poppler-utils, baked into api Dockerfile) ──
+      # Without OCR_ENABLED=1, scanned PDFs and image uploads return 415
+      # not_textual from /v1/files/{id}/extract-text. Set to "1" in .env
+      # to turn it on. OCR_LANG passes through to tesseract -l.
+      OCR_ENABLED: ${OCR_ENABLED:-1}
+      OCR_LANG: ${OCR_LANG:-eng}
+      OCR_MAX_PAGES: ${OCR_MAX_PAGES:-30}
       # ── ONLYOFFICE ──
       # ONLYOFFICE_PUBLIC_URL is the URL the BROWSER loads api.js from.
       # Must be HTTPS in prod (matches DOMAIN_OFFICE behind nginx).
