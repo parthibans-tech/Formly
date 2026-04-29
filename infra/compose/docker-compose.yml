@@ -101,13 +101,15 @@ services:
   # ────────────────────────────────────────────────────────────
   # Web — Next.js standalone, built from web/Dockerfile.
   #
-  # Bound to 127.0.0.1:3000 — nginx proxies the public domain to
-  # this port.
+  # Bound to 127.0.0.1:3030 — nginx proxies the public domain to
+  # this port. Container internally still listens on :3000; only the
+  # host-side port differs (3000 is taken by another project on this
+  # VPS).
   # ────────────────────────────────────────────────────────────
   web:
     image: ${WEB_IMAGE:-ghcr.io/your-org/drive360-web:latest}
     ports:
-      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:3030:3000"
     build:
       context: ../../web
       dockerfile: Dockerfile

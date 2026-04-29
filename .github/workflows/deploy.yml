@@ -8,16 +8,17 @@
 #
 #   api-v<X.Y.Z>      → deploy ONLY the Go API
 #   web-v<X.Y.Z>      → deploy ONLY the Next.js web app
-#   nginx-v<X.Y.Z>    → deploy ONLY the nginx reverse-proxy config
-#                       (no image rebuild — just scp + reload)
-#   release-v<X.Y.Z>  → deploy api + web + nginx (use when a change
-#                       crosses everything and they ship together)
+#   release-v<X.Y.Z>  → deploy BOTH (use when a change crosses both
+#                       halves and they need to ship together)
 #
 # Why split: a typo fix in the web costs ~3 min of API rebuild that
 # changed nothing. Splitting keeps API-only deploys to ~1.5 min and
-# rules out "did this web change affect the API?" anxiety. nginx is
-# its own track because reverse-proxy edits are common and never
-# need an image rebuild.
+# rules out "did this web change affect the API?" anxiety.
+#
+# nginx config (infra/nginx/drive360.conf) is NOT deployed by CI —
+# it's pushed manually to the VPS when changed:
+#   scp infra/nginx/drive360.conf root@vps:/etc/nginx/sites-available/drive360
+#   ssh root@vps 'nginx -t && systemctl reload nginx'
 #
 # REQUIRED REPO SECRETS:
 #   HOSTINGER_HOST       — VPS IP or hostname
@@ -57,7 +58,6 @@ on:
     tags:
       - "api-v*"
       - "web-v*"
-      - "nginx-v*"
       - "release-v*"
   workflow_dispatch:
     inputs:
@@ -66,7 +66,7 @@ on:
         required: true
         type: choice
         default: release
-        options: [api, web, nginx, release]
+        options: [api, web, release]
 
 # Don't run two deploys to the same ref simultaneously — the second
 # one's `docker compose up` would race the first.
@@ -88,11 +88,10 @@ jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
-      deploy_api:   ${{ steps.decide.outputs.deploy_api }}
-      deploy_web:   ${{ steps.decide.outputs.deploy_web }}
-      deploy_nginx: ${{ steps.decide.outputs.deploy_nginx }}
-      image_tag:    ${{ steps.decide.outputs.image_tag }}
-      repo_lower:   ${{ steps.decide.outputs.repo_lower }}
+      deploy_api: ${{ steps.decide.outputs.deploy_api }}
+      deploy_web: ${{ steps.decide.outputs.deploy_web }}
+      image_tag:  ${{ steps.decide.outputs.image_tag }}
+      repo_lower: ${{ steps.decide.outputs.repo_lower }}
     steps:
       - id: decide
         shell: bash
@@ -106,16 +105,14 @@ jobs:
             case "$ref" in
               api-v*)     target=api;     image_tag="${ref#api-v}";;
               web-v*)     target=web;     image_tag="${ref#web-v}";;
-              nginx-v*)   target=nginx;   image_tag="${ref#nginx-v}";;
               release-v*) target=release; image_tag="${ref#release-v}";;
               *) echo "::error::Unknown tag shape: $ref"; exit 1;;
             esac
           fi
           case "$target" in
-            api)     api=true;  web=false; nginx=false ;;
-            web)     api=false; web=true;  nginx=false ;;
-            nginx)   api=false; web=false; nginx=true  ;;
-            release) api=true;  web=true;  nginx=true  ;;
+            api)     api=true;  web=false ;;
+            web)     api=false; web=true  ;;
+            release) api=true;  web=true  ;;
           esac
           repo_lower=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
 
@@ -132,11 +129,10 @@ jobs:
           {
             echo "deploy_api=$api"
             echo "deploy_web=$web"
-            echo "deploy_nginx=$nginx"
             echo "image_tag=$image_tag"
             echo "repo_lower=$repo_lower"
           } >> "$GITHUB_OUTPUT"
-          echo "Plan: api=$api web=$web nginx=$nginx tag=$image_tag repo=$repo_lower"
+          echo "Plan: api=$api web=$web tag=$image_tag repo=$repo_lower"
 
   # ═════════════════════════════════════════════════════════════
   # 2. PREFLIGHT — verify SSH + Docker on the VPS before spending
@@ -389,61 +385,11 @@ jobs:
             docker image prune -af --filter "until=168h" || true
 
   # ═════════════════════════════════════════════════════════════
-  # 5b. DEPLOY-NGINX — push the reverse-proxy config and reload.
-  #
-  # Doesn't need build artifacts, so runs in parallel with `deploy`.
-  # The VPS-side helper (/usr/local/sbin/install-drive360-nginx) does
-  # `nginx -t` before the reload — bad config never lands.
-  # ═════════════════════════════════════════════════════════════
-  deploy-nginx:
-    needs: [plan, preflight]
-    if: needs.plan.outputs.deploy_nginx == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: VPS — stage nginx config
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.HOSTINGER_HOST }}
-          username: ${{ secrets.HOSTINGER_USER }}
-          key: ${{ secrets.HOSTINGER_SSH_KEY }}
-          port: ${{ secrets.HOSTINGER_SSH_PORT || 22 }}
-          source: "infra/nginx/drive360.conf"
-          target: "/home/deploy/"
-          strip_components: 2
-          overwrite: true
-
-      - name: VPS — install + reload nginx
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.HOSTINGER_HOST }}
-          username: ${{ secrets.HOSTINGER_USER }}
-          key: ${{ secrets.HOSTINGER_SSH_KEY }}
-          port: ${{ secrets.HOSTINGER_SSH_PORT || 22 }}
-          command_timeout: 60s
-          script: |
-            set -euo pipefail
-            # The scp step lands the file at /home/deploy/drive360.conf.
-            # Rename to the path the helper expects, then invoke it.
-            mv /home/deploy/drive360.conf /home/deploy/drive360-nginx.conf
-            sudo /usr/local/sbin/install-drive360-nginx
-
-  # ═════════════════════════════════════════════════════════════
   # 6. SMOKE TESTS — separate job so a deploy-success/test-failure
   #    is visually distinct from a deploy failure in GHA UI.
   # ═════════════════════════════════════════════════════════════
   smoke:
-    needs: [plan, deploy, deploy-nginx]
-    # Run as long as nothing actually failed. `deploy` is skipped on
-    # nginx-only tags and `deploy-nginx` is skipped on api/web-only
-    # tags — neither should block smoke tests.
-    if: |
-      always() &&
-      needs.plan.result == 'success' &&
-      (needs.deploy.result == 'success' || needs.deploy.result == 'skipped') &&
-      (needs.deploy-nginx.result == 'success' || needs.deploy-nginx.result == 'skipped')
+    needs: [plan, deploy]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -485,7 +431,6 @@ jobs:
             echo "## Deploy succeeded ✅"
             echo "- Tag: \`${GITHUB_REF_NAME}\`"
             echo "- Image tag: \`${{ needs.plan.outputs.image_tag }}\`"
-            echo "- API:   ${{ needs.plan.outputs.deploy_api }}"
-            echo "- Web:   ${{ needs.plan.outputs.deploy_web }}"
-            echo "- Nginx: ${{ needs.plan.outputs.deploy_nginx }}"
+            echo "- API: ${{ needs.plan.outputs.deploy_api }}"
+            echo "- Web: ${{ needs.plan.outputs.deploy_web }}"
           } >> "$GITHUB_STEP_SUMMARY"
