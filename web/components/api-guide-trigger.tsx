@@ -73,6 +73,13 @@ export function ApiGuideSheet({ templateId, templateName, label = "API" }: Props
             >
               Open full page
             </Link>
+            {" · "}
+            <Link
+              href={`/templates/${templateId}/settings`}
+              className="underline underline-offset-2"
+            >
+              Output &amp; security
+            </Link>
           </SheetDescription>
         </SheetHeader>
         <ApiGuide templateId={templateId} refreshKey={refreshKey} compact />

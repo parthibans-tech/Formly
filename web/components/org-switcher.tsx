@@ -62,12 +62,27 @@ export function OrgSwitcher() {
     }
     setSwitching(true);
     try {
-      const res = await api<{ token: string; orgId: string; role: string }>(
-        "/v1/me/switch-org",
-        { method: "POST", body: JSON.stringify({ orgId: m.orgId }) }
-      );
+      const res = await api<{
+        token: string;
+        orgId: string;
+        role: string;
+        orgKind?: string;
+      }>("/v1/me/switch-org", {
+        method: "POST",
+        body: JSON.stringify({ orgId: m.orgId }),
+      });
       const u = getUser() || {};
-      setSession(res.token, { ...u, orgId: res.orgId, role: res.role });
+      // Merge orgKind alongside id+role so the sidebar's first paint
+      // after the upcoming reload already knows whether to render
+      // team-only nav (the alternative — a stale cached `kind` from
+      // the previous workspace — flashes the Team link briefly when
+      // switching from a team org into a personal one).
+      setSession(res.token, {
+        ...u,
+        orgId: res.orgId,
+        role: res.role,
+        orgKind: res.orgKind ?? u.orgKind ?? "team",
+      });
       // Full reload — every page caches data tied to the previous org,
       // so a soft re-render isn't enough. Send the user to /drive so
       // they land on a known-good route in the new workspace.

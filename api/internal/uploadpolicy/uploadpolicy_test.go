@@ -139,10 +139,34 @@ func TestSniffMime(t *testing.T) {
 		// — legitimate uploads must NOT trip —
 		{"pdf as pdf", pdfHead, "application/pdf", false},
 		{"png as png", pngHead, "image/png", false},
-		{"docx declared with full office mime detects as zip but allowed via family heuristic? not — DOCX's full mime != zip family",
+		// DOCX / XLSX / PPTX / ODT / EPUB are physically ZIP, so
+		// http.DetectContentType returns application/zip. The
+		// ZIP-container exemption recognises the declared OOXML/ODF/EPUB
+		// MIMEs and passes them through — otherwise every legitimate
+		// office upload trips the strict reject path.
+		{"docx declared with full office mime allowed via zip-container exemption",
 			zipHead,
 			"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-			true /* deliberate: SniffMime is strict, the canonical merge layer is what tolerates this */},
+			false},
+		{"xlsx declared with full office mime allowed",
+			zipHead,
+			"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+			false},
+		{"odt declared allowed",
+			zipHead,
+			"application/vnd.oasis.opendocument.text",
+			false},
+		{"epub allowed",
+			zipHead,
+			"application/epub+zip",
+			false},
+		// But the exemption is narrow — a forged "application/pdf"
+		// declaration with ZIP bytes still rejects, because PDF isn't
+		// in the ZIP-container allowlist.
+		{"zip bytes claiming an unrelated MIME still rejects",
+			zipHead,
+			"application/vnd.unknown.format",
+			true},
 
 		// — declared MIMEs we deliberately don't second-guess —
 		{"unknown declaration is trusted", pdfHead, "application/octet-stream", false},
@@ -172,10 +196,30 @@ func TestCanonicalMime(t *testing.T) {
 	}{
 		// Specific declaration, agreeing detection — keep specific.
 		{"png declared, png detected", "image/png", "image/png", "image/png"},
-		{"docx declared, zip detected — keep docx (family agnostic exemption is for office types)",
+		// DOCX / XLSX / PPTX / ODT / EPUB are physically ZIP archives — the
+		// detected family will always be application/zip. Persisting the
+		// "bytes-truth" would clobber the precise office MIME and break
+		// every downstream branch (convert pipeline, preview renderer,
+		// extractor selection), so the ZIP-container exemption keeps the
+		// declaration.
+		{"docx declared, zip detected — keep docx via ZIP-container exemption",
 			"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 			"application/zip",
-			"application/zip" /* family mismatch: caller relies on SniffMime + reject path for office types in strict mode */},
+			"application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+		{"xlsx declared, zip detected — keep xlsx",
+			"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+			"application/zip",
+			"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+		{"epub declared, zip detected — keep epub",
+			"application/epub+zip",
+			"application/zip",
+			"application/epub+zip"},
+		// But the exemption is narrow — an unknown declaration with ZIP
+		// bytes still gets clobbered to bytes-truth (forgery defense).
+		{"unknown declared, zip detected — bytes win",
+			"application/vnd.unknown.format",
+			"application/zip",
+			"application/zip"},
 
 		// Generic declaration, specific detection — upgrade to detection.
 		{"octet-stream declared, pdf detected", "application/octet-stream", "application/pdf", "application/pdf"},

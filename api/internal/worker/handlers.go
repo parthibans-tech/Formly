@@ -241,7 +241,10 @@ func (h *Handlers) generateOne(ctx context.Context, t *asynq.Task) error {
 	h.Log.Info("job started", "kind", "one", "job", p.JobID)
 	_ = jobs.MarkRunning(ctx, h.DB, p.JobID)
 
-	res, err := h.Runner.Run(ctx, p.OrgID, p.UserID, p.TemplateID, p.Data, p.Flatten)
+	res, err := h.Runner.RunWithOpts(ctx, p.OrgID, p.UserID, p.TemplateID, p.Data, p.Flatten, &generate.RunOptions{
+		OutputName: p.OutputName,
+		OutputPath: p.OutputPath,
+	})
 	if err != nil {
 		_ = jobs.MarkFailed(ctx, h.DB, p.JobID, err.Error())
 		return err

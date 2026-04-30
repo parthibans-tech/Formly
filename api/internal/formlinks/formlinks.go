@@ -302,11 +302,19 @@ func (h *Handler) Submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The submitter isn't authenticated. Attribute the generation to whichever
-	// user in the org owns the form link so the files table's FK is satisfied.
+	// The submitter isn't authenticated. Attribute the generation to
+	// whichever member of this org has been around the longest so the
+	// files-table FK is satisfied. Phase 4: source from org_memberships
+	// — picks up cross-org members too, and "longest in this org" is
+	// closer to the spirit of an attribution fallback than "longest on
+	// the platform".
 	var ownerUser string
-	if err := h.DB.QueryRow(r.Context(),
-		`SELECT id FROM users WHERE org_id=$1 ORDER BY created_at ASC LIMIT 1`, orgID,
+	if err := h.DB.QueryRow(r.Context(), `
+		SELECT user_id::text
+		  FROM org_memberships
+		 WHERE org_id = $1
+		 ORDER BY created_at ASC
+		 LIMIT 1`, orgID,
 	).Scan(&ownerUser); err != nil {
 		writeErr(w, 500, "no_owner", "no users in org")
 		return

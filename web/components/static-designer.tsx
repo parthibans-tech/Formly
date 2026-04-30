@@ -260,7 +260,11 @@ export default function StaticDesigner({
   const [showGrid, setShowGrid] = useState(false);
   const [snapToGrid, setSnapToGrid] = useState(false);
   const [clipboard, setClipboard] = useState<Widget[]>([]);
-  const [autoSave, setAutoSave] = useState(true);
+  // Default off: auto-save can mask intent (an in-progress widget drag
+  // gets versioned the moment the debounce timer fires). Authors opt in
+  // via the View menu / palette ("Enable auto-save") when they want the
+  // convenience.
+  const [autoSave, setAutoSave] = useState(false);
   // Zoom is applied on top of SCALE — effective render scale = SCALE * zoom.
   const [zoom, setZoom] = useState(1);
   const [fullscreen, setFullscreen] = useState(false);

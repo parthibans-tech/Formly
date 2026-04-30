@@ -35,14 +35,18 @@ import {
   ArrowLeft,
   Crop,
   Download,
+  FileStack,
   FlipHorizontal,
   FlipVertical,
   Image as ImageIcon,
   ImagePlus,
+  Layers,
   Loader2,
+  Maximize2,
   RotateCcw,
   RotateCw,
   Save,
+  Sliders,
   Sparkles,
   Undo2,
   WandSparkles,
@@ -139,6 +143,20 @@ export default function ImageDesigner({
   // user clicking Save without reading any copy ends up with both a
   // pristine original and an edited copy — the safer outcome.
   const [overwrite, setOverwrite] = useState(false);
+
+  // Right-rail tab. The original layout stacked every section in one
+  // long scrollable column, which forced the user to scroll past Crop /
+  // Rotate / Resize just to reach Filters or Output. Switching to a
+  // Photoshop-style icon strip + single-panel-at-a-time view means
+  // every group fits in one viewport — no scrolling, faster discovery.
+  type ToolTab =
+    | "transform"
+    | "resize"
+    | "adjust"
+    | "filters"
+    | "export"
+    | "pipeline";
+  const [tab, setTab] = useState<ToolTab>("transform");
 
   const imgRef = useRef<HTMLImageElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
@@ -429,221 +447,379 @@ export default function ImageDesigner({
           </div>
         </section>
 
-        {/* Right rail — op toolbox, slider grouping, save options. */}
-        <aside className="w-[320px] shrink-0 overflow-y-auto border-l bg-background p-5 space-y-6">
-          {err && (
-            <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-              {err}
+        {/* Right rail — split into a vertical icon strip (category
+            picker) + a single panel showing only the active category.
+            Each panel is short enough to fit a typical viewport without
+            scrolling, so users no longer have to scroll past unrelated
+            sections to reach Filters / Export. */}
+        <aside className="flex w-[360px] shrink-0 flex-row border-l bg-background">
+          {/* Vertical icon strip — always visible. The Pipeline tab
+              shows the staged-op count as a tiny badge so the user can
+              see at a glance what's queued without leaving their tab. */}
+          <nav className="flex w-14 shrink-0 flex-col items-stretch gap-0.5 border-r bg-muted/30 py-2">
+            <ToolTabBtn
+              label="Transform"
+              icon={<Crop className="h-4 w-4" />}
+              active={tab === "transform"}
+              onClick={() => setTab("transform")}
+            />
+            <ToolTabBtn
+              label="Resize"
+              icon={<Maximize2 className="h-4 w-4" />}
+              active={tab === "resize"}
+              onClick={() => setTab("resize")}
+            />
+            <ToolTabBtn
+              label="Adjust"
+              icon={<Sliders className="h-4 w-4" />}
+              active={tab === "adjust"}
+              onClick={() => setTab("adjust")}
+            />
+            <ToolTabBtn
+              label="Filters"
+              icon={<Sparkles className="h-4 w-4" />}
+              active={tab === "filters"}
+              onClick={() => setTab("filters")}
+            />
+            <ToolTabBtn
+              label="Export"
+              icon={<ImageIcon className="h-4 w-4" />}
+              active={tab === "export"}
+              onClick={() => setTab("export")}
+            />
+            <ToolTabBtn
+              label="Pipeline"
+              icon={<Layers className="h-4 w-4" />}
+              active={tab === "pipeline"}
+              badge={stagedOps.length > 0 ? stagedOps.length : undefined}
+              onClick={() => setTab("pipeline")}
+            />
+          </nav>
+
+          {/* Active panel. Each panel manages its own padding so the
+              dense ones (Adjust, Pipeline) get more breathing room
+              than the chunky button grids (Transform, Filters). */}
+          <div className="flex min-w-0 flex-1 flex-col">
+            {/* Panel header — name + a one-line hint about what the
+                panel does. Sticky-light: keeps context if a panel ever
+                does need to scroll on very short viewports. */}
+            <div className="flex items-center gap-2 border-b px-4 py-3">
+              <PanelTitle tab={tab} />
             </div>
-          )}
 
-          <section className="space-y-2">
-            <h3 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              <Crop className="h-3.5 w-3.5" />
-              Crop
-            </h3>
-            <div className="flex gap-2">
-              <Button
-                variant={cropMode ? "default" : "outline"}
-                size="sm"
-                className="flex-1"
-                onClick={() => {
-                  if (cropMode) {
-                    applyCrop();
-                  } else {
-                    setCropMode(true);
-                    // Default to a centered 60% rect on enter so the
-                    // user sees something to grab immediately.
-                    if (imgRef.current) {
-                      const r = imgRef.current.getBoundingClientRect();
-                      setCropRect({
-                        x: r.width * 0.2,
-                        y: r.height * 0.2,
-                        w: r.width * 0.6,
-                        h: r.height * 0.6,
-                      });
-                    }
-                  }
-                }}
-              >
-                {cropMode ? "Apply crop" : "Start crop"}
-              </Button>
-              {cropMode && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => {
-                    setCropMode(false);
-                    setCropRect(null);
-                  }}
-                >
-                  Cancel
-                </Button>
-              )}
-            </div>
-          </section>
-
-          <section className="space-y-2">
-            <h3 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              <RotateCw className="h-3.5 w-3.5" />
-              Rotate & flip
-            </h3>
-            <div className="grid grid-cols-2 gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => pushOp({ kind: "rotate", preset: "90ccw" })}
-              >
-                <RotateCcw className="h-4 w-4" />
-                90° CCW
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => pushOp({ kind: "rotate", preset: "90cw" })}
-              >
-                <RotateCw className="h-4 w-4" />
-                90° CW
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => pushOp({ kind: "rotate", preset: "180" })}
-              >
-                180°
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => pushOp({ kind: "flip", axis: "h" })}
-              >
-                <FlipHorizontal className="h-4 w-4" />
-                Flip H
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => pushOp({ kind: "flip", axis: "v" })}
-              >
-                <FlipVertical className="h-4 w-4" />
-                Flip V
-              </Button>
-            </div>
-          </section>
-
-          <section className="space-y-2">
-            <h3 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              <ImagePlus className="h-3.5 w-3.5" />
-              HD upscale
-            </h3>
-            <p className="text-[11px] text-muted-foreground">
-              Lanczos resampling — sharper at 2×/4×, no extra deps.
-            </p>
-            <div className="grid grid-cols-3 gap-2">
-              <Button variant="outline" size="sm" onClick={() => pushOp({ kind: "upscale", factor: "2x" })}>
-                2×
-              </Button>
-              <Button variant="outline" size="sm" onClick={() => pushOp({ kind: "upscale", factor: "3x" })}>
-                3×
-              </Button>
-              <Button variant="outline" size="sm" onClick={() => pushOp({ kind: "upscale", factor: "4x" })}>
-                4×
-              </Button>
-            </div>
-          </section>
-
-          <ResizeBox natural={natural} onResize={(op) => pushOp(op)} />
-
-          <section className="space-y-3">
-            <h3 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              <WandSparkles className="h-3.5 w-3.5" />
-              Adjustments
-            </h3>
-            <SliderRow label="Brightness" value={brightness} onChange={setBrightness} />
-            <SliderRow label="Contrast" value={contrast} onChange={setContrast} />
-            <SliderRow label="Saturation" value={saturation} onChange={setSaturation} />
-            <Button
-              variant="ghost"
-              size="sm"
-              className="w-full"
-              disabled={brightness === 0 && contrast === 0 && saturation === 0}
-              onClick={applyAdjustments}
-            >
-              Commit adjustments
-            </Button>
-          </section>
-
-          <section className="space-y-2">
-            <h3 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              <Sparkles className="h-3.5 w-3.5" />
-              Filters
-            </h3>
-            <div className="grid grid-cols-2 gap-2">
-              <Button variant="outline" size="sm" onClick={() => pushOp({ kind: "filter", name: "grayscale" })}>
-                Grayscale
-              </Button>
-              <Button variant="outline" size="sm" onClick={() => pushOp({ kind: "filter", name: "invert" })}>
-                Invert
-              </Button>
-              <Button variant="outline" size="sm" onClick={() => pushOp({ kind: "filter", name: "sepia" })}>
-                Sepia
-              </Button>
-              <Button variant="outline" size="sm" onClick={() => pushOp({ kind: "filter", name: "blur", sigma: 2 })}>
-                Blur
-              </Button>
-              <Button variant="outline" size="sm" onClick={() => pushOp({ kind: "filter", name: "sharpen", sigma: 1 })}>
-                Sharpen
-              </Button>
-            </div>
-          </section>
-
-          <section className="space-y-2">
-            <h3 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              <ImageIcon className="h-3.5 w-3.5" />
-              Output format
-            </h3>
-            <Select value={format} onValueChange={setFormat}>
-              <SelectTrigger className="h-8 text-xs">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="png">PNG (lossless + alpha)</SelectItem>
-                <SelectItem value="jpeg">JPEG (smaller, no alpha)</SelectItem>
-                <SelectItem value="gif">GIF</SelectItem>
-              </SelectContent>
-            </Select>
-            {format === "jpeg" && (
-              <div className="space-y-1">
-                <Label className="text-[11px] text-muted-foreground">
-                  Quality — {quality}
-                </Label>
-                <input
-                  type="range"
-                  min={1}
-                  max={100}
-                  step={1}
-                  value={quality}
-                  onChange={(e) => setQuality(parseInt(e.target.value, 10))}
-                  className="w-full accent-primary"
-                />
+            {/* Errors are panel-agnostic — surface them above whichever
+                panel is open so the user sees them no matter which tab
+                they're on when a transform fails. */}
+            {err && (
+              <div className="mx-4 mt-3 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                {err}
               </div>
             )}
-          </section>
 
-          {stagedOps.length > 0 && (
-            <section className="space-y-1">
-              <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                Pipeline ({stagedOps.length})
-              </h3>
-              <ol className="space-y-1 text-[11px] text-muted-foreground">
-                {stagedOps.map((op, i) => (
-                  <li key={i} className="truncate font-mono">
-                    {i + 1}. {describeOp(op)}
-                  </li>
-                ))}
-              </ol>
-            </section>
-          )}
+            <div className="min-h-0 flex-1 overflow-y-auto p-4">
+              {tab === "transform" && (
+                <div className="space-y-5">
+                  <section className="space-y-2">
+                    <PanelSubhead icon={<Crop className="h-3.5 w-3.5" />} label="Crop" />
+                    <div className="flex gap-2">
+                      <Button
+                        variant={cropMode ? "default" : "outline"}
+                        size="sm"
+                        className="flex-1"
+                        onClick={() => {
+                          if (cropMode) {
+                            applyCrop();
+                          } else {
+                            setCropMode(true);
+                            // Default to a centered 60% rect on enter so the
+                            // user sees something to grab immediately.
+                            if (imgRef.current) {
+                              const r = imgRef.current.getBoundingClientRect();
+                              setCropRect({
+                                x: r.width * 0.2,
+                                y: r.height * 0.2,
+                                w: r.width * 0.6,
+                                h: r.height * 0.6,
+                              });
+                            }
+                          }
+                        }}
+                      >
+                        {cropMode ? "Apply crop" : "Start crop"}
+                      </Button>
+                      {cropMode && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => {
+                            setCropMode(false);
+                            setCropRect(null);
+                          }}
+                        >
+                          Cancel
+                        </Button>
+                      )}
+                    </div>
+                  </section>
+
+                  <section className="space-y-2">
+                    <PanelSubhead
+                      icon={<RotateCw className="h-3.5 w-3.5" />}
+                      label="Rotate & flip"
+                    />
+                    <div className="grid grid-cols-2 gap-2">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => pushOp({ kind: "rotate", preset: "90ccw" })}
+                      >
+                        <RotateCcw className="h-4 w-4" />
+                        90° CCW
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => pushOp({ kind: "rotate", preset: "90cw" })}
+                      >
+                        <RotateCw className="h-4 w-4" />
+                        90° CW
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => pushOp({ kind: "rotate", preset: "180" })}
+                      >
+                        180°
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => pushOp({ kind: "flip", axis: "h" })}
+                      >
+                        <FlipHorizontal className="h-4 w-4" />
+                        Flip H
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => pushOp({ kind: "flip", axis: "v" })}
+                      >
+                        <FlipVertical className="h-4 w-4" />
+                        Flip V
+                      </Button>
+                    </div>
+                  </section>
+                </div>
+              )}
+
+              {tab === "resize" && (
+                <div className="space-y-5">
+                  <ResizeBox natural={natural} onResize={(op) => pushOp(op)} />
+                  <section className="space-y-2">
+                    <PanelSubhead
+                      icon={<ImagePlus className="h-3.5 w-3.5" />}
+                      label="HD upscale"
+                    />
+                    <p className="text-[11px] text-muted-foreground">
+                      Lanczos resampling — sharper at 2×/4×, no extra deps.
+                    </p>
+                    <div className="grid grid-cols-3 gap-2">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => pushOp({ kind: "upscale", factor: "2x" })}
+                      >
+                        2×
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => pushOp({ kind: "upscale", factor: "3x" })}
+                      >
+                        3×
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => pushOp({ kind: "upscale", factor: "4x" })}
+                      >
+                        4×
+                      </Button>
+                    </div>
+                  </section>
+                </div>
+              )}
+
+              {tab === "adjust" && (
+                <section className="space-y-3">
+                  <PanelSubhead
+                    icon={<WandSparkles className="h-3.5 w-3.5" />}
+                    label="Live adjustments"
+                  />
+                  <SliderRow
+                    label="Brightness"
+                    value={brightness}
+                    onChange={setBrightness}
+                  />
+                  <SliderRow
+                    label="Contrast"
+                    value={contrast}
+                    onChange={setContrast}
+                  />
+                  <SliderRow
+                    label="Saturation"
+                    value={saturation}
+                    onChange={setSaturation}
+                  />
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="w-full"
+                    disabled={
+                      brightness === 0 && contrast === 0 && saturation === 0
+                    }
+                    onClick={applyAdjustments}
+                  >
+                    Commit adjustments
+                  </Button>
+                  <p className="pt-1 text-[11px] text-muted-foreground">
+                    Sliders preview live; commit pins them onto the pipeline so
+                    further edits stack on top.
+                  </p>
+                </section>
+              )}
+
+              {tab === "filters" && (
+                <section className="space-y-2">
+                  <PanelSubhead
+                    icon={<Sparkles className="h-3.5 w-3.5" />}
+                    label="One-tap filters"
+                  />
+                  <div className="grid grid-cols-2 gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => pushOp({ kind: "filter", name: "grayscale" })}
+                    >
+                      Grayscale
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => pushOp({ kind: "filter", name: "invert" })}
+                    >
+                      Invert
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => pushOp({ kind: "filter", name: "sepia" })}
+                    >
+                      Sepia
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => pushOp({ kind: "filter", name: "blur", sigma: 2 })}
+                    >
+                      Blur
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => pushOp({ kind: "filter", name: "sharpen", sigma: 1 })}
+                    >
+                      Sharpen
+                    </Button>
+                  </div>
+                </section>
+              )}
+
+              {tab === "export" && (
+                <section className="space-y-3">
+                  <PanelSubhead
+                    icon={<ImageIcon className="h-3.5 w-3.5" />}
+                    label="Output format"
+                  />
+                  <Select value={format} onValueChange={setFormat}>
+                    <SelectTrigger className="h-8 text-xs">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="png">PNG (lossless + alpha)</SelectItem>
+                      <SelectItem value="jpeg">JPEG (smaller, no alpha)</SelectItem>
+                      <SelectItem value="gif">GIF</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  {format === "jpeg" && (
+                    <div className="space-y-1">
+                      <Label className="text-[11px] text-muted-foreground">
+                        Quality — {quality}
+                      </Label>
+                      <input
+                        type="range"
+                        min={1}
+                        max={100}
+                        step={1}
+                        value={quality}
+                        onChange={(e) => setQuality(parseInt(e.target.value, 10))}
+                        className="w-full accent-primary"
+                      />
+                    </div>
+                  )}
+                  <p className="pt-1 text-[11px] text-muted-foreground">
+                    Format applies on the next preview / save. JPEG strips
+                    transparency — pick PNG if the image has alpha.
+                  </p>
+                </section>
+              )}
+
+              {tab === "pipeline" && (
+                <section className="space-y-2">
+                  <PanelSubhead
+                    icon={<FileStack className="h-3.5 w-3.5" />}
+                    label={`Pipeline (${stagedOps.length})`}
+                  />
+                  {stagedOps.length === 0 ? (
+                    <p className="rounded-md border border-dashed bg-muted/30 px-3 py-6 text-center text-xs text-muted-foreground">
+                      No operations yet. Crop, rotate, or apply a filter
+                      and you&rsquo;ll see the steps queued here.
+                    </p>
+                  ) : (
+                    <>
+                      <ol className="space-y-1 text-[11px] text-muted-foreground">
+                        {stagedOps.map((op, i) => (
+                          <li key={i} className="truncate font-mono">
+                            {i + 1}. {describeOp(op)}
+                          </li>
+                        ))}
+                      </ol>
+                      <div className="flex gap-2 pt-2">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="flex-1"
+                          onClick={undo}
+                          disabled={ops.length === 0}
+                        >
+                          <Undo2 className="h-3.5 w-3.5" />
+                          Undo last
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="flex-1"
+                          onClick={resetAll}
+                        >
+                          Reset
+                        </Button>
+                      </div>
+                    </>
+                  )}
+                </section>
+              )}
+            </div>
+          </div>
         </aside>
       </div>
     </div>
@@ -651,6 +827,110 @@ export default function ImageDesigner({
 }
 
 // --- Sub-components ----------------------------------------------------
+
+// ToolTabBtn — one entry in the vertical category strip. Stacks an
+// icon over a 9px label so the strip stays narrow (56px) without
+// becoming unreadable. The active item gets a left accent bar so the
+// selection is obvious without relying on color alone.
+function ToolTabBtn({
+  label,
+  icon,
+  active,
+  badge,
+  onClick,
+}: {
+  label: string;
+  icon: React.ReactNode;
+  active: boolean;
+  badge?: number;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={label}
+      aria-label={label}
+      aria-pressed={active}
+      className={cn(
+        "group relative flex flex-col items-center justify-center gap-1 px-1 py-2 text-[10px] font-medium transition",
+        active
+          ? "bg-background text-foreground"
+          : "text-muted-foreground hover:bg-background/60 hover:text-foreground",
+      )}
+    >
+      {/* Active accent — left bar, visible-and-color-blind-friendly. */}
+      <span
+        aria-hidden
+        className={cn(
+          "absolute inset-y-1 left-0 w-0.5 rounded-r-full transition",
+          active ? "bg-primary" : "bg-transparent",
+        )}
+      />
+      <span className="relative">
+        {icon}
+        {badge != null && badge > 0 && (
+          <span className="absolute -right-2 -top-1.5 inline-flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-primary px-1 text-[9px] font-semibold leading-none text-primary-foreground">
+            {badge > 9 ? "9+" : badge}
+          </span>
+        )}
+      </span>
+      <span className="leading-tight">{label}</span>
+    </button>
+  );
+}
+
+// PanelTitle — the breadcrumb-style heading at the top of each panel.
+// Tied to the active tab so the user always knows which group they're
+// looking at, even though only the strip's icon-button gives a visual
+// cue from the side.
+type PanelTab =
+  | "transform"
+  | "resize"
+  | "adjust"
+  | "filters"
+  | "export"
+  | "pipeline";
+
+const PANEL_META: Record<PanelTab, { title: string; hint: string }> = {
+  transform: { title: "Transform", hint: "Crop, rotate, flip the image." },
+  resize: { title: "Resize", hint: "Set output dimensions or upscale." },
+  adjust: {
+    title: "Adjust",
+    hint: "Fine-tune brightness, contrast, saturation.",
+  },
+  filters: { title: "Filters", hint: "One-tap colour effects." },
+  export: { title: "Export", hint: "Output format and quality." },
+  pipeline: { title: "Pipeline", hint: "Review and undo staged ops." },
+};
+
+function PanelTitle({ tab }: { tab: PanelTab }) {
+  const m = PANEL_META[tab];
+  return (
+    <div className="min-w-0">
+      <h2 className="truncate text-sm font-semibold">{m.title}</h2>
+      <p className="truncate text-[11px] text-muted-foreground">{m.hint}</p>
+    </div>
+  );
+}
+
+// PanelSubhead — the small section header inside a panel. Mirrors the
+// old `<h3>` styling so the visual rhythm carries over from the
+// previous stacked layout.
+function PanelSubhead({
+  icon,
+  label,
+}: {
+  icon: React.ReactNode;
+  label: string;
+}) {
+  return (
+    <h3 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+      {icon}
+      {label}
+    </h3>
+  );
+}
 
 function SliderRow({
   label,

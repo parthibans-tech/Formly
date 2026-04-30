@@ -136,6 +136,22 @@ func notifyTrialEnding(ctx context.Context, db *pgxpool.Pool, mailer MailerSende
 		map[string]any{"daysLeft": daysLeft})
 }
 
+// notifyTrialExpired fires from the dunning sweep that catches trials
+// whose `trial_ends_at` passed without a payment method on file. After
+// this mail goes out, the org's writes are gated until the admin picks
+// a plan on /settings/billing. The trial is one-time per org and won't
+// be re-granted, so the only way forward is checkout.
+func notifyTrialExpired(ctx context.Context, db *pgxpool.Pool, mailer MailerSender, orgID, planName string) {
+	subject := "Your trial has ended — choose a plan to continue"
+	body := fmt.Sprintf(
+		"Your %s trial has ended. Workspace data is preserved, but new uploads, invites, and integrations are paused until you choose a plan. Pick one on /settings/billing — checkout takes a minute.",
+		planName,
+	)
+	SendBillingNotice(ctx, db, mailer, orgID, "billing_trial_expired",
+		subject, htmlWrap(subject, body), body,
+		map[string]any{"planName": planName})
+}
+
 func plural(n int) string {
 	if n == 1 {
 		return ""

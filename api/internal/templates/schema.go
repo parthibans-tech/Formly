@@ -29,6 +29,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -36,6 +37,15 @@ import (
 	"github.com/docforge/api/internal/generate/acroform"
 	"github.com/go-chi/chi/v5"
 )
+
+// placeholderRegex returns the {{key}} matcher used for the path/name
+// placeholder list in the schema response. Wrapped in a function so the
+// (small) compiled regex is created once per call without exporting it
+// — pathtpl already owns the canonical version, but we keep a private
+// copy here to avoid an internal-package import cycle.
+func placeholderRegex() *regexp.Regexp {
+	return regexp.MustCompile(`\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}`)
+}
 
 // ctx is a short alias for context.Context — keeps handler helper
 // signatures readable without leaking the package name everywhere.
@@ -65,6 +75,33 @@ type schemaEndpoint struct {
 	AuthSchemes []string `json:"authSchemes"` // e.g. ["Bearer <api-key>", "Bearer <session-jwt>"]
 }
 
+// outputDoc is the integrator-facing description of the template's
+// output naming + folder rules. We surface only the templates (with the
+// {{key}} placeholders left in) — never the resolved values, since
+// resolution depends on the request data the caller is about to send.
+type outputDoc struct {
+	FolderPath       string `json:"folderPath,omitempty"`
+	FilenameTemplate string `json:"filenameTemplate,omitempty"`
+	// Placeholders is the set of {{key}}s referenced anywhere in the
+	// folderPath or filenameTemplate. Helpful for the API guide UI to
+	// flag "you'll need to send `customerName` in `data` for this
+	// template's path to resolve".
+	Placeholders []string `json:"placeholders,omitempty"`
+}
+
+// securityDoc surfaces the *shape* of security policy without leaking
+// passwords. Integrators need to know "this template enforces a print-
+// only PDF" without the API guide doubling as a credential dump.
+type securityDoc struct {
+	Enabled        bool `json:"enabled"`
+	HasUserPassword  bool `json:"hasUserPassword"`
+	HasOwnerPassword bool `json:"hasOwnerPassword"`
+	Encryption     string `json:"encryption,omitempty"` // "AES-128" | "AES-256"
+	// Permissions: per-action allow flags. Only meaningful when Enabled
+	// is true; absent fields default to false (denied).
+	Permissions map[string]bool `json:"permissions,omitempty"`
+}
+
 // SchemaResp is the full payload for /v1/templates/:id/schema.
 type SchemaResp struct {
 	TemplateID   string                 `json:"templateId"`
@@ -74,6 +111,8 @@ type SchemaResp struct {
 	Fields       []schemaField          `json:"fields"`
 	JSONSchema   map[string]interface{} `json:"jsonSchema"` // JSON Schema draft-07 for the `data` body
 	Example      map[string]interface{} `json:"example"`    // a filled-in example payload
+	Output       *outputDoc             `json:"output,omitempty"`
+	Security     *securityDoc           `json:"security,omitempty"`
 	Notes        []string               `json:"notes,omitempty"`
 }
 
@@ -100,6 +139,16 @@ func (h *Handler) Schema(w http.ResponseWriter, r *http.Request) {
 		Placeholders []string                               `json:"placeholders"`
 		Validations  map[string]*acroform.ValidationRule    `json:"validations"`
 		Required     []string                               `json:"required"`
+		Output       *struct {
+			FolderPath       string `json:"folderPath"`
+			FilenameTemplate string `json:"filenameTemplate"`
+		} `json:"output"`
+		Security *struct {
+			OwnerPassword string                 `json:"ownerPassword"`
+			UserPassword  string                 `json:"userPassword"`
+			Encryption    string                 `json:"encryption"`
+			Permissions   map[string]interface{} `json:"permissions"`
+		} `json:"security"`
 	}
 	_ = json.Unmarshal(cfgRaw, &cfg)
 
@@ -122,6 +171,48 @@ func (h *Handler) Schema(w http.ResponseWriter, r *http.Request) {
 	jsonSchema := buildJSONSchema(fields)
 	example := buildExample(fields)
 
+	// Output naming / folder hints — surface only the templates with
+	// {{key}} placeholders intact, plus the deduped placeholder list so
+	// the API guide can flag "you'll need these keys for the path to
+	// resolve cleanly".
+	var outDoc *outputDoc
+	if cfg.Output != nil && (cfg.Output.FolderPath != "" || cfg.Output.FilenameTemplate != "") {
+		outDoc = &outputDoc{
+			FolderPath:       cfg.Output.FolderPath,
+			FilenameTemplate: cfg.Output.FilenameTemplate,
+			Placeholders:     extractPlaceholders(cfg.Output.FolderPath, cfg.Output.FilenameTemplate),
+		}
+		notes = append(notes, "Output filename/folder support `{{key}}` placeholders resolved against your `data` payload — missing keys collapse to empty strings, so guard against that with sensible templates.")
+	}
+
+	// Security policy summary. We never echo passwords; the caller
+	// already set them and doesn't need them returned. The UI uses
+	// `enabled` and the per-permission flags to render a "this template
+	// outputs a password-protected PDF with print enabled" panel.
+	var secDoc *securityDoc
+	if cfg.Security != nil && (cfg.Security.OwnerPassword != "" || cfg.Security.UserPassword != "") {
+		perms := map[string]bool{}
+		for _, k := range []string{"print", "copy", "modify", "annotate"} {
+			if v, ok := cfg.Security.Permissions[k]; ok {
+				if b, ok := v.(bool); ok {
+					perms[k] = b
+				}
+			}
+		}
+		enc := cfg.Security.Encryption
+		if enc == "" {
+			enc = "AES-256"
+		}
+		secDoc = &securityDoc{
+			Enabled:          true,
+			HasUserPassword:  cfg.Security.UserPassword != "",
+			HasOwnerPassword: cfg.Security.OwnerPassword != "",
+			Encryption:       enc,
+			Permissions:      perms,
+		}
+		notes = append(notes, "This template outputs an encrypted PDF — recipients will be prompted for a password to open or to bypass the permission restrictions.")
+	}
+
 	resp := SchemaResp{
 		TemplateID:   id,
 		TemplateName: name,
@@ -138,9 +229,33 @@ func (h *Handler) Schema(w http.ResponseWriter, r *http.Request) {
 		Fields:     fields,
 		JSONSchema: jsonSchema,
 		Example:    example,
+		Output:     outDoc,
+		Security:   secDoc,
 		Notes:      notes,
 	}
 	writeJSON(w, 200, resp)
+}
+
+// extractPlaceholders returns the deduped, sorted list of {{key}}
+// identifiers referenced anywhere in the supplied templates. Used to
+// surface "these data keys drive your output path" in the API guide
+// without making the UI re-parse the template strings itself.
+func extractPlaceholders(tmpls ...string) []string {
+	re := placeholderRegex()
+	seen := map[string]bool{}
+	for _, t := range tmpls {
+		for _, m := range re.FindAllStringSubmatch(t, -1) {
+			if len(m) >= 2 {
+				seen[m[1]] = true
+			}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for k := range seen {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // schemaForAcroform walks template_fields (enriched with config.mappings)

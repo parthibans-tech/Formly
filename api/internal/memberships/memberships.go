@@ -109,14 +109,15 @@ func (h *Handler) Switch(w http.ResponseWriter, r *http.Request) {
 
 	var (
 		role      string
+		orgKind   string
 		deletedAt *time.Time
 	)
 	err := h.DB.QueryRow(r.Context(), `
-		SELECT m.role, o.deleted_at
+		SELECT m.role, COALESCE(o.kind,'team'), o.deleted_at
 		  FROM org_memberships m
 		  JOIN organizations o ON o.id = m.org_id
 		 WHERE m.user_id = $1 AND m.org_id = $2`, c.UserID, req.OrgID,
-	).Scan(&role, &deletedAt)
+	).Scan(&role, &orgKind, &deletedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			writeErr(w, 403, "not_a_member", "you don't belong to that org")
@@ -141,6 +142,10 @@ func (h *Handler) Switch(w http.ResponseWriter, r *http.Request) {
 		"token": token,
 		"orgId": req.OrgID,
 		"role":  role,
+		// Surface the new org's kind so the web client can update its
+		// cached user blob in the same beat — keeps the sidebar's
+		// first paint after switch correct without an extra round trip.
+		"orgKind": orgKind,
 	})
 }
 

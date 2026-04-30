@@ -42,6 +42,7 @@ import (
 	"github.com/docforge/api/internal/platformaudit"
 	"github.com/docforge/api/internal/me"
 	"github.com/docforge/api/internal/orgdashboard"
+	"github.com/docforge/api/internal/orgs"
 	"github.com/docforge/api/internal/platformdashboard"
 	"github.com/docforge/api/internal/platformorgs"
 	"github.com/docforge/api/internal/platformusers"
@@ -276,6 +277,12 @@ func main() {
 	pd := platformdashboard.New(pool)
 	od := orgdashboard.New(pool)
 	meh := me.New(pool)
+	// /v1/me/profile surfaces the org logo URL too — the me handler
+	// needs the storage client to mint a presigned GET on each read.
+	meh.AttachStore(store)
+	// Org branding (logo upload / delete). Lives on /v1/orgs/me/* so
+	// the namespace stays predictable as we grow per-tenant settings.
+	orgsH := orgs.New(pool, store)
 	mb := memberships.New(pool, a)
 	// Phase 4a: subscription module (read-only catalog + manual provider).
 	// Phase 4b: live providers — Razorpay (INR) and Stripe (USD/other).
@@ -475,6 +482,12 @@ func main() {
 		// hits /v1/me/profile to get the richer view.
 		r.Get("/v1/me/profile", meh.Get)
 		r.Patch("/v1/me/profile", meh.Patch)
+
+		// Per-tenant branding. Admin-only is enforced inside the handler
+		// (claims aren't visible at the route declaration site since the
+		// require-admin middleware is mounted on a different subtree).
+		r.Post("/v1/orgs/me/logo", orgsH.PostLogo)
+		r.Delete("/v1/orgs/me/logo", orgsH.DeleteLogo)
 		r.Post("/v1/auth/logout", a.Logout)
 		r.Post("/v1/auth/set-password", a.SetPassword)
 
@@ -825,6 +838,11 @@ func main() {
 		r.Post("/v1/team/members/{id}/reset-mfa", tm.ResetMFA)
 		r.Get("/v1/team/invites", tm.ListInvites)
 		r.Post("/v1/team/invites", tm.CreateInvite)
+		// Resend rotates the token + extends expiry, then re-emails.
+		// Old URLs forwarded around stop working the moment a resend
+		// fires, so this is the safe equivalent of "send the email
+		// again" for an invite the recipient claims they didn't get.
+		r.Post("/v1/team/invites/{id}/resend", tm.ResendInvite)
 		r.Delete("/v1/team/invites/{id}", tm.RevokeInvite)
 
 		// Comments + @mentions inbox.

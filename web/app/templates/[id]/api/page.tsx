@@ -16,7 +16,7 @@
 import { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
-import { ArrowLeft, FileCode, Sparkles } from "lucide-react";
+import { ArrowLeft, FileCode, Settings, Sparkles } from "lucide-react";
 import { api, getToken } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -86,12 +86,20 @@ export default function TemplateApiGuidePage() {
             </div>
           </div>
           {tpl && (
-            <Button variant="ghost" size="sm" asChild>
-              <Link href={`/templates/${tpl.id}/playground`}>
-                <Sparkles className="h-4 w-4" />
-                Playground
-              </Link>
-            </Button>
+            <div className="flex items-center gap-1">
+              <Button variant="ghost" size="sm" asChild>
+                <Link href={`/templates/${tpl.id}/settings`}>
+                  <Settings className="h-4 w-4" />
+                  Output &amp; security
+                </Link>
+              </Button>
+              <Button variant="ghost" size="sm" asChild>
+                <Link href={`/templates/${tpl.id}/playground`}>
+                  <Sparkles className="h-4 w-4" />
+                  Playground
+                </Link>
+              </Button>
+            </div>
           )}
         </div>
       </header>

@@ -121,7 +121,10 @@ export default function MarkdownDesigner({
   const previewTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
-  const [autoSave, setAutoSave] = useState(true);
+  // Default off: auto-save can mask intent (an in-progress prose edit gets
+  // versioned the moment the debounce timer fires). Authors opt in via the
+  // View menu / palette ("Enable auto-save") when they want the convenience.
+  const [autoSave, setAutoSave] = useState(false);
   const [lastSavedAt, setLastSavedAt] = useState<Date | null>(null);
   const sourceRef = useRef<HTMLTextAreaElement | null>(null);
 

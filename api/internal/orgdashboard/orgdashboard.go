@@ -106,14 +106,22 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	out := map[string]any{}
 
 	// Members: total / active / locked / pending invites / new in 30d.
+	// Phase 4: source of truth is org_memberships, joined to users for
+	// the lock state. The Last30d filter uses the membership's
+	// created_at — i.e. "joined this org in the last 30 days" — which
+	// is the right semantic now that a user can be in multiple orgs
+	// (otherwise a long-tenured platform user joining a new org would
+	// fail the freshness check at their new home).
 	var members memberCounts
 	_ = h.DB.QueryRow(ctx, `
 		SELECT
 			COUNT(*),
-			COUNT(*) FILTER (WHERE locked_at IS NULL),
-			COUNT(*) FILTER (WHERE locked_at IS NOT NULL),
-			COUNT(*) FILTER (WHERE created_at > now() - interval '30 days')
-		FROM users WHERE org_id=$1
+			COUNT(*) FILTER (WHERE u.locked_at IS NULL),
+			COUNT(*) FILTER (WHERE u.locked_at IS NOT NULL),
+			COUNT(*) FILTER (WHERE m.created_at > now() - interval '30 days')
+		FROM org_memberships m
+		JOIN users u ON u.id = m.user_id
+		WHERE m.org_id = $1
 	`, c.OrgID).Scan(&members.Total, &members.Active, &members.Locked, &members.Last30d)
 	_ = h.DB.QueryRow(ctx, `
 		SELECT COUNT(*) FROM invitations
@@ -224,12 +232,17 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	out["recentInvoices"] = invoices
 
 	// Recent members (8 most recent — useful right after onboarding).
+	// Phase 4: ordered by membership creation, not user creation, so
+	// admins see "who joined this org most recently" rather than
+	// "who signed up to the platform most recently".
 	recentMembers := []memberRow{}
 	if rows, err := h.DB.Query(ctx, `
-		SELECT id::text, email, COALESCE(name,''), role, created_at
-		  FROM users
-		 WHERE org_id=$1
-		 ORDER BY created_at DESC LIMIT 8`, c.OrgID); err == nil {
+		SELECT u.id::text, u.email, COALESCE(u.name,''),
+		       COALESCE(m.role,'editor'), m.created_at
+		  FROM org_memberships m
+		  JOIN users u ON u.id = m.user_id
+		 WHERE m.org_id = $1
+		 ORDER BY m.created_at DESC LIMIT 8`, c.OrgID); err == nil {
 		defer rows.Close()
 		for rows.Next() {
 			var m memberRow

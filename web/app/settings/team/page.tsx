@@ -19,6 +19,7 @@ import {
   Mail,
   PencilLine,
   Plus,
+  Send,
   ShieldOff,
   Trash2,
   Users,
@@ -152,6 +153,10 @@ function TeamSettingsInner() {
   const [inviteRole, setInviteRole] = useState<Member["role"]>("editor");
   const [inviting, setInviting] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  // Per-invite "resending…" flag, keyed by invite id. Lets the row's
+  // Resend button show a spinner without blocking the rest of the UI
+  // (an admin could resend several invites in quick succession).
+  const [resendingId, setResendingId] = useState<string | null>(null);
 
   useEffect(() => {
     setMe(getUser());
@@ -279,6 +284,43 @@ function TeamSettingsInner() {
       await load();
     } catch (e: any) {
       toast.show("error", e.message);
+    }
+  }
+
+  // Resend rotates the invite token, extends the expiry, and re-mails
+  // the link. Old copies of the URL stop working the moment this fires
+  // — see api/internal/team/team.go:ResendInvite for the rationale.
+  // We surface the email outcome the same way Create does (via the
+  // emailStatus field) so a misconfigured mailer doesn't silently
+  // pretend the resend went out.
+  async function resendInvite(inv: Invite) {
+    setResendingId(inv.id);
+    try {
+      const res = await api<{ emailStatus?: string }>(
+        `/v1/team/invites/${inv.id}/resend`,
+        { method: "POST" },
+      );
+      if (res.emailStatus === "sent") {
+        toast.show("success", "Invitation resent", {
+          description: `We re-emailed the invite link to ${inv.email}.`,
+        });
+      } else if (res.emailStatus === "skipped") {
+        toast.show("info", "New link minted", {
+          description:
+            "Email isn't configured, so nothing was sent. Use \"Copy link\" to share it manually.",
+        });
+      } else {
+        toast.show("info", "Resent with delivery issue", {
+          description:
+            res.emailStatus?.replace(/^failed:/, "") ||
+            "The new link is active; you may want to share it manually.",
+        });
+      }
+      await load();
+    } catch (e: any) {
+      toast.show("error", e.message);
+    } finally {
+      setResendingId(null);
     }
   }
 
@@ -509,6 +551,23 @@ function TeamSettingsInner() {
                                 </>
                               )}
                             </Button>
+                            {isAdmin && (
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() => resendInvite(inv)}
+                                loading={resendingId === inv.id}
+                                disabled={resendingId === inv.id}
+                                title={
+                                  expired
+                                    ? "Mints a fresh link and emails it again"
+                                    : "Resends the invite email; the previous link is rotated out"
+                                }
+                              >
+                                <Send className="h-4 w-4" />
+                                Resend
+                              </Button>
+                            )}
                             {isAdmin && (
                               <Button
                                 variant="ghost"

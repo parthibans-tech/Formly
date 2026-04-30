@@ -74,6 +74,10 @@ func ClientOpt() asynq.RedisClientOpt {
 
 // GenerateOnePayload describes a single async generation job.
 // The job_id column in generation_jobs is the source of truth for status.
+//
+// OutputName / OutputPath mirror the request body's per-call overrides
+// so async jobs honour the same naming/folder hints sync calls do.
+// Both are optional ({{key}} substitution still happens against Data).
 type GenerateOnePayload struct {
 	JobID      string                 `json:"jobId"`
 	OrgID      string                 `json:"orgId"`
@@ -81,6 +85,8 @@ type GenerateOnePayload struct {
 	TemplateID string                 `json:"templateId"`
 	Data       map[string]interface{} `json:"data"`
 	Flatten    bool                   `json:"flatten"`
+	OutputName string                 `json:"outputName,omitempty"`
+	OutputPath string                 `json:"outputPath,omitempty"`
 }
 
 // GenerateBatchPayload references a previously-uploaded tabular input via

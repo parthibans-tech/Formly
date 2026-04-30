@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -29,8 +29,28 @@ const schema = z.object({
 
 type FormValues = z.infer<typeof schema>;
 
+// safeNext sanitizes the `?next=` query parameter so the login page only
+// ever redirects to a same-origin path. Anything else (absolute URL,
+// protocol-relative `//evil.com`, weird scheme) falls back to the
+// default landing page. Used by the invite-accept flow to bounce back
+// after sign-in without opening an open-redirect hole.
+function safeNext(raw: string | null): string | null {
+  if (!raw) return null;
+  // Must start with a single `/` and not `//` (protocol-relative).
+  if (!raw.startsWith("/") || raw.startsWith("//")) return null;
+  // Reject anything that smuggles in a scheme via URL parsing.
+  try {
+    const u = new URL(raw, "http://_");
+    if (u.origin !== "http://_") return null;
+  } catch {
+    return null;
+  }
+  return raw;
+}
+
 export default function LoginPage() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const toast = useToast();
   const [showPassword, setShowPassword] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
@@ -38,6 +58,11 @@ export default function LoginPage() {
   const [mfaCode, setMfaCode] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [pending, setPending] = useState<FormValues | null>(null);
+
+  // Captured once on render — if it's set, login redirects there
+  // instead of the default /drive (or /settings/admin for super
+  // admins). Wired by the accept-invite "Sign in to accept" CTA.
+  const nextPath = safeNext(searchParams.get("next"));
 
   const form = useForm<FormValues>({
     resolver: zodResolver(schema),
@@ -109,10 +134,15 @@ export default function LoginPage() {
         return;
       }
       toast.show("success", "Welcome back");
-      // Super-admins land on the platform dashboard (cross-org operator
-      // console). Everyone else — including org admins — goes straight to
-      // their workspace; org admins can navigate to /dashboard from the
-      // sidebar when they want the org overview.
+      // `?next=` (validated by safeNext) wins over the default landing
+      // route — the invite-accept flow uses it to round-trip a user
+      // through sign-in and back to the accept page. Super-admins still
+      // get the platform-console default when no `next` is supplied.
+      // Everyone else lands on their workspace.
+      if (nextPath) {
+        router.replace(nextPath);
+        return;
+      }
       router.replace(res.user?.isSuperAdmin ? "/settings/admin" : "/drive");
     } catch (e: any) {
       setFormError(e.message || "Unable to sign in");

@@ -988,27 +988,37 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	// for the same logical document.
 	hidePreviews := ` AND NOT EXISTS (SELECT 1 FROM files src WHERE src.preview_pdf_id = files.id)`
 
+	// Hide rows from uploads that never finished. CreateUploadURL inserts
+	// a `files` row with status='pending', size=0 BEFORE the client PUTs
+	// to storage; if the upload fails or the tab closes, Complete never
+	// runs and the row sticks around as an orphan — visible in listings
+	// but 404-on-open because the storage object doesn't exist. Filtering
+	// `status='pending' AND size=0` hides those orphans without breaking
+	// the replace flow, which keeps the previous successful upload's
+	// `size>0` while the row is briefly back to status='pending'.
+	hideOrphans := ` AND NOT (files.status = 'pending' AND files.size = 0)`
+
 	var sql string
 	var args []any
 	switch view {
 	case "trashed":
 		vis, vargs := visClause(3)
 		sql = baseSelect + `
-		       WHERE files.org_id=$2 AND files.trashed_at IS NOT NULL` + vis + hidePreviews + `
+		       WHERE files.org_id=$2 AND files.trashed_at IS NOT NULL` + vis + hidePreviews + hideOrphans + `
 		       ORDER BY files.created_at DESC
 		       LIMIT 200`
 		args = append([]any{c.UserID, c.OrgID}, vargs...)
 	case "templates":
 		vis, vargs := visClause(3)
 		sql = baseSelect + `
-		       WHERE files.org_id=$2 AND files.trashed_at IS NULL AND files.template_id IS NOT NULL` + vis + hidePreviews + `
+		       WHERE files.org_id=$2 AND files.trashed_at IS NULL AND files.template_id IS NOT NULL` + vis + hidePreviews + hideOrphans + `
 		       ORDER BY files.created_at DESC
 		       LIMIT 200`
 		args = append([]any{c.UserID, c.OrgID}, vargs...)
 	case "recent":
 		vis, vargs := visClause(3)
 		sql = baseSelect + `
-		       WHERE files.org_id=$2 AND files.trashed_at IS NULL` + vis + hidePreviews + `
+		       WHERE files.org_id=$2 AND files.trashed_at IS NULL` + vis + hidePreviews + hideOrphans + `
 		       ORDER BY files.created_at DESC
 		       LIMIT 50`
 		args = append([]any{c.UserID, c.OrgID}, vargs...)
@@ -1022,7 +1032,7 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 		vis, vargs := visClause(3)
 		sql = baseSelect + `
 		       WHERE files.org_id=$2 AND files.trashed_at IS NULL
-		         AND sf.user_id IS NOT NULL` + vis + hidePreviews + `
+		         AND sf.user_id IS NOT NULL` + vis + hidePreviews + hideOrphans + `
 		       ORDER BY sf.created_at DESC
 		       LIMIT 200`
 		args = append([]any{c.UserID, c.OrgID}, vargs...)
@@ -1045,7 +1055,7 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 		vis, vargs := visClause(4)
 		sql = baseSelect + `
 		       WHERE files.org_id=$2 AND files.trashed_at IS NULL
-		         AND (($3='' AND files.folder_id IS NULL) OR files.folder_id::text=$3)` + vis + hidePreviews + `
+		         AND (($3='' AND files.folder_id IS NULL) OR files.folder_id::text=$3)` + vis + hidePreviews + hideOrphans + `
 		       ORDER BY files.created_at DESC`
 		args = append([]any{c.UserID, c.OrgID, folder}, vargs...)
 	}
@@ -1123,7 +1133,8 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		 FROM files
 		 LEFT JOIN starred_files sf
 		   ON sf.file_id = files.id AND sf.user_id = $3::uuid
-		 WHERE files.id=$1 AND files.org_id=$2 AND files.trashed_at IS NULL`,
+		 WHERE files.id=$1 AND files.org_id=$2 AND files.trashed_at IS NULL
+		   AND NOT (files.status = 'pending' AND files.size = 0)`,
 		id, c.OrgID, c.UserID,
 	).Scan(&f.ID, &f.Name, &f.Mime, &f.Size, &f.Status, &f.TemplateID, &f.FolderID, &f.CreatedAt, &f.Starred, &f.PreviewPdfID, &f.ConvertStatus, &f.ConvertWarning); err != nil {
 		writeErr(w, 404, "not_found", "file not found")
@@ -1203,7 +1214,9 @@ func (h *Handler) Download(w http.ResponseWriter, r *http.Request) {
 	if err := h.DB.QueryRow(r.Context(),
 		`SELECT storage_key, name, COALESCE(mime, ''),
 		        COALESCE(scan_status, 'skipped'), COALESCE(scan_signature, '')
-		   FROM files WHERE id=$1 AND org_id=$2 AND trashed_at IS NULL`,
+		   FROM files
+		  WHERE id=$1 AND org_id=$2 AND trashed_at IS NULL
+		    AND NOT (status = 'pending' AND size = 0)`,
 		id, c.OrgID,
 	).Scan(&key, &name, &mime, &scanStatus, &scanSig); err != nil {
 		writeErr(w, 404, "not_found", "file not found")
@@ -1504,7 +1517,9 @@ func (h *Handler) zipPreflightFile(
 	if err := h.DB.QueryRow(r.Context(),
 		`SELECT storage_key, name, COALESCE(mime, ''),
 		        COALESCE(scan_status, 'skipped'), COALESCE(scan_signature, '')
-		   FROM files WHERE id=$1 AND org_id=$2 AND trashed_at IS NULL`,
+		   FROM files
+		  WHERE id=$1 AND org_id=$2 AND trashed_at IS NULL
+		    AND NOT (status = 'pending' AND size = 0)`,
 		fileID, c.OrgID,
 	).Scan(&key, &name, &mime, &scanStatus, &scanSig); err != nil {
 		return zipEntry{}, 404, "not_found",
@@ -1750,7 +1765,9 @@ func (h *Handler) InlinePreview(w http.ResponseWriter, r *http.Request) {
 	if err := h.DB.QueryRow(r.Context(),
 		`SELECT storage_key, name, COALESCE(mime, ''),
 		        COALESCE(scan_status, 'skipped'), COALESCE(scan_signature, '')
-		   FROM files WHERE id=$1 AND org_id=$2 AND trashed_at IS NULL`,
+		   FROM files
+		  WHERE id=$1 AND org_id=$2 AND trashed_at IS NULL
+		    AND NOT (status = 'pending' AND size = 0)`,
 		id, c.OrgID,
 	).Scan(&key, &name, &mime, &scanStatus, &scanSig); err != nil {
 		writeErr(w, 404, "not_found", "file not found")

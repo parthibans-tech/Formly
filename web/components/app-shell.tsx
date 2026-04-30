@@ -32,6 +32,11 @@ import {
   autoCrumbs,
   type Crumb,
 } from "@/components/breadcrumbs";
+import {
+  BillingStateProvider,
+  useBillingState,
+} from "@/lib/billing-state";
+import { PaywallGate } from "@/components/paywall-gate";
 
 type Props = {
   children: React.ReactNode;
@@ -56,7 +61,18 @@ type Props = {
   breadcrumbs?: Crumb[];
 };
 
-export function AppShell({
+export function AppShell(props: Props) {
+  // Wrapper exists so children of <AppShellInner> can call useBillingState()
+  // — the provider has to sit above the consumer in the tree. Every page
+  // that mounts AppShell gets the gate behaviour for free.
+  return (
+    <BillingStateProvider>
+      <AppShellInner {...props} />
+    </BillingStateProvider>
+  );
+}
+
+function AppShellInner({
   children,
   search,
   headerRight,
@@ -66,6 +82,7 @@ export function AppShell({
   const pathname = usePathname() || "";
   const crumbs = breadcrumbs ?? autoCrumbs(pathname);
   const confirm = useConfirm();
+  const billing = useBillingState();
   const [user, setUser] = useState<any>(null);
   const [mobileOpen, setMobileOpen] = useState(false);
 
@@ -98,6 +115,15 @@ export function AppShell({
   }
 
   if (!user) return null;
+
+  // Hard paywall: trial ended (or otherwise no active sub) replaces the
+  // entire shell. Sidebar, header nav, and breadcrumbs are gone — the
+  // only path forward is "pick a plan and pay" or "sign out". We don't
+  // render this until the first billing fetch resolves, otherwise the
+  // page would flash the normal shell for a frame on every navigation.
+  if (!billing.loading && billing.requiresUpgrade) {
+    return <PaywallGate />;
+  }
 
   const initials = (user.email || "U")
     .split("@")[0]

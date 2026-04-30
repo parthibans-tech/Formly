@@ -8,11 +8,26 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// Phase 4 (migration 052) made org_memberships the canonical source of
+// truth for "is this user in this org". Seat counting reads memberships
+// directly — the legacy MULTI_ORG_SEATS env flag is gone. Every user
+// has a primary-org membership (the migration's invariant assertion
+// guarantees it), so the count matches the old `users WHERE org_id=$1`
+// behavior for single-org tenants while correctly including cross-org
+// members for multi-org ones.
+
 // LimitError is returned by the enforcement helpers when an action would
 // exceed the org's plan ceiling. The HTTP code is encoded in `Status`
 // so handlers can write the right response without re-deriving it.
+//
+// Codes the frontend may surface:
+//   - "subscription_required" — trial expired, no paid sub; show the
+//     paywall and route the admin to /settings/billing to pick a plan
+//   - "seat_limit"             — over the seat ceiling for the plan
+//   - "storage_limit"          — over the storage ceiling for the plan
+//   - "feature_locked"         — feature not in the plan's `features` JSON
 type LimitError struct {
-	Code    string // machine code: "seat_limit", "storage_limit", "feature_locked"
+	Code    string
 	Message string
 	Status  int
 	Hint    string // optional remediation hint shown in the toast
@@ -29,6 +44,38 @@ func IsLimitError(err error) (*LimitError, bool) {
 	return nil, false
 }
 
+// trialExpiredError is the canonical 402 returned to writes when an
+// org's trial has lapsed and no paid subscription has taken its place.
+// Centralised here so the message + hint stay consistent across every
+// gated entry point.
+func trialExpiredError() *LimitError {
+	return &LimitError{
+		Code:    "subscription_required",
+		Status:  402,
+		Message: "your trial has ended; choose a plan to continue",
+		Hint:    "Pick a plan on /settings/billing to unblock uploads, invites, and integrations.",
+	}
+}
+
+// EnsureSubscriptionActive returns subscription_required when the org
+// has used its one-time trial and has no active paid subscription. Any
+// caller about to do a write that isn't already covered by
+// EnsureStorageAvailable / EnsureSeatAvailable / RequireFeature should
+// call this first.
+//
+// Falls open on lookup errors — same defensive pattern as the other
+// helpers; we never want a DB hiccup to wedge the whole app.
+func EnsureSubscriptionActive(ctx context.Context, db *pgxpool.Pool, orgID string) error {
+	limits, err := LoadOrgLimits(ctx, db, orgID)
+	if err != nil {
+		return nil
+	}
+	if limits.RequiresUpgrade {
+		return trialExpiredError()
+	}
+	return nil
+}
+
 // EnsureSeatAvailable checks whether an org can add one more user.
 // `additional` is the number of seats about to be created (1 for a
 // single invite, N for a bulk import). Pass 0 to just probe the limit.
@@ -37,12 +84,23 @@ func EnsureSeatAvailable(ctx context.Context, db *pgxpool.Pool, orgID string, ad
 	if err != nil {
 		return nil // fall open on lookup error — never block on infra hiccups
 	}
+	if limits.RequiresUpgrade {
+		return trialExpiredError()
+	}
 	if limits.MaxUsers == nil {
 		return nil // unlimited
 	}
+	// Seat count: distinct members of this org, sourced from
+	// org_memberships. A user that's a member of two orgs counts once
+	// against each org's cap, which is the intended billing semantic
+	// (each org pays for its own seats). The migration-052 invariant
+	// guarantees every user has at least their primary-org membership
+	// row, so this never under-counts vs the legacy `users WHERE
+	// org_id=$1` path.
 	var count int
 	if err := db.QueryRow(ctx,
-		`SELECT COUNT(*) FROM users WHERE org_id=$1`, orgID,
+		`SELECT COUNT(DISTINCT user_id) FROM org_memberships WHERE org_id=$1`,
+		orgID,
 	).Scan(&count); err != nil {
 		return nil
 	}
@@ -76,6 +134,9 @@ func EnsureStorageAvailable(ctx context.Context, db *pgxpool.Pool, orgID string,
 	if err != nil {
 		return nil
 	}
+	if limits.RequiresUpgrade {
+		return trialExpiredError()
+	}
 	if limits.MaxStorageBytes == nil {
 		return nil
 	}
@@ -106,6 +167,9 @@ func RequireFeature(ctx context.Context, db *pgxpool.Pool, orgID, feature string
 	limits, err := LoadOrgLimits(ctx, db, orgID)
 	if err != nil {
 		return nil
+	}
+	if limits.RequiresUpgrade {
+		return trialExpiredError()
 	}
 	v, ok := limits.Features[feature].(bool)
 	if !ok || !v {

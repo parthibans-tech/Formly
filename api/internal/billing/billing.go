@@ -158,13 +158,42 @@ func (h *Handler) Subscription(w http.ResponseWriter, r *http.Request) {
 	sub, err := loadActiveSubscription(r.Context(), h.DB, c.OrgID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			writeErr(w, 404, "no_subscription", "no active subscription")
+			// No active sub. The frontend's billing page uses this to
+			// decide whether to show the plan picker / paywall — so we
+			// also tell it whether the trial slot is already burnt
+			// (one-time rule) or whether StartTrial would still grant
+			// one (e.g. an org created out-of-band by an admin).
+			trialUsed, _ := orgHasAnySubscription(r.Context(), h.DB, c.OrgID)
+			writeJSON(w, 200, map[string]any{
+				"status":           "none",
+				"requiresUpgrade":  true,
+				"trialUsed":        trialUsed,
+				"hint":             "Choose a plan on /settings/billing to continue.",
+			})
 			return
 		}
 		writeErr(w, 500, "db_error", err.Error())
 		return
 	}
 	writeJSON(w, 200, sub)
+}
+
+// orgHasAnySubscription reports whether the org has any subscription
+// row at all (active, canceled, anything). Used by the billing UI to
+// decide between "Start your 14-day trial" and "Trial used — pick a
+// plan", since StartTrial is one-time.
+func orgHasAnySubscription(ctx context.Context, db *pgxpool.Pool, orgID string) (bool, error) {
+	var n int
+	err := db.QueryRow(ctx,
+		`SELECT 1 FROM subscriptions WHERE org_id=$1 LIMIT 1`, orgID,
+	).Scan(&n)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // -- invoices -----------------------------------------------------------
@@ -435,21 +464,32 @@ func validAssignStatus(s string) bool {
 // inside its own DB transaction, so we accept a queryer interface that
 // either *pgxpool.Pool or pgx.Tx satisfies.
 //
-// Idempotent: if the org already has a non-canceled subscription we
-// leave it alone. That keeps double-fires safe (signup retry, super
-// admin creating an org from another path, etc.).
+// One-time only. The trial is granted exactly once per org — if the
+// org has ANY prior subscription row (active, canceled, expired,
+// anything) we skip the insert. This keeps the rule honest:
+//
+//   - signup retries / double-fires are still safe (no duplicate row)
+//   - users can't game the trial by canceling and re-signing up the
+//     same org
+//   - super-admin can still grant a comp plan via /admin/orgs/{id}/subscription
+//     because that path uses AdminAssign, not StartTrial
+//
+// After the trial ends without a payment, RunDunning cancels the row
+// and does NOT auto-provision a replacement. The org becomes
+// "trial expired, no active subscription" — LoadOrgLimits flags it as
+// RequiresUpgrade and the enforcement helpers return
+// subscription_required (402). The admin must pick a paid plan from
+// /settings/billing to unblock writes.
 func StartTrial(ctx context.Context, q DBQueryer, orgID string) error {
 	if orgID == "" {
 		return nil
 	}
 	var existing string
-	err := q.QueryRow(ctx, `
-		SELECT id FROM subscriptions
-		 WHERE org_id=$1
-		   AND status IN ('trialing','active','past_due','paused')
-		 LIMIT 1`, orgID).Scan(&existing)
+	err := q.QueryRow(ctx,
+		`SELECT id FROM subscriptions WHERE org_id=$1 LIMIT 1`, orgID,
+	).Scan(&existing)
 	if err == nil {
-		return nil // already has one
+		return nil // org has been billed before — no fresh trial
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return err
@@ -475,6 +515,13 @@ type DBQueryer interface {
 }
 
 // Limits is the resolved enforcement ceiling for a given org.
+//
+// RequiresUpgrade is the gate signal for the trial-expired-no-payment
+// state: the org used its one-time trial, the trial ended, and no paid
+// subscription took its place. Enforcement helpers translate this flag
+// into a 402 `subscription_required` LimitError on every write path
+// (uploads, invites, feature gates) — reads stay open so the admin can
+// still see existing data and reach /settings/billing.
 type Limits struct {
 	Tier            string
 	PlanID          string
@@ -482,28 +529,47 @@ type Limits struct {
 	MaxUsers        *int   // nil = unlimited
 	MaxStorageBytes *int64 // nil = unlimited
 	Features        map[string]any
+	RequiresUpgrade bool   // true when trial used + no active sub
 }
 
 // LoadOrgLimits returns the effective ceilings for an org by combining
 // its active subscription with its per-org override columns. Per-org
 // values win — set on `organizations` by super-admin via SetQuotas.
 //
-// On error or "no subscription found" we fall back to the free-tier
-// limits so callers always get a sane non-nil result.
+// State machine the helper resolves:
+//
+//   - Active subscription (trialing/active/past_due/paused, and a
+//     trial row whose `trial_ends_at` is still in the future) →
+//     plan-level limits and features. RequiresUpgrade=false.
+//
+//   - Trial expired (status='trialing' but trial_ends_at has passed)
+//     OR no active row but the org has prior history → RequiresUpgrade
+//     is set, all writes get gated behind subscription_required. The
+//     dunning sweep cancels the trial row separately; this branch is
+//     the safety net for the up-to-1-hour gap before the cron runs.
+//
+//   - Org row missing (deep data-integrity bug) → bubbles the error;
+//     callers fall back to the conservative seed (free tier, no
+//     unlimited surprises).
+//
+// All scan targets are nullable so a canceled-only org doesn't fail
+// the row scan and silently fall through to the legacy "everything
+// nil = unlimited" bug.
 func LoadOrgLimits(ctx context.Context, q DBQueryer, orgID string) (Limits, error) {
 	out := Limits{Tier: "free", PlanID: "free", Status: StatusActive,
 		Features: map[string]any{}}
 	var (
-		planID, status, tier string
+		planID, status, tier *string
 		planMaxUsers         *int
 		planMaxStorage       *int64
 		featuresRaw          []byte
 		orgMaxUsers          *int
 		orgMaxStorage        *int64
+		trialEndsAt          *time.Time
 	)
 	err := q.QueryRow(ctx, `
 		SELECT s.plan_id, s.status, p.tier, p.max_users, p.max_storage_bytes,
-		       p.features, o.max_users, o.max_storage_bytes
+		       p.features, o.max_users, o.max_storage_bytes, s.trial_ends_at
 		  FROM organizations o
 		  LEFT JOIN subscriptions s ON s.org_id = o.id
 		       AND s.status IN ('trialing','active','past_due','paused')
@@ -512,26 +578,55 @@ func LoadOrgLimits(ctx context.Context, q DBQueryer, orgID string) (Limits, erro
 		 ORDER BY s.created_at DESC
 		 LIMIT 1`, orgID,
 	).Scan(&planID, &status, &tier, &planMaxUsers, &planMaxStorage,
-		&featuresRaw, &orgMaxUsers, &orgMaxStorage)
+		&featuresRaw, &orgMaxUsers, &orgMaxStorage, &trialEndsAt)
 	if err != nil {
 		return out, err
 	}
-	out.PlanID = planID
-	out.Status = status
-	out.Tier = tier
-	if len(featuresRaw) > 0 {
-		_ = json.Unmarshal(featuresRaw, &out.Features)
+
+	expiredTrial := status != nil && *status == StatusTrialing &&
+		trialEndsAt != nil && trialEndsAt.Before(time.Now())
+	haveActiveSub := planID != nil && !expiredTrial
+
+	if haveActiveSub {
+		out.PlanID = *planID
+		if status != nil {
+			out.Status = *status
+		}
+		if tier != nil {
+			out.Tier = *tier
+		}
+		if len(featuresRaw) > 0 {
+			_ = json.Unmarshal(featuresRaw, &out.Features)
+		}
+		out.MaxUsers = planMaxUsers
+		out.MaxStorageBytes = planMaxStorage
+	} else {
+		// Trial used up or otherwise no active sub. Mark for upgrade —
+		// the enforcement helpers turn this into a 402 with hint
+		// pointing the admin at /settings/billing.
+		out.RequiresUpgrade = true
+		out.Status = "trial_expired"
+		// Set zeroed ceilings as a defense-in-depth: even if an
+		// enforcement helper forgets to check RequiresUpgrade, the
+		// quota check still bites.
+		zeroUsers := 0
+		zeroStorage := int64(0)
+		out.MaxUsers = &zeroUsers
+		out.MaxStorageBytes = &zeroStorage
 	}
-	// Per-org overrides win when present.
+
+	// Per-org overrides win when present, regardless of plan source.
+	// Super-admin can use these to comp a specific org out of the
+	// upgrade gate without touching the subscriptions table — set
+	// max_users / max_storage_bytes generously and clear any sub. But
+	// note: overrides only relax quota numbers, they don't clear the
+	// RequiresUpgrade flag. To re-enable an expired-trial org cleanly
+	// the right path is AdminAssign (a real comp subscription row).
 	if orgMaxUsers != nil {
 		out.MaxUsers = orgMaxUsers
-	} else {
-		out.MaxUsers = planMaxUsers
 	}
 	if orgMaxStorage != nil {
 		out.MaxStorageBytes = orgMaxStorage
-	} else {
-		out.MaxStorageBytes = planMaxStorage
 	}
 	return out, nil
 }

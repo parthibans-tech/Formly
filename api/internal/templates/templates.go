@@ -612,6 +612,20 @@ type generateReq struct {
 	// every click. The explicit "Save to Drive" action in the playground
 	// omits this flag to take the persist path instead.
 	Preview bool `json:"preview"`
+
+	// OutputName overrides the filename the generated file is saved as.
+	// Both the literal value and any {{key}} placeholders inside it are
+	// supported — placeholders are resolved against `data` using the
+	// same rules as the template's config_json.output.filenameTemplate.
+	// When omitted, the template's config drives the name (or the
+	// "<name>-filled-<timestamp>.pdf" fallback when neither is set).
+	OutputName string `json:"outputName,omitempty"`
+
+	// OutputPath overrides the logical sub-folder under the org's
+	// outputs/ prefix. Same {{key}} substitution rules. Useful for
+	// integrators routing per-tenant or per-customer output trees
+	// without baking the path into the template config.
+	OutputPath string `json:"outputPath,omitempty"`
 }
 
 type generateResp struct {
@@ -674,6 +688,7 @@ func (h *Handler) Generate(w http.ResponseWriter, r *http.Request) {
 		task, err := queue.NewGenerateOne(queue.GenerateOnePayload{
 			JobID: jobID, OrgID: c.OrgID, UserID: c.UserID, TemplateID: id,
 			Data: req.Data, Flatten: req.Flatten,
+			OutputName: req.OutputName, OutputPath: req.OutputPath,
 		})
 		if err != nil {
 			writeErr(w, 500, "enqueue", err.Error())
@@ -687,8 +702,13 @@ func (h *Handler) Generate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Sync path: delegate to the shared Runner.
-	res, err := h.Runner.Run(r.Context(), c.OrgID, c.UserID, id, req.Data, req.Flatten)
+	// Sync path: delegate to the shared Runner. Per-call output naming
+	// overrides ride along via RunWithOpts; security is template-level
+	// only (intentionally not overridable from the request body).
+	res, err := h.Runner.RunWithOpts(r.Context(), c.OrgID, c.UserID, id, req.Data, req.Flatten, &generate.RunOptions{
+		OutputName: req.OutputName,
+		OutputPath: req.OutputPath,
+	})
 	if err != nil {
 		// Validation failures are a 422 with a structured `fields` list so
 		// the client can render inline per-field messages rather than

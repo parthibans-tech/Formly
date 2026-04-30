@@ -28,7 +28,9 @@ import {
   Copy,
   ExternalLink,
   FileCode,
+  Folder,
   KeyRound,
+  Lock,
   Shield,
   Terminal,
 } from "lucide-react";
@@ -51,6 +53,27 @@ export type SchemaField = {
   page?: number;
 };
 
+// OutputDoc mirrors api/internal/templates/schema.go::outputDoc — the
+// template's filename / folder rules, with {{key}} placeholders left
+// intact so the integrator can see what data drives the path.
+export type OutputDoc = {
+  folderPath?: string;
+  filenameTemplate?: string;
+  placeholders?: string[];
+};
+
+// SecurityDoc mirrors api/internal/templates/schema.go::securityDoc.
+// Passwords are intentionally NOT echoed — only the shape of the policy
+// is returned, so the API guide can describe what end users will see
+// without doubling as a credential dump.
+export type SecurityDoc = {
+  enabled: boolean;
+  hasUserPassword: boolean;
+  hasOwnerPassword: boolean;
+  encryption?: string; // "AES-128" | "AES-256"
+  permissions?: Record<string, boolean>;
+};
+
 export type SchemaResp = {
   templateId: string;
   templateName: string;
@@ -64,6 +87,8 @@ export type SchemaResp = {
   fields: SchemaField[];
   jsonSchema: Record<string, any>;
   example: Record<string, any>;
+  output?: OutputDoc;
+  security?: SecurityDoc;
   notes?: string[];
 };
 
@@ -117,12 +142,28 @@ export function ApiGuide({ templateId, refreshKey = 0, compact = false }: Props)
 
   const examplePayload = useMemo(() => {
     if (!schema) return "";
-    return JSON.stringify({ data: schema.example, flatten: false }, null, 2);
+    // When the template defines an output filename or folder, surface
+    // matching `outputName` / `outputPath` keys in the example so an
+    // integrator copy-pasting the body sees the override slots
+    // immediately. Both are commented out via the standard JSON.parse
+    // round-trip — they're non-default behaviour, so we'd rather have
+    // the integrator opt in explicitly than send them silently.
+    const body: Record<string, unknown> = {
+      data: schema.example,
+      flatten: false,
+    };
+    if (schema.output?.filenameTemplate) {
+      body.outputName = schema.output.filenameTemplate;
+    }
+    if (schema.output?.folderPath) {
+      body.outputPath = schema.output.folderPath;
+    }
+    return JSON.stringify(body, null, 2);
   }, [schema]);
 
   const snippets = useMemo(() => {
     if (!schema) return { curl: "", js: "", python: "" };
-    return buildSnippets(fullEndpoint, schema.example);
+    return buildSnippets(fullEndpoint, schema.example, schema.output);
   }, [schema, fullEndpoint]);
 
   function copy(label: string, text: string) {
@@ -416,10 +457,125 @@ export function ApiGuide({ templateId, refreshKey = 0, compact = false }: Props)
         />
       </section>
 
+      {/* --- Output naming + folder placement ----------------------- */}
+      {(schema.output?.filenameTemplate || schema.output?.folderPath) && (
+        <section className="space-y-3">
+          <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+            6. Output naming &amp; folder
+          </h3>
+          <div className="space-y-3 rounded-lg border bg-muted/30 p-4 text-sm">
+            <div className="flex items-start gap-3">
+              <Folder className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+              <div className="space-y-2">
+                <p className="text-xs text-muted-foreground">
+                  This template defines a default filename and/or folder for
+                  every render. Both support{" "}
+                  <code className="font-mono">{`{{key}}`}</code>{" "}
+                  placeholders that resolve against the keys in your{" "}
+                  <code className="font-mono">data</code> payload.
+                </p>
+                {schema.output?.filenameTemplate && (
+                  <div className="text-xs">
+                    <span className="text-muted-foreground">Filename: </span>
+                    <code className="font-mono">
+                      {schema.output.filenameTemplate}
+                    </code>
+                  </div>
+                )}
+                {schema.output?.folderPath && (
+                  <div className="text-xs">
+                    <span className="text-muted-foreground">Folder: </span>
+                    <code className="font-mono">
+                      {schema.output.folderPath}
+                    </code>
+                  </div>
+                )}
+                {schema.output?.placeholders &&
+                  schema.output.placeholders.length > 0 && (
+                    <div className="text-xs text-muted-foreground">
+                      Required keys for clean resolution:{" "}
+                      {schema.output.placeholders.map((p, i) => (
+                        <span key={p}>
+                          {i > 0 && ", "}
+                          <code className="font-mono">{p}</code>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                <p className="pt-1 text-xs text-muted-foreground">
+                  Override per-call by sending{" "}
+                  <code className="font-mono">outputName</code> or{" "}
+                  <code className="font-mono">outputPath</code> in the
+                  request body — same placeholder syntax. Missing keys
+                  collapse to empty strings, so a template like{" "}
+                  <code className="font-mono">{`Invoice-{{number}}.pdf`}</code>{" "}
+                  with no <code className="font-mono">number</code> degrades
+                  to <code className="font-mono">Invoice-.pdf</code>.
+                </p>
+              </div>
+            </div>
+          </div>
+        </section>
+      )}
+
+      {/* --- PDF security ------------------------------------------- */}
+      {schema.security?.enabled && (
+        <section className="space-y-3">
+          <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+            7. PDF security
+          </h3>
+          <div className="space-y-3 rounded-lg border border-amber-300/60 bg-amber-50/50 p-4 text-sm dark:border-amber-500/30 dark:bg-amber-500/10">
+            <div className="flex items-start gap-3">
+              <Lock className="mt-0.5 h-4 w-4 shrink-0 text-amber-700 dark:text-amber-300" />
+              <div className="space-y-2">
+                <p className="text-xs">
+                  Generated PDFs are encrypted with{" "}
+                  <span className="font-mono">
+                    {schema.security.encryption || "AES-256"}
+                  </span>
+                  . Recipients see a password prompt in their PDF reader.
+                </p>
+                <ul className="list-disc space-y-1 pl-4 text-xs">
+                  {schema.security.hasUserPassword && (
+                    <li>
+                      <span className="font-medium">User password</span>{" "}
+                      required to <em>open</em> the document.
+                    </li>
+                  )}
+                  {schema.security.hasOwnerPassword && (
+                    <li>
+                      <span className="font-medium">Owner password</span>{" "}
+                      required to bypass the permission mask below.
+                    </li>
+                  )}
+                </ul>
+                <div className="text-xs">
+                  <span className="text-muted-foreground">
+                    Permissions allowed without the owner password:
+                  </span>{" "}
+                  <span className="font-mono">
+                    {permissionLabel(schema.security.permissions)}
+                  </span>
+                </div>
+                <p className="pt-1 text-xs text-muted-foreground">
+                  Security is a template-level policy — it cannot be
+                  overridden from the request body. Update it in the
+                  template designer&rsquo;s Security panel.
+                </p>
+              </div>
+            </div>
+          </div>
+        </section>
+      )}
+
       {/* --- Optional fields + per-mode notes ----------------------- */}
       <section className="space-y-3">
         <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
-          6. Request options
+          {schema.security?.enabled ||
+          schema.output?.filenameTemplate ||
+          schema.output?.folderPath
+            ? "8. Request options"
+            : "6. Request options"}
         </h3>
         <div className="overflow-hidden rounded-lg border">
           <table className="w-full text-sm">
@@ -447,6 +603,28 @@ export function ApiGuide({ templateId, refreshKey = 0, compact = false }: Props)
                   inline-disposition presigned URL for embedding.
                 </td>
               </tr>
+              <tr>
+                <td className="w-32 px-3 py-2 font-mono text-xs">
+                  outputName
+                </td>
+                <td className="px-3 py-2 text-xs text-muted-foreground">
+                  string — override the saved filename for this one render.
+                  Supports <code className="font-mono">{`{{key}}`}</code>{" "}
+                  placeholders against your{" "}
+                  <code className="font-mono">data</code>.
+                </td>
+              </tr>
+              <tr>
+                <td className="w-32 px-3 py-2 font-mono text-xs">
+                  outputPath
+                </td>
+                <td className="px-3 py-2 text-xs text-muted-foreground">
+                  string — override the logical sub-folder under the org&rsquo;s
+                  outputs/ prefix. Same placeholder syntax. Path traversal
+                  attempts (<code className="font-mono">..</code>, NUL,
+                  control bytes) are stripped.
+                </td>
+              </tr>
             </tbody>
           </table>
         </div>
@@ -470,6 +648,21 @@ export function ApiGuide({ templateId, refreshKey = 0, compact = false }: Props)
 }
 
 // ---- helpers --------------------------------------------------------------
+
+// permissionLabel summarises the granular allow-flags for the security
+// banner. We match the order the designer's checkboxes use so the same
+// language appears in both places.
+function permissionLabel(perms?: Record<string, boolean>): string {
+  if (!perms) return "(none — owner password required for everything)";
+  const allowed: string[] = [];
+  if (perms.print) allowed.push("print");
+  if (perms.copy) allowed.push("copy text");
+  if (perms.modify) allowed.push("modify");
+  if (perms.annotate) allowed.push("annotate / fill forms");
+  if (allowed.length === 0)
+    return "(none — owner password required for everything)";
+  return allowed.join(", ");
+}
 
 function renderConstraints(f: SchemaField) {
   const parts: string[] = [];
@@ -581,10 +774,22 @@ function labelForLang(l: Lang) {
 
 // buildSnippets produces three ready-to-run snippets — cURL, JavaScript
 // (fetch), and Python (requests) — pre-filled with the template's example
-// payload.
-function buildSnippets(endpoint: string, example: Record<string, any>) {
-  const body = JSON.stringify({ data: example, flatten: false }, null, 2);
-  const singleLine = JSON.stringify({ data: example, flatten: false });
+// payload. When the template defines an output filename/folder, the
+// matching `outputName`/`outputPath` keys are surfaced in the body so the
+// integrator's first paste already shows the override slots in context.
+function buildSnippets(
+  endpoint: string,
+  example: Record<string, any>,
+  output?: OutputDoc
+) {
+  const reqBody: Record<string, unknown> = {
+    data: example,
+    flatten: false,
+  };
+  if (output?.filenameTemplate) reqBody.outputName = output.filenameTemplate;
+  if (output?.folderPath) reqBody.outputPath = output.folderPath;
+  const body = JSON.stringify(reqBody, null, 2);
+  const singleLine = JSON.stringify(reqBody);
 
   const curl = `curl -X POST '${endpoint}' \\
   -H 'Authorization: Bearer YOUR_API_KEY' \\
@@ -616,7 +821,7 @@ resp = requests.post(
         "Authorization": "Bearer YOUR_API_KEY",
         "Content-Type": "application/json",
     },
-    json=${toPythonLiteral({ data: example, flatten: false })},
+    json=${toPythonLiteral(reqBody)},
 )
 resp.raise_for_status()
 

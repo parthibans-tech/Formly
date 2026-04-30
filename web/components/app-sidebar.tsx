@@ -43,11 +43,14 @@ import {
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { getUser } from "@/lib/api";
+import { api, getUser } from "@/lib/api";
 import { Input } from "@/components/ui/input";
+import { Badge } from "@/components/ui/badge";
 import { useAIConfig, type AIFeatureFlags } from "@/hooks/use-ai-config";
+import { useBillingState } from "@/lib/billing-state";
 
 type Role = "admin" | "editor" | "viewer";
+type OrgKind = "team" | "personal";
 
 type Item = {
   href: string;
@@ -62,6 +65,13 @@ type Item = {
   // is_super_admin = true) see this. Org admins of regular workspaces
   // won't, even though their role is still "admin".
   superAdmin?: boolean;
+  // teamOnly: when true, hide on personal workspaces. Used for entries
+  // that fundamentally don't apply to a single-member org — the Team
+  // page (no one to manage), email-sender configuration (no team to
+  // notify), etc. Server still enforces refusal (CreateInvite returns
+  // personal_org_no_invites) — this just keeps the dead link out of
+  // the sidebar.
+  teamOnly?: boolean;
   // Hint shown under the label in search results so users can tell apart
   // similarly-named items (e.g. "Audit log" vs "Platform audit").
   hint?: string;
@@ -108,6 +118,17 @@ const SECTIONS: Section[] = [
     items: [
       { href: "/inbox/mentions", label: "Mentions", icon: AtSign },
       { href: "/inbox/reviews", label: "Reviews", icon: CheckSquare },
+      // Access requests are authorized per-file by the API (file
+      // owner approves, requester cancels), so every role needs
+      // this link: editors approve incoming requests on files they
+      // own, and viewers cancel/track outgoing requests they filed.
+      // Lives in Inbox (with Mentions/Reviews) rather than Admin
+      // because it's not an admin-only surface.
+      {
+        href: "/settings/access-requests",
+        label: "Access requests",
+        icon: Share2,
+      },
     ],
   },
   {
@@ -122,12 +143,19 @@ const SECTIONS: Section[] = [
         roles: ["admin"],
         hint: "Org overview",
       },
-      { href: "/settings/team", label: "Team", icon: Users, roles: ["admin"] },
       {
-        href: "/settings/access-requests",
-        label: "Access requests",
-        icon: Share2,
+        href: "/settings/organization",
+        label: "Organization",
+        icon: Building2,
         roles: ["admin"],
+        hint: "Identity & invoice details",
+      },
+      {
+        href: "/settings/team",
+        label: "Team",
+        icon: Users,
+        roles: ["admin"],
+        teamOnly: true,
       },
       {
         href: "/settings/schedules",
@@ -192,19 +220,6 @@ const SECTIONS: Section[] = [
         href: "/integrations",
         label: "Integrations",
         icon: Plug,
-        roles: ["admin"],
-      },
-    ],
-  },
-  {
-    id: "billing",
-    title: "Billing",
-    hideForSuperAdmin: true,
-    items: [
-      {
-        href: "/settings/billing",
-        label: "Plan & invoices",
-        icon: CreditCard,
         roles: ["admin"],
       },
     ],
@@ -308,6 +323,7 @@ function writeJSON(key: string, v: unknown) {
 function visibleFor(
   role: Role | null,
   isSuperAdmin: boolean,
+  orgKind: OrgKind,
   items: Item[],
   aiFeatureOn: (k: keyof AIFeatureFlags) => boolean,
 ): Item[] {
@@ -317,6 +333,11 @@ function visibleFor(
   return items.filter((it) => {
     if (it.superAdmin && !isSuperAdmin) return false;
     if (it.roles && !it.roles.includes(r)) return false;
+    // Personal-workspace gate: items flagged team-only get hidden in
+    // single-member orgs. The server enforces the actual refusal
+    // (e.g. CreateInvite returns personal_org_no_invites) — this just
+    // saves the user a click on a dead link.
+    if (it.teamOnly && orgKind === "personal") return false;
     // AI gate: hide entries whose feature flag is off so the sidebar
     // never advertises a route the page itself would 503 on.
     if (it.aiFeature && !aiFeatureOn(it.aiFeature)) return false;
@@ -337,10 +358,26 @@ function sectionVisible(s: Section, isSuperAdmin: boolean): boolean {
 export function AppSidebar({ onNavigate }: { onNavigate?: () => void }) {
   const [role, setRole] = useState<Role | null>(null);
   const [isSuperAdmin, setIsSuperAdmin] = useState(false);
+  // orgKind drives the personal-workspace nav gate. Hydrated
+  // synchronously from the cached user blob so the first paint
+  // already filters team-only items, then re-confirmed from
+  // /v1/me/profile (authoritative server-side) on mount.
+  const [orgKind, setOrgKind] = useState<OrgKind>("team");
   const [query, setQuery] = useState("");
   const [pins, setPins] = useState<string[]>([]);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  // Org branding for the sidebar header. Same source of truth as the
+  // top-bar (/v1/me/profile) so name + logo stay in lockstep across
+  // both surfaces. Re-fetched on the "org-logo-updated" event the
+  // /settings/organization page dispatches after upload/remove.
+  const [org, setOrg] = useState<{ name: string; logoUrl?: string } | null>(
+    null,
+  );
   const searchRef = useRef<HTMLInputElement>(null);
+  // Live subscription state (already loaded by the shell once at
+  // mount). Used to render a compact plan badge under the org name so
+  // every page gives an at-a-glance answer to "what plan are we on?".
+  const billing = useBillingState();
   // One AI-config fetch per page-load (the hook is module-cached).
   // We synthesize a per-feature predicate here so visibleFor stays a
   // pure function — no hook calls inside its filter loop.
@@ -356,8 +393,41 @@ export function AppSidebar({ onNavigate }: { onNavigate?: () => void }) {
     const u = getUser();
     setRole((u?.role as Role) ?? null);
     setIsSuperAdmin(!!u?.isSuperAdmin);
+    if (u?.orgKind === "personal") setOrgKind("personal");
     setPins(readJSON<string[]>(PINS_KEY, []));
     setCollapsed(readJSON<Record<string, boolean>>(COLLAPSED_KEY, {}));
+  }, []);
+
+  // Pull org branding from the authoritative profile endpoint. Cached
+  // on the user blob isn't a reliable source for orgName (older
+  // sessions) and never carries the logo URL. We also re-pin orgKind
+  // from the server response so a stale cached value (e.g. from an
+  // older login that pre-dates the personal-workspace feature) gets
+  // corrected without a re-login.
+  useEffect(() => {
+    let cancelled = false;
+    const load = () => {
+      api<{ orgName: string; orgLogoUrl?: string; orgKind?: string }>(
+        "/v1/me/profile",
+      )
+        .then((p) => {
+          if (cancelled) return;
+          setOrg({ name: p.orgName || "", logoUrl: p.orgLogoUrl });
+          if (p.orgKind === "personal" || p.orgKind === "team") {
+            setOrgKind(p.orgKind);
+          }
+        })
+        .catch(() => {
+          // Non-fatal — sidebar falls back to the wordmark.
+        });
+    };
+    load();
+    const onUpdated = () => load();
+    window.addEventListener("org-logo-updated", onUpdated);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("org-logo-updated", onUpdated);
+    };
   }, []);
 
   // Cmd/Ctrl-K focuses the sidebar search. Mirrors the muscle memory of
@@ -412,12 +482,11 @@ export function AppSidebar({ onNavigate }: { onNavigate?: () => void }) {
 
   const allVisible = useMemo(() => {
     return orderedSections.flatMap((s) =>
-      visibleFor(role, isSuperAdmin, s.items, aiFeatureOn).map((it) => ({
-        ...it,
-        sectionTitle: s.title,
-      })),
+      visibleFor(role, isSuperAdmin, orgKind, s.items, aiFeatureOn).map(
+        (it) => ({ ...it, sectionTitle: s.title }),
+      ),
     );
-  }, [orderedSections, role, isSuperAdmin, aiFeatureOn]);
+  }, [orderedSections, role, isSuperAdmin, orgKind, aiFeatureOn]);
 
   const pinnedItems = useMemo(() => {
     if (pins.length === 0) return [];
@@ -443,15 +512,40 @@ export function AppSidebar({ onNavigate }: { onNavigate?: () => void }) {
       className="flex h-full flex-col overflow-hidden"
     >
       <div className="flex flex-col gap-3 p-3 pb-2">
+        {/* Workspace brand — shows the org's uploaded logo + name when
+            available, falling back to the Drive360 wordmark. Super-admins
+            always see the platform wordmark since they operate
+            cross-org and "their" org is the operator org, which isn't
+            meaningful context here.
+
+            Layout: 8x8 logo on the left, two-line stack on the right
+            (org name truncated to one line + a compact plan badge).
+            The full name lives on the link's `title` for hover, and on
+            the logo's `alt` for screen readers. */}
         <Link
           href={isSuperAdmin ? "/settings/admin" : "/drive"}
           onClick={onNavigate}
-          className="inline-flex items-center gap-2 px-2 text-sm font-semibold"
+          className="inline-flex min-w-0 items-center gap-2 px-2"
+          title={!isSuperAdmin && org?.name ? org.name : "Drive360"}
         >
-          <span className="grid h-8 w-8 place-items-center rounded-md bg-primary text-primary-foreground">
-            <FileSignature className="h-4 w-4" />
+          {!isSuperAdmin && org?.logoUrl ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={org.logoUrl}
+              alt={org.name ? `${org.name} logo` : "Workspace logo"}
+              className="h-8 w-8 shrink-0 rounded-md border bg-card object-contain"
+            />
+          ) : (
+            <span className="grid h-8 w-8 shrink-0 place-items-center rounded-md bg-primary text-primary-foreground">
+              <FileSignature className="h-4 w-4" />
+            </span>
+          )}
+          <span className="flex min-w-0 flex-col leading-tight">
+            <span className="min-w-0 truncate text-sm font-semibold">
+              {!isSuperAdmin && org?.name ? org.name : "Drive360"}
+            </span>
+            {!isSuperAdmin && <PlanBadge billing={billing} />}
           </span>
-          Drive360
         </Link>
 
         <div className="relative">
@@ -506,7 +600,13 @@ export function AppSidebar({ onNavigate }: { onNavigate?: () => void }) {
             )}
 
             {orderedSections.map((s) => {
-              const items = visibleFor(role, isSuperAdmin, s.items, aiFeatureOn);
+              const items = visibleFor(
+                role,
+                isSuperAdmin,
+                orgKind,
+                s.items,
+                aiFeatureOn,
+              );
               if (items.length === 0) return null;
               return (
                 <SectionBlock
@@ -627,7 +727,6 @@ function SearchResults({
           pinned={pins.includes(item.href)}
           onTogglePin={onTogglePin}
           onNavigate={onNavigate}
-          subtitle={item.sectionTitle}
         />
       ))}
     </ul>
@@ -639,14 +738,12 @@ function NavRow({
   pinned,
   onTogglePin,
   onNavigate,
-  subtitle,
   pinnable = true,
 }: {
   item: Item;
   pinned: boolean;
   onTogglePin: (href: string) => void;
   onNavigate?: () => void;
-  subtitle?: string;
   pinnable?: boolean;
 }) {
   const pathname = usePathname();
@@ -669,14 +766,7 @@ function NavRow({
         )}
       >
         <Icon className="h-4 w-4 shrink-0" />
-        <span className="min-w-0 flex-1 truncate">
-          {item.label}
-          {(subtitle || item.hint) && (
-            <span className="ml-1 text-[10px] font-normal text-muted-foreground">
-              · {subtitle || item.hint}
-            </span>
-          )}
-        </span>
+        <span className="min-w-0 flex-1 truncate">{item.label}</span>
       </Link>
       {pinnable && (
         <button
@@ -703,5 +793,70 @@ function NavRow({
         </button>
       )}
     </li>
+  );
+}
+
+// PlanBadge renders the compact "Free / Pro · trial / Pro · past due"
+// indicator under the org name. Reads from the shared billing state so
+// it stays in sync with the paywall and the /settings/organization
+// page without a second fetch. Returns null while loading and when the
+// API errored — we'd rather show nothing than guess a tier.
+function PlanBadge({
+  billing,
+}: {
+  billing: ReturnType<typeof useBillingState>;
+}) {
+  if (billing.loading) return null;
+  const sub = billing.subscription as
+    | {
+        planName?: string;
+        tier?: string;
+        status?: string;
+        cancelAtPeriodEnd?: boolean;
+      }
+    | null;
+
+  // Active sub branch — derive a single-line "{plan} · {modifier?}"
+  // label and pick a variant that matches the urgency:
+  //   trialing       → default (informational)
+  //   past_due       → destructive
+  //   cancel-pending → warning (still active but ending)
+  //   normal active  → success
+  if (sub) {
+    const name = sub.planName || sub.tier || "Active";
+    let modifier: string | null = null;
+    let variant: "default" | "success" | "warning" | "destructive" =
+      "success";
+    if (sub.status === "trialing") {
+      modifier = "trial";
+      variant = "default";
+    } else if (sub.status === "past_due") {
+      modifier = "past due";
+      variant = "destructive";
+    } else if (sub.cancelAtPeriodEnd) {
+      modifier = "ending";
+      variant = "warning";
+    }
+    return (
+      <Badge
+        variant={variant}
+        className="mt-0.5 w-fit max-w-full truncate px-1.5 py-0 text-[10px] font-medium"
+      >
+        {modifier ? `${name} · ${modifier}` : name}
+      </Badge>
+    );
+  }
+
+  // No active sub — either trial expired (paywall is engaged) or the
+  // workspace has never paid. Both surface as a muted pill so the user
+  // always knows the tier; clicking the brand link still goes to /drive,
+  // the paywall itself handles the upgrade journey separately.
+  return (
+    <Badge
+      variant="outline"
+      className="mt-0.5 w-fit px-1.5 py-0 text-[10px] font-medium text-muted-foreground"
+    >
+      {billing.requiresUpgrade ? "Trial ended" : "Free"}
+    </Badge>
   );
 }

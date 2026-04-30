@@ -105,7 +105,37 @@ function dispatch(action: Action) {
 
 type Toast = Omit<ToasterToast, "id">;
 
+// Two ReactNodes are "equivalent" for dedupe purposes when their
+// stringified forms match. We only ever pass strings/numbers/null
+// through the toast() helper in this codebase, so a String() coercion
+// is safe and avoids a deep-equal dependency.
+function sameNode(a: React.ReactNode, b: React.ReactNode): boolean {
+  if (a === b) return true;
+  if (a == null && b == null) return true;
+  if (a == null || b == null) return false;
+  return String(a) === String(b);
+}
+
 function toast({ ...props }: Toast) {
+  // Dedupe: if an identical toast (same variant + title + description)
+  // is already open, refresh it instead of stacking a duplicate.
+  // Spamming a copy button then reads as "the toast is still there"
+  // instead of three near-identical cards piling on top of each other.
+  const existing = memoryState.toasts.find(
+    (t) =>
+      t.open !== false &&
+      t.variant === props.variant &&
+      sameNode(t.title, props.title) &&
+      sameNode(t.description, props.description),
+  );
+  if (existing) {
+    const id = existing.id;
+    const update = (next: ToasterToast) =>
+      dispatch({ type: "UPDATE_TOAST", toast: { ...next, id } });
+    const dismiss = () => dispatch({ type: "DISMISS_TOAST", toastId: id });
+    return { id, dismiss, update };
+  }
+
   const id = genId();
   const update = (props: ToasterToast) =>
     dispatch({ type: "UPDATE_TOAST", toast: { ...props, id } });

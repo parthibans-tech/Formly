@@ -95,6 +95,14 @@ type registerReq struct {
 	Password string `json:"password"`
 	Name     string `json:"name"`
 	OrgName  string `json:"orgName"`
+	// Personal=true creates a sealed single-member workspace ("Just me"
+	// signup). The org row is tagged kind='personal'; CreateInvite
+	// refuses against it with 409 personal_org_no_invites. Users in a
+	// personal org can still ACCEPT invites to other team orgs — the
+	// personal workspace just stays read-only-membership-wise on its
+	// own. When false (default) we create a regular kind='team' org
+	// using OrgName (or "<name>'s Org" if blank), the same as before.
+	Personal bool `json:"personal"`
 }
 
 type authResp struct {
@@ -115,6 +123,12 @@ type user struct {
 	// IsSuperAdmin mirrors users.is_super_admin — surfaced so the web
 	// client can gate platform-only UI without making a second call.
 	IsSuperAdmin bool `json:"isSuperAdmin,omitempty"`
+	// OrgKind is "team" (default) or "personal". Surfaced on the login
+	// response so the web app's first paint already knows whether to
+	// render team-only navigation (Team page, "Manage team" buttons,
+	// invite affordances). The same field appears on /v1/me/profile
+	// for pages that don't have access to the cached user blob.
+	OrgKind string `json:"orgKind,omitempty"`
 }
 
 func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
@@ -137,12 +151,24 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(ctx)
 
+	// Branch on the personal-workspace flag. Personal signups override
+	// any org name the form sent (the form hides the field anyway) and
+	// stamp the org as kind='personal' so the invite-create endpoint
+	// will refuse for this org. Team signups keep the legacy fallback
+	// of "<name>'s Org" when OrgName is blank.
 	orgName := req.OrgName
-	if orgName == "" {
+	orgKind := "team"
+	if req.Personal {
+		orgName = "Personal workspace"
+		orgKind = "personal"
+	} else if orgName == "" {
 		orgName = req.Name + "'s Org"
 	}
 	var orgID string
-	if err := tx.QueryRow(ctx, `INSERT INTO organizations (name) VALUES ($1) RETURNING id`, orgName).Scan(&orgID); err != nil {
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO organizations (name, kind) VALUES ($1,$2) RETURNING id`,
+		orgName, orgKind,
+	).Scan(&orgID); err != nil {
 		writeErr(w, 500, "org_create", err.Error())
 		return
 	}
@@ -153,6 +179,21 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 		orgID, req.Email, string(hash), req.Name,
 	).Scan(&userID); err != nil {
 		writeErr(w, 400, "user_create", err.Error())
+		return
+	}
+	// Mirror the user into org_memberships so the multi-org code paths
+	// (membership listing, /v1/me/switch-org, seat counting) see this
+	// signup the same way they see invite-accept and admin-attached
+	// memberships. Migration 030 backfills existing users; this keeps
+	// the invariant going forward. Idempotent — ON CONFLICT in case the
+	// migration already covered the row through some other code path.
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO org_memberships (user_id, org_id, role, source)
+		 VALUES ($1,$2,'admin','primary')
+		 ON CONFLICT (user_id, org_id) DO NOTHING`,
+		userID, orgID,
+	); err != nil {
+		writeErr(w, 500, "membership_create", err.Error())
 		return
 	}
 	if h.OnRegister != nil {
@@ -171,6 +212,11 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 	token, _ := h.issueTokenSuper(userID, orgID, req.Email, RoleAdmin, false)
 	writeJSON(w, 200, authResp{Token: token, User: user{
 		ID: userID, Email: req.Email, Name: req.Name, OrgID: orgID, Role: RoleAdmin,
+		// OrgKind is known at register-time without a re-read because
+		// we set it ourselves a few lines up. Mirroring it here keeps
+		// the response shape identical to /v1/auth/login so the web
+		// app's session-bootstrap path treats both the same.
+		OrgKind: orgKind,
 	}})
 }
 
@@ -206,6 +252,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 
 	var (
 		id, orgID, name, hash, role string
+		orgKind                     string
 		isSuper                     bool
 		lockedAt                    *time.Time
 		lockedReason                *string
@@ -216,12 +263,12 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		`SELECT u.id, u.org_id, u.name, u.password_hash, COALESCE(u.role,'editor'),
 		        COALESCE(u.is_super_admin, FALSE),
 		        u.locked_at, u.locked_reason, u.force_pw_reset,
-		        o.deleted_at
+		        o.deleted_at, COALESCE(o.kind,'team')
 		   FROM users u
 		   LEFT JOIN organizations o ON o.id = u.org_id
 		  WHERE u.email=$1`, req.Email,
 	).Scan(&id, &orgID, &name, &hash, &role, &isSuper, &lockedAt, &lockedReason,
-		&forcePwReset, &orgDeletedAt)
+		&forcePwReset, &orgDeletedAt, &orgKind)
 	if err != nil {
 		writeErr(w, 401, "invalid_credentials", "bad email or password")
 		return
@@ -287,6 +334,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		User: user{
 			ID: id, Email: req.Email, Name: name, OrgID: orgID, Role: role,
 			IsSuperAdmin: isSuper,
+			OrgKind:      orgKind,
 		},
 		ForcePasswordReset: forcePwReset,
 	})
@@ -425,6 +473,30 @@ func (h *Handler) issueTokenSuper(uid, oid, email, role string, isSuper bool) (s
 // arrive as super-admins — that bit is set by migration or platform action.
 func (h *Handler) IssueTokenForUser(uid, oid, email, role string) (string, error) {
 	return h.issueToken(uid, oid, email, role)
+}
+
+// ParseToken validates a raw JWT against this handler's secret and returns
+// the decoded claims. Public endpoints that aren't behind Middleware (e.g.
+// the invite-accept handler) call this when they want to opportunistically
+// recognise a signed-in caller — the request still works without a Bearer,
+// but if one is present and valid we can skip a redundant password prompt.
+//
+// Returns (nil, err) for any parse / signature / expiry failure. The
+// session-revocation hook is intentionally NOT consulted here: this helper
+// is only used to authenticate identity for a one-shot "are you who you
+// say you are" check, not to grant a fresh authorization scope.
+func (h *Handler) ParseToken(raw string) (*Claims, error) {
+	claims := &Claims{}
+	_, err := jwt.ParseWithClaims(raw, claims, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, errors.New("bad signing method")
+		}
+		return h.Secret, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return claims, nil
 }
 
 // APIKeyVerifier resolves a raw API key into (userID, orgID, email, role).

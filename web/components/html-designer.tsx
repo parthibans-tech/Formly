@@ -147,7 +147,11 @@ export default function HtmlDesigner({
   const previewTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
-  const [autoSave, setAutoSave] = useState(true);
+  // Default off: auto-save can mask intent (an in-progress edit is shipped
+  // to collaborators / preview the moment the debounce timer fires).
+  // Authors opt in via the View menu / palette ("Enable auto-save") when
+  // they want the convenience.
+  const [autoSave, setAutoSave] = useState(false);
   const [lastSavedAt, setLastSavedAt] = useState<Date | null>(null);
   const codeTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 

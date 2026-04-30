@@ -14,15 +14,24 @@ import (
 	"time"
 
 	"github.com/docforge/api/internal/auth"
+	"github.com/docforge/api/internal/orgs"
+	"github.com/docforge/api/internal/storage"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type Handler struct {
-	DB *pgxpool.Pool
+	DB    *pgxpool.Pool
+	Store *storage.Client // optional; when set we surface the org logo URL on profile reads
 }
 
 func New(db *pgxpool.Pool) *Handler { return &Handler{DB: db} }
+
+// AttachStore wires in the storage client so /v1/me/profile can return
+// a presigned URL for the org logo. main.go calls this after both the
+// me handler and the storage client are constructed; passing it via the
+// constructor would have meant re-ordering the entire init block.
+func (h *Handler) AttachStore(s *storage.Client) { h.Store = s }
 
 type profile struct {
 	ID                 string    `json:"id"`
@@ -32,6 +41,12 @@ type profile struct {
 	IsSuperAdmin       bool      `json:"isSuperAdmin"`
 	OrgID              string    `json:"orgId"`
 	OrgName            string    `json:"orgName"`
+	// OrgKind is "team" or "personal" — drives whether the web app
+	// shows team-only surfaces (Team page, "Manage team" buttons,
+	// invite affordances). Defaults to "team" for legacy orgs that
+	// pre-date migration 051.
+	OrgKind            string    `json:"orgKind"`
+	OrgLogoURL         string    `json:"orgLogoUrl,omitempty"`
 	CreatedAt          time.Time `json:"createdAt"`
 	LockedAt           *string   `json:"lockedAt,omitempty"`
 	ForcePasswordReset bool      `json:"forcePasswordReset"`
@@ -77,16 +92,19 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		OrgID:        c.OrgID,
 	}
 
-	// Core user row + org name.
+	// Core user row + org name + kind. orgKind is COALESCE'd to 'team'
+	// so old DBs without migration 051 still get a sensible value.
 	var lockedAt *time.Time
 	err := h.DB.QueryRow(ctx, `
 		SELECT u.name, u.created_at, u.locked_at,
 		       COALESCE(u.force_pw_reset, false),
-		       COALESCE(o.name, '')
+		       COALESCE(o.name, ''),
+		       COALESCE(o.kind, 'team')
 		  FROM users u
 		  LEFT JOIN organizations o ON o.id = u.org_id
 		 WHERE u.id = $1`, c.UserID,
-	).Scan(&p.Name, &p.CreatedAt, &lockedAt, &p.ForcePasswordReset, &p.OrgName)
+	).Scan(&p.Name, &p.CreatedAt, &lockedAt, &p.ForcePasswordReset,
+		&p.OrgName, &p.OrgKind)
 	if errors.Is(err, pgx.ErrNoRows) {
 		writeErr(w, 404, "not_found", "user not found")
 		return
@@ -98,6 +116,13 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	if lockedAt != nil {
 		s := lockedAt.Format(time.RFC3339)
 		p.LockedAt = &s
+	}
+
+	// Org logo: presigned URL minted on every read so the URL never
+	// outlives its TTL. Best-effort — a missing/broken logo never blocks
+	// the profile response, the header just falls back to the wordmark.
+	if h.Store != nil && p.OrgID != "" {
+		p.OrgLogoURL = orgs.LogoURL(ctx, h.DB, h.Store, p.OrgID)
 	}
 
 	// MFA: presence of two_factor_secrets row + verified_at + recovery codes.

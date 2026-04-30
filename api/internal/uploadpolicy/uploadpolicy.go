@@ -405,7 +405,64 @@ func SniffMime(headBytes []byte, declared string) (detected string, mismatch boo
 		// text/plain vs text/html etc. — too noisy to flag.
 		return detected, false
 	}
+	// ZIP-container exemption: DOCX/XLSX/PPTX/ODT/EPUB/JAR/APK are all
+	// physically ZIP archives, so http.DetectContentType reports them as
+	// application/zip even when the user correctly declared the precise
+	// office MIME. Without this carve-out, *every* legitimate office
+	// upload trips the strict reject path. We only exempt declarations
+	// we recognise — so a DOCX claiming "application/pdf" is still a
+	// forgery, but a DOCX claiming the right OOXML MIME passes through.
+	if isZipContainerMime(d2) && (d1 == "application/zip" || d1 == "application/x-zip-compressed") {
+		return detected, false
+	}
 	return detected, d1 != d2
+}
+
+// isZipContainerMime reports whether the given MIME identifies a format
+// that's physically a ZIP archive. Used by SniffMime to avoid rejecting
+// DOCX-as-zip etc. Keep this list narrow: every entry is a known
+// ZIP-based format whose first 4 bytes are the PK\x03\x04 signature.
+// Unknown application/vnd.* values are NOT exempted — that would be a
+// forgery escape hatch.
+//
+// Callers pass the family-reduced form (no `+xml` suffix, no parameters,
+// lowercased). Notably this means application/epub+zip arrives as
+// application/epub.
+func isZipContainerMime(m string) bool {
+	switch m {
+	// Microsoft OOXML — Word / Excel / PowerPoint, both base and
+	// macro-enabled and template variants.
+	case "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+		"application/vnd.openxmlformats-officedocument.wordprocessingml.template",
+		"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+		"application/vnd.openxmlformats-officedocument.spreadsheetml.template",
+		"application/vnd.openxmlformats-officedocument.presentationml.presentation",
+		"application/vnd.openxmlformats-officedocument.presentationml.template",
+		"application/vnd.openxmlformats-officedocument.presentationml.slideshow",
+		"application/vnd.ms-word.document.macroenabled.12",
+		"application/vnd.ms-word.template.macroenabled.12",
+		"application/vnd.ms-excel.sheet.macroenabled.12",
+		"application/vnd.ms-excel.template.macroenabled.12",
+		"application/vnd.ms-powerpoint.presentation.macroenabled.12",
+		"application/vnd.ms-powerpoint.template.macroenabled.12":
+		return true
+	// OpenDocument — text / spreadsheet / presentation / graphics.
+	case "application/vnd.oasis.opendocument.text",
+		"application/vnd.oasis.opendocument.spreadsheet",
+		"application/vnd.oasis.opendocument.presentation",
+		"application/vnd.oasis.opendocument.graphics",
+		"application/vnd.oasis.opendocument.chart",
+		"application/vnd.oasis.opendocument.formula":
+		return true
+	// EPUB / JAR / APK — all PK\x03\x04 archives. EPUB's full MIME is
+	// application/epub+zip; family() strips the suffix to application/epub
+	// before this check runs.
+	case "application/epub",
+		"application/java-archive",
+		"application/vnd.android.package-archive":
+		return true
+	}
+	return false
 }
 
 // CanonicalMime decides which MIME to PERSIST after a successful upload.
@@ -454,6 +511,16 @@ func CanonicalMime(declared, detected string) string {
 	// text/html, text/csv, etc.); keep the declaration. SniffMime
 	// applies the same exemption.
 	if strings.HasPrefix(family(d), "text/") && strings.HasPrefix(family(x), "text/") {
+		return d
+	}
+	// ZIP-container exemption: DOCX/XLSX/PPTX/ODT/EPUB/JAR are physically
+	// ZIP archives, so http.DetectContentType reports application/zip.
+	// Persisting the bytes-truth here would overwrite the more specific
+	// office MIME with "application/zip" and break downstream code that
+	// branches on the precise OOXML / ODF MIME (convert pipeline, preview
+	// renderer, extractor selection). Keep the declaration. SniffMime
+	// applies the matching strict-mode exemption.
+	if isZipContainerMime(family(d)) && (family(x) == "application/zip" || family(x) == "application/x-zip-compressed") {
 		return d
 	}
 	// Family mismatch and we got here — declared lied. Trust bytes.

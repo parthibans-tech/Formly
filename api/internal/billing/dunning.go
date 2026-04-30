@@ -98,7 +98,55 @@ func (h *Handler) RunDunning(ctx context.Context) {
 		}
 	}
 
-	// 2. Past-due reminders — every 24h up to MaxDunningNotices, then
+	// 2. Expired trials — cancel status='trialing' rows whose
+	// trial_ends_at has passed without a payment method on file. Only
+	// manual trials (StartTrial-provisioned) need this sweep;
+	// Stripe/Razorpay trials get converted by their own webhooks.
+	//
+	// We do NOT auto-provision a replacement subscription. Trial is
+	// one-time per org (enforced by StartTrial), and the product
+	// policy is "if your trial ends, pick a plan and pay" — not "drop
+	// silently to a free tier". After this sweep the org has no
+	// active sub, LoadOrgLimits flags it as RequiresUpgrade, and
+	// every write gets a 402 subscription_required until the admin
+	// completes checkout on /settings/billing.
+	{
+		rows, err := h.DB.Query(ctx, `
+			SELECT s.id::text, s.org_id::text, COALESCE(p.name,'your trial')
+			  FROM subscriptions s
+			  LEFT JOIN plans p ON p.id = s.plan_id
+			 WHERE s.status='trialing'
+			   AND s.provider='manual'
+			   AND s.trial_ends_at IS NOT NULL
+			   AND s.trial_ends_at < now()`)
+		if err == nil {
+			type expired struct {
+				ID, OrgID, PlanName string
+			}
+			var batch []expired
+			for rows.Next() {
+				var e expired
+				if rows.Scan(&e.ID, &e.OrgID, &e.PlanName) != nil {
+					continue
+				}
+				batch = append(batch, e)
+			}
+			rows.Close()
+
+			for _, e := range batch {
+				if _, err := h.DB.Exec(ctx, `
+					UPDATE subscriptions
+					   SET status='canceled', canceled_at=now(), updated_at=now()
+					 WHERE id=$1::uuid AND status='trialing'`, e.ID); err != nil {
+					log.Printf("billing.dunning: cancel expired trial %s: %v", e.ID, err)
+					continue
+				}
+				notifyTrialExpired(ctx, h.DB, h.Mailer, e.OrgID, e.PlanName)
+			}
+		}
+	}
+
+	// 3. Past-due reminders — every 24h up to MaxDunningNotices, then
 	// the next sweep cancels the subscription outright.
 	{
 		rows, err := h.DB.Query(ctx, `
