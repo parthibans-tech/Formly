@@ -1,0 +1,71 @@
+{{/*
+  Formly Alertmanager templates.
+
+  Why custom templates: the default Alertmanager messages put every
+  label on a separate line and bury the runbook link three scrolls
+  down. A pager that needs scrolling is a pager that gets ignored.
+  These templates target a one-glance summary: who is on fire,
+  how badly, and where to read the runbook.
+
+  Defined templates:
+    - formly.summary           — one-line "X firing: <alertname> (<labels>)"
+    - formly.externalURL       — URL back to Alertmanager / Prometheus
+    - formly.slack.title       — Slack message title
+    - formly.slack.text        — Slack message body
+    - formly.slack.color       — green/yellow/red for the side bar
+    - formly.pagerduty.description — PagerDuty incident description
+*/}}
+
+{{ define "formly.summary" -}}
+{{ if eq .Status "firing" -}}
+{{ .Alerts.Firing | len }} firing
+{{- else -}}
+resolved
+{{- end }}: {{ .GroupLabels.alertname }}
+{{- if .CommonLabels.job }} on {{ .CommonLabels.job }}{{ end }}
+{{- end }}
+
+{{ define "formly.externalURL" -}}
+{{ .ExternalURL }}
+{{- end }}
+
+{{/* ── Slack ─────────────────────────────────────────────────── */}}
+
+{{ define "formly.slack.color" -}}
+{{ if eq .Status "firing" -}}
+{{ if eq .CommonLabels.severity "page" -}}danger{{ else -}}warning{{- end }}
+{{- else -}}
+good
+{{- end }}
+{{- end }}
+
+{{ define "formly.slack.title" -}}
+{{ if eq .Status "firing" }}:rotating_light:{{ else }}:white_check_mark:{{ end }}
+{{- " " }}[{{ .Status | toUpper }}{{ if eq .Status "firing" }}{{ if eq .CommonLabels.severity "page" }} · PAGE{{ end }}{{ end }}]
+{{ .GroupLabels.alertname }}
+{{- if .CommonLabels.job }} ({{ .CommonLabels.job }}){{ end }}
+{{- end }}
+
+{{ define "formly.slack.text" -}}
+{{ range .Alerts -}}
+*{{ .Annotations.summary }}*
+{{ if .Annotations.description -}}
+{{ .Annotations.description }}
+{{ end -}}
+{{ if .Labels.tier }}_tier:_ `{{ .Labels.tier }}`  {{ end }}
+{{- if .Labels.kind }}_kind:_ `{{ .Labels.kind }}`  {{ end }}
+{{- if .Labels.instance }}_instance:_ `{{ .Labels.instance }}`{{ end }}
+{{ if .Annotations.runbook_url }}<{{ .Annotations.runbook_url }}|:book: Runbook>  {{ end }}
+{{- if .GeneratorURL }}<{{ .GeneratorURL }}|:mag: Query>  {{ end }}
+<{{ $.ExternalURL }}|:bell: Silence>
+{{ end -}}
+{{- end }}
+
+{{/* ── PagerDuty ─────────────────────────────────────────────── */}}
+
+{{ define "formly.pagerduty.description" -}}
+{{ template "formly.summary" . }}
+{{ range .Alerts -}}
+- {{ .Annotations.summary }}
+{{ end -}}
+{{- end }}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
@@ -35,9 +36,11 @@ import (
 	"github.com/docforge/api/internal/ocr"
 	"github.com/docforge/api/internal/ocrprofiles"
 	"github.com/docforge/api/internal/memberships"
+	"github.com/docforge/api/internal/metrics"
 	"github.com/docforge/api/internal/onlyoffice"
 	"github.com/docforge/api/internal/orggate"
 	"github.com/docforge/api/internal/platform"
+	"github.com/docforge/api/internal/promquery"
 	"github.com/docforge/api/internal/vault"
 	"github.com/docforge/api/internal/platformaudit"
 	"github.com/docforge/api/internal/me"
@@ -68,6 +71,7 @@ import (
 	"github.com/docforge/api/internal/storage"
 	"github.com/docforge/api/internal/team"
 	"github.com/docforge/api/internal/templates"
+	"github.com/docforge/api/internal/tracing"
 	"github.com/docforge/api/internal/uploadpolicy"
 	"github.com/docforge/api/internal/mergerecipes"
 	"github.com/docforge/api/internal/pdfmerge"
@@ -99,6 +103,40 @@ func main() {
 	}
 	logger.Info("migrations applied")
 
+	// OpenTelemetry tracer — set up before the metrics registry so
+	// the metrics middleware (mounted later) can read the same
+	// trace_id we'll inject into the request context. Disabled by
+	// default in environments without OTEL_EXPORTER_OTLP_ENDPOINT;
+	// returns a no-op shutdown so the deferred call below is safe.
+	tracingShutdown := tracing.Init(ctx, "formly-api")
+	defer func() {
+		// Bounded shutdown — don't let a wedged Tempo block
+		// process exit. 5s is generous for the in-flight batch
+		// flush plus the OTLP HTTP roundtrip.
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tracingShutdown(flushCtx); err != nil {
+			logger.Warn("tracing shutdown", "err", err)
+		}
+	}()
+
+	// Prometheus registry — constructed early so downstream services
+	// (AI client, mail observer) can hand metrics into the wiring as
+	// they're built. The /metrics handler that exposes this registry
+	// is mounted later, after the chi router is set up.
+	metricsReg := metrics.New(metrics.Options{
+		Process: "api",
+		Version: os.Getenv("APP_VERSION"),
+		Commit:  os.Getenv("APP_COMMIT"),
+	})
+	metricsReg.StartDBPoolCollector(ctx, pool)
+	// Adapter satisfies ai.Observer by funnelling each call into the
+	// AIRequests counter and AIDuration histogram. Token counts will
+	// land here once ChatResponse carries usage data — for now the
+	// observer pushes 0/0 and the metrics package treats 0 as
+	// "unknown" (no AITokens samples emitted on that path).
+	aiObserver := metricsAIObserver{reg: metricsReg}
+
 	store, err := storage.New()
 	if err != nil {
 		logger.Error("storage init", "err", err)
@@ -110,6 +148,30 @@ func main() {
 	defer qc.Close()
 
 	a := auth.New(pool)
+
+	// Tier 2 metrics wiring. Three independent threads:
+	//
+	//  1. Tenant annotator — runs from auth middleware after Claims are
+	//     attached; resolves the org's billing tier (cached, 30s TTL)
+	//     and stashes it in the metrics request slot so the outer
+	//     metrics middleware can label the per-tier SLO counter.
+	//
+	//  2. Login-attempt observer — fires from auth.Login / auth.Register
+	//     and the MFA branch with stable {kind, result} labels.
+	//
+	// Wired here (not in metrics.New) so the metrics package keeps zero
+	// imports of auth/billing and is unit-testable in isolation.
+	planResolver := newPlanTierResolver(pool)
+	a.TenantAnnotator = func(req *http.Request) {
+		c, _ := req.Context().Value(auth.UserCtxKey).(*auth.Claims)
+		if c == nil || c.OrgID == "" {
+			return
+		}
+		metrics.SetRequestTenant(req, planResolver.Resolve(req.Context(), c.OrgID))
+	}
+	a.OnLoginAttempt = func(_ context.Context, kind, result string) {
+		metricsReg.AuthAttempts.WithLabelValues(kind, result).Inc()
+	}
 	t := templates.New(pool, store)
 	t.Queue = qc
 	// Surface the org-level iframe-sandbox token in PreviewURL responses
@@ -190,7 +252,7 @@ func main() {
 	// returns a Disabled client whose every method returns
 	// ErrDisabled, and the public /v1/ai/config endpoint reports
 	// `enabled:false` so the frontend hides AI affordances.
-	aiClient := ai.NewFromEnv()
+	aiClient := ai.WithMetrics(ai.NewFromEnv(), aiObserver)
 	logger.Info("ai", "enabled", aiClient.Enabled(), "provider", aiClient.Provider())
 	aiH := ai.NewHandler(aiClient)
 
@@ -300,6 +362,10 @@ func main() {
 	})
 	bl.AttachMailer(mh.Mailer)
 	bl.WireNotifier(ctx)
+	// Tier 4 deadman: each dunning tick stamps the cron gauge so the
+	// "billing-dunning hasn't run in N hours" alert can fire if this
+	// goroutine wedges or its context is canceled by accident.
+	bl.OnDunningTick = func() { metricsReg.MarkCronRun("billing-dunning") }
 	bl.StartDunningLoop(ctx, time.Hour)
 	a.OnRegister = func(ctx context.Context, q auth.PostRegisterDB, orgID string) error {
 		return billing.StartTrial(ctx, q, orgID)
@@ -317,6 +383,32 @@ func main() {
 	obs := observability.New(pool, obsAgg, obsChecker, queue.ClientOpt())
 	observability.StartFlusher(ctx, pool, obsAgg)
 	observability.StartHealthLoop(ctx, pool, obsChecker, time.Minute)
+
+	// Mail observer — fires once per Send so we can alert on mail
+	// failures by kind (invite, billing_*, access_request_*) and
+	// provider. Wired here (rather than next to metricsReg above)
+	// because mh.Mailer is constructed further down the boot chain.
+	// Kept as a hook on the Mailer to keep `internal/mail` free of
+	// any prometheus import.
+	mh.Mailer.SetMetricsObserver(func(kind, provider string, ok bool) {
+		result := "sent"
+		if !ok {
+			result = "failed"
+		}
+		if kind == "" {
+			kind = "unknown"
+		}
+		if provider == "" {
+			provider = "unknown"
+		}
+		metricsReg.MailSent.WithLabelValues(kind, provider, result).Inc()
+	})
+	// Credentials for the /metrics scrape gate. When unset, the handler
+	// falls back to loopback-only — safe default for dev, matches what
+	// most homelab Prometheus instances do anyway. Set both env vars in
+	// production so scrapers off-host can authenticate.
+	metricsUser := os.Getenv("METRICS_BASIC_AUTH_USER")
+	metricsPass := os.Getenv("METRICS_BASIC_AUTH_PASSWORD")
 
 	// Wire auth hooks so login → session tracking + audit, middleware →
 	// revocation check, login → optional MFA challenge.
@@ -354,13 +446,34 @@ func main() {
 	// `fk_` authenticate against the api_keys table instead of as a JWT. We
 	// register the v2 verifier so the auth middleware attaches the key ID +
 	// scopes to the request context (used by scope-guard + per-key logger).
+	//
+	// Tier 2: classify the verifier outcome into a small enum (ok /
+	// invalid / revoked / expired / error) and increment APIKeyAuth.
+	// `invalid` + `revoked` dominating with no `ok` is the canonical
+	// leaked-key-being-scanned signal.
 	auth.RegisterAPIKeyVerifierV2(func(r *http.Request, raw string) (string, string, string, string, string, []string, error) {
-		return apikeys.VerifyAndLoadV2(pool, r, raw)
+		uid, oid, email, role, keyID, scopes, err := apikeys.VerifyAndLoadV2(pool, r, raw)
+		metricsReg.APIKeyAuth.WithLabelValues(apiKeyAuthResult(err)).Inc()
+		return uid, oid, email, role, keyID, scopes, err
 	})
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Recoverer)
+	// OpenTelemetry server-side spans — mounted between RequestID
+	// and the metrics middleware so:
+	//   1. The chi RequestID is already on the context (the tracing
+	//      middleware copies it onto the span as
+	//      `formly.request_id` for cross-system correlation).
+	//   2. The metrics middleware sees the W3C `traceparent` header
+	//      that this middleware injects, so HTTP histogram exemplars
+	//      and the actual span share the same trace_id.
+	r.Use(tracing.Middleware())
+	// Prometheus HTTP middleware — mounted high so it observes the
+	// status the user actually sees (post-Recoverer 5xx, pre-CORS so
+	// preflights count). Skips /healthz and /metrics internally to keep
+	// cardinality and the latency histogram honest.
+	r.Use(metricsReg.Middleware())
 	// gzip / deflate response compression. JSON list endpoints (drive,
 	// audit, OCR profiles, embeddings search) ship multi-KB payloads
 	// that compress 5–10× on the wire; we leave the heavy binary
@@ -409,16 +522,31 @@ func main() {
 	// Rate-limit auth endpoints (login, register, MFA verify) to slow down
 	// credential-stuffing. 30 requests / minute / IP-path is plenty for a
 	// human and painful for a bot.
+	//
+	// Tier 2: Name + OnLimit feed the security RateLimitHits counter.
+	// "auth" is the canonical bucket name — a future per-endpoint
+	// limiter (e.g. password-reset only) gets its own Name without
+	// inflating the bucket label cardinality past a handful.
 	authRateLimit := security.RateLimit(pool, security.LimitOpts{
 		Window:    time.Minute,
 		Max:       30,
 		BucketKey: security.LoginBucketKey,
+		Name:      "auth",
+		OnLimit: func(name string) {
+			metricsReg.RateLimitHits.WithLabelValues(name).Inc()
+		},
 	})
 
 	// Deep health + metrics exposition. Public (unauthenticated) so probes
 	// and scrapers can hit them, but return structured data.
 	r.Get("/healthz", obs.DeepHealth)
-	r.Get("/metrics", obs.Metrics)
+	// /metrics serves the full prom exposition (Go runtime, process,
+	// HTTP series, build_info). Auth-gated: basic auth when env creds
+	// are set, otherwise loopback-only. The legacy obs.Metrics endpoint
+	// (last-hour rollup from request_metrics) moves to /v1/ops/metrics
+	// so existing dashboards don't break while we cut over.
+	r.Method("GET", "/metrics", metricsReg.Handler(metricsUser, metricsPass))
+	r.Get("/v1/ops/metrics", obs.Metrics)
 
 	// OpenAPI spec — public so docs viewers can fetch it without a token.
 	r.Get("/v1/openapi.json", platform.OpenAPIHandler())
@@ -771,6 +899,21 @@ func main() {
 		// Phase 3: platform-wide audit log viewer.
 		r.With(requireSuperAdmin).Get("/v1/admin/audit", pa.List)
 
+		// Tier 3: Prometheus-powered super-admin observability.
+		// Both routes 503 cleanly when PROMETHEUS_URL is unset, so a
+		// fresh dev checkout still loads /settings/admin/observability
+		// — the page just hides its live panels.
+		obsq := promquery.NewHandler(promquery.New(
+			os.Getenv("PROMETHEUS_URL"),
+			os.Getenv("PROMETHEUS_USER"),
+			os.Getenv("PROMETHEUS_PASSWORD"),
+		))
+		r.With(requireSuperAdmin).Get("/v1/admin/observability/snapshot", obsq.SnapshotHandler)
+		r.With(requireSuperAdmin).Get("/v1/admin/observability/series", obsq.SeriesHandler)
+		r.With(requireSuperAdmin).Get("/v1/admin/observability/targets", obsq.TargetsHandler)
+		r.With(requireSuperAdmin).Get("/v1/admin/observability/alerts", obsq.AlertsHandler)
+		r.With(requireSuperAdmin).Get("/v1/admin/observability/infra", obsq.InfraHandler)
+
 		// Super-admin dashboard: one-shot aggregator with org/user/sub
 		// counts, 30-day revenue, recent signups, paid + open invoices,
 		// and recent audit events. The console page hits this on load.
@@ -987,6 +1130,63 @@ func (a teamMailerAdapter) Send(ctx context.Context, opts team.NotifyOptions) (s
 		},
 		Metadata: opts.Metadata,
 	})
+}
+
+// metricsAIObserver bridges ai.Observer onto the prometheus
+// AIRequests / AIDuration / AITokens vectors. Kept here (not in
+// internal/ai or internal/metrics) so neither package has to know
+// about the other — main is the wiring level by design.
+type metricsAIObserver struct {
+	reg *metrics.Registry
+}
+
+func (o metricsAIObserver) Observe(op, provider string, dur time.Duration, tokensIn, tokensOut int, err error) {
+	if o.reg == nil {
+		return
+	}
+	if op == "" {
+		op = "unknown"
+	}
+	if provider == "" {
+		provider = "unknown"
+	}
+	result := "ok"
+	if err != nil {
+		result = "error"
+	}
+	o.reg.AIRequests.WithLabelValues(provider, op, result).Inc()
+	o.reg.AIDuration.WithLabelValues(provider, op).Observe(dur.Seconds())
+	// Treat 0 as "unknown" rather than "definitely zero" — we'd
+	// rather skip the sample than poison the rate() with phantom
+	// zero-token calls. When ChatResponse grows usage data we'll
+	// land non-zero counts here and these branches start firing.
+	if tokensIn > 0 {
+		o.reg.AITokens.WithLabelValues(provider, op, "prompt").Add(float64(tokensIn))
+	}
+	if tokensOut > 0 {
+		o.reg.AITokens.WithLabelValues(provider, op, "completion").Add(float64(tokensOut))
+	}
+}
+
+// apiKeyAuthResult buckets an APIKeyVerifierV2 error into the small
+// label set the metrics dashboard understands. Kept here (not in
+// internal/apikeys) so the apikeys package stays free of an
+// observability dependency — and the label vocabulary is what the
+// metrics dashboards / alerts know about, not what the apikeys
+// package happens to expose.
+func apiKeyAuthResult(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, apikeys.ErrInvalidKey):
+		return "invalid"
+	case errors.Is(err, apikeys.ErrRevokedKey):
+		return "revoked"
+	case errors.Is(err, apikeys.ErrExpiredKey):
+		return "expired"
+	default:
+		return "error"
+	}
 }
 
 // requireSuperAdmin gates the /v1/admin/users/* routes.

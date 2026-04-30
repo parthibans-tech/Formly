@@ -1,0 +1,75 @@
+# Blackbox exporter modules. Prometheus calls into the exporter
+# with `module=<name>&target=<url>` to perform a probe; the
+# response is the standard `probe_*` metric set:
+#
+#   probe_success                  1 if the probe passed, 0 otherwise
+#   probe_duration_seconds         total wall-clock probe time
+#   probe_http_status_code         last HTTP response code (http_*)
+#   probe_ssl_earliest_cert_expiry seconds since unix epoch (http_* + tls)
+#   probe_dns_lookup_time_seconds  DNS resolution time
+#
+# The probe job in prometheus.dev.yml consumes these and the alert
+# rules in alerts.rules.yml fire on (a) success==0 sustained, (b)
+# duration over budget, (c) cert nearing expiry.
+#
+# We deliberately keep this list short — every URL listed here is
+# scraped on the same cadence and bills against the same total
+# series count. Add modules sparingly.
+
+modules:
+  http_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      preferred_ip_protocol: ip4
+      valid_status_codes: []  # 2xx only
+      valid_http_versions: ["HTTP/1.1", "HTTP/2.0"]
+      fail_if_ssl: false
+      fail_if_not_ssl: false
+      tls_config:
+        insecure_skip_verify: false
+      follow_redirects: true
+
+  http_2xx_insecure:
+    # Local dev: target /metrics with self-signed certs allowed.
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      preferred_ip_protocol: ip4
+      tls_config:
+        insecure_skip_verify: true
+
+  http_post_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      method: POST
+      preferred_ip_protocol: ip4
+      headers:
+        Content-Type: application/json
+      body: '{"probe":true}'
+
+  tcp_connect:
+    prober: tcp
+    timeout: 5s
+    tcp:
+      preferred_ip_protocol: ip4
+
+  dns_a:
+    prober: dns
+    timeout: 5s
+    dns:
+      query_name: "formly.com"
+      query_type: A
+      valid_rcodes: ["NOERROR"]
+      validate_answer_rrs:
+        fail_if_matches_regexp: []
+        fail_if_not_matches_regexp: []
+
+  icmp:
+    prober: icmp
+    timeout: 5s
+    icmp:
+      preferred_ip_protocol: ip4

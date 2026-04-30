@@ -26,13 +26,34 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// MetricsObserver is fired once per delivery attempt with the
+// resolved (result, status_code, duration) tuple. main.go wires this
+// to the prometheus webhook vectors so this package stays free of
+// any prometheus import. result is the bucket label used by the
+// counter ("2xx" / "3xx" / "4xx" / "5xx" / "error"), code is the
+// raw HTTP status (0 when the request never got a response).
+type MetricsObserver func(result string, code int, dur time.Duration)
+
 type Handler struct {
 	DB    *pgxpool.Pool
 	Queue *asynq.Client
+
+	// observer fires after every ProcessDelivery attempt; nil when
+	// metrics aren't wired (tests, dev).
+	observer MetricsObserver
 }
 
 func New(db *pgxpool.Pool, q *asynq.Client) *Handler {
 	return &Handler{DB: db, Queue: q}
+}
+
+// SetMetricsObserver attaches a metrics observer. Boot-time only —
+// not safe to swap concurrently with in-flight ProcessDelivery calls.
+func (h *Handler) SetMetricsObserver(o MetricsObserver) {
+	if h == nil {
+		return
+	}
+	h.observer = o
 }
 
 // WireEventBus subscribes a fan-out handler to the default events bus. When an
@@ -444,6 +465,13 @@ func (h *Handler) ProcessDelivery(ctx context.Context, t *asynq.Task) error {
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
 	`, p.WebhookID, p.Event, status, attempt, p.Body, code, respBody, errString(deliverErr), int(dur.Milliseconds()))
 
+	// Metrics observer — bucket on the HTTP status class, or "error"
+	// when there was no response at all. Fired after the audit row
+	// lands so a metric uptick always corresponds to a webhook_deliveries row.
+	if h.observer != nil {
+		h.observer(deliveryResultBucket(code, deliverErr), code, dur)
+	}
+
 	// Returning a non-nil error tells asynq to retry.
 	if status != "success" {
 		if deliverErr != nil {
@@ -452,6 +480,28 @@ func (h *Handler) ProcessDelivery(ctx context.Context, t *asynq.Task) error {
 		return fmt.Errorf("non-2xx response: %d", code)
 	}
 	return nil
+}
+
+// deliveryResultBucket maps a (code, err) pair to the same status-class
+// labels the chi HTTP middleware uses, plus "error" for transport-level
+// failures (DNS, timeout, TLS, connection refused) where we never got
+// an HTTP status. Bucketing keeps cardinality at five.
+func deliveryResultBucket(code int, err error) string {
+	if err != nil && code == 0 {
+		return "error"
+	}
+	switch {
+	case code >= 500:
+		return "5xx"
+	case code >= 400:
+		return "4xx"
+	case code >= 300:
+		return "3xx"
+	case code >= 200:
+		return "2xx"
+	default:
+		return "error"
+	}
 }
 
 func deliver(ctx context.Context, url, secret string, body []byte) (status string, code int, respBody string, err error, dur time.Duration) {

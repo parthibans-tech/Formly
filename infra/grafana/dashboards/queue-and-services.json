@@ -1,0 +1,202 @@
+{
+  "annotations": {"list": []},
+  "description": "Worker queue throughput, in-flight, errors. Webhook delivery health. AI provider error ratio. DB pool.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "type": "row",
+      "title": "Asynq queues",
+      "id": 100,
+      "gridPos": {"x": 0, "y": 0, "w": 24, "h": 1}
+    },
+    {
+      "type": "timeseries",
+      "title": "Tasks/sec by queue",
+      "id": 1,
+      "gridPos": {"x": 0, "y": 1, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (queue) (rate(formly_queue_tasks_total[5m]))",
+          "legendFormat": "{{queue}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "custom": {"drawStyle": "line", "fillOpacity": 10, "stacking": {"mode": "normal"}}}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Task error ratio (per task, 5m)",
+      "id": 2,
+      "gridPos": {"x": 12, "y": 1, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "task:formly_queue_error_ratio:rate5m",
+          "legendFormat": "{{task}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {"drawStyle": "line", "fillOpacity": 5},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 0.05},
+              {"color": "red", "value": 0.1}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Tasks in flight per queue",
+      "id": 3,
+      "gridPos": {"x": 0, "y": 9, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (queue) (formly_queue_tasks_in_flight)",
+          "legendFormat": "{{queue}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "short", "custom": {"drawStyle": "line", "fillOpacity": 10}}}
+    },
+    {
+      "type": "row",
+      "title": "Webhook delivery",
+      "id": 101,
+      "gridPos": {"x": 0, "y": 16, "w": 24, "h": 1}
+    },
+    {
+      "type": "timeseries",
+      "title": "Webhook delivery rate by result",
+      "id": 4,
+      "gridPos": {"x": 0, "y": 17, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (result) (rate(formly_webhook_total[5m]))",
+          "legendFormat": "{{result}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "custom": {"drawStyle": "line", "fillOpacity": 10, "stacking": {"mode": "normal"}}}}
+    },
+    {
+      "type": "stat",
+      "title": "Webhook failure ratio (5m)",
+      "id": 5,
+      "gridPos": {"x": 12, "y": 17, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "webhook:formly_webhook_failure_ratio:rate5m"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 0.1},
+              {"color": "red", "value": 0.25}
+            ]
+          }
+        }
+      },
+      "options": {"colorMode": "background"}
+    },
+    {
+      "type": "row",
+      "title": "AI providers",
+      "id": 102,
+      "gridPos": {"x": 0, "y": 25, "w": 24, "h": 1}
+    },
+    {
+      "type": "timeseries",
+      "title": "AI requests/sec by provider+op",
+      "id": 6,
+      "gridPos": {"x": 0, "y": 26, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (provider, op) (rate(formly_ai_requests_total[5m]))",
+          "legendFormat": "{{provider}}/{{op}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "custom": {"drawStyle": "line", "fillOpacity": 10}}}
+    },
+    {
+      "type": "timeseries",
+      "title": "AI error ratio (5m)",
+      "id": 7,
+      "gridPos": {"x": 12, "y": 26, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "provider:formly_ai_error_ratio:rate5m",
+          "legendFormat": "{{provider}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "percentunit", "custom": {"drawStyle": "line", "fillOpacity": 5}}}
+    },
+    {
+      "type": "row",
+      "title": "DB pool",
+      "id": 103,
+      "gridPos": {"x": 0, "y": 34, "w": 24, "h": 1}
+    },
+    {
+      "type": "timeseries",
+      "title": "Pool utilization",
+      "id": 8,
+      "gridPos": {"x": 0, "y": 35, "w": 24, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "process:formly_db_pool_utilization:ratio",
+          "legendFormat": "{{process}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {"drawStyle": "line", "fillOpacity": 10},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 0.8},
+              {"color": "red", "value": 0.95}
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["formly", "queue", "services"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Formly · Queue & services",
+  "uid": "formly-queue-services",
+  "version": 1,
+  "weekStart": ""
+}

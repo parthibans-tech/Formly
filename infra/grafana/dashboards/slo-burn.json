@@ -1,0 +1,153 @@
+{
+  "annotations": {"list": []},
+  "description": "Multi-window burn-rate view: per-tier 1h/6h burn, 28d budget remaining, read/write split.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "type": "stat",
+      "title": "28d error budget remaining (by tier)",
+      "id": 1,
+      "gridPos": {"x": 0, "y": 0, "w": 24, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "tier:formly_error_budget_remaining:ratio28d",
+          "legendFormat": "{{tier}}",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "orange", "value": 0.25},
+              {"color": "green", "value": 0.5}
+            ]
+          }
+        }
+      },
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "center"}
+    },
+    {
+      "type": "timeseries",
+      "title": "1h burn rate per tier (page threshold = 14.4× = 7.2%)",
+      "id": 2,
+      "gridPos": {"x": 0, "y": 5, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "tier:formly_tenant_error_ratio:rate1h",
+          "legendFormat": "{{tier}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {"drawStyle": "line", "fillOpacity": 10, "lineInterpolation": "smooth"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 0.03},
+              {"color": "red", "value": 0.072}
+            ]
+          }
+        }
+      },
+      "options": {"tooltip": {"mode": "multi"}}
+    },
+    {
+      "type": "timeseries",
+      "title": "6h burn rate per tier (ticket threshold = 6× = 3%)",
+      "id": 3,
+      "gridPos": {"x": 12, "y": 5, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "tier:formly_tenant_error_ratio:rate6h",
+          "legendFormat": "{{tier}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {"drawStyle": "line", "fillOpacity": 10, "lineInterpolation": "smooth"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 0.015},
+              {"color": "red", "value": 0.03}
+            ]
+          }
+        }
+      },
+      "options": {"tooltip": {"mode": "multi"}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Read SLO (5m error ratio per tier)",
+      "id": 4,
+      "gridPos": {"x": 0, "y": 13, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "tier_kind:formly_tenant_error_ratio:rate5m{kind=\"read\"}",
+          "legendFormat": "{{tier}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "percentunit", "custom": {"drawStyle": "line", "fillOpacity": 5}}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Write SLO (5m error ratio per tier)",
+      "id": 5,
+      "gridPos": {"x": 12, "y": 13, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "tier_kind:formly_tenant_error_ratio:rate5m{kind=\"write\"}",
+          "legendFormat": "{{tier}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "percentunit", "custom": {"drawStyle": "line", "fillOpacity": 5}}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Forecasted seconds until 28d budget exhausted",
+      "id": 6,
+      "gridPos": {"x": 0, "y": 21, "w": 24, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "tier:formly_error_budget_exhaustion_seconds:predict6h",
+          "legendFormat": "{{tier}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "s", "custom": {"drawStyle": "line", "fillOpacity": 5}}}
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["formly", "slo"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Formly · SLO + error budget",
+  "uid": "formly-slo-burn",
+  "version": 1,
+  "weekStart": ""
+}

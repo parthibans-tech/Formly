@@ -13,15 +13,17 @@ package email
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"mime/multipart"
+	"mime"
 	"net/http"
 	"net/smtp"
-	"net/textproto"
+	"os"
 	"strings"
 	"time"
 )
@@ -204,62 +206,110 @@ func sendMailStartTLS(addr, host string, auth smtp.Auth, from string, to []strin
 	return c.Quit()
 }
 
-// buildRFC822 writes a multipart/mixed message with headers, optional text
-// and HTML bodies as multipart/alternative, plus any attachments.
+// buildRFC822 writes a multipart/mixed RFC 5322 message with the headers
+// modern spam filters look for. The structure is:
+//
+//   headers
+//   └─ multipart/mixed
+//      ├─ multipart/alternative
+//      │  ├─ text/plain        (quoted-printable)
+//      │  └─ text/html         (quoted-printable)
+//      └─ application/<type>   (base64) — one per attachment
+//
+// Spam-filter critical headers we set:
+//
+//   - Date              : RFC 5322 §3.6.1 — missing or stale Date is the
+//                         single most common reason transactional mail
+//                         lands in spam.
+//   - Message-ID        : RFC 5322 §3.6.4 — random local-part + sender's
+//                         domain. Filters trace conversation threads on
+//                         this; a missing one is treated as bot output.
+//   - MIME-Version: 1.0 : without this, content-type extensions are
+//                         technically undefined and some MTAs flag it.
+//   - Auto-Submitted    : RFC 3834 — declares this is a system-generated
+//                         transactional message, not a reply / bulk blast.
+//                         Stops auto-responders (vacation replies) from
+//                         bouncing back and signals "legitimate robot."
+//   - Precedence: bulk  : legacy but still respected by Yahoo/AOL.
+//   - X-Auto-Response-Suppress : Outlook-specific, suppresses OOO replies.
+//   - Content-Transfer-Encoding on every part — quoted-printable for
+//     text (handles smart quotes / em-dashes safely) and base64 for
+//     attachments. Bare 8-bit body parts are a moderate spam signal.
+//
+// We also RFC-2047-encode the Subject and the From display name when they
+// contain non-ASCII so a literal "—" in the subject doesn't get the mail
+// flagged on older relays.
 func buildRFC822(m Message) ([]byte, error) {
 	var buf bytes.Buffer
-	mixed := multipart.NewWriter(&buf)
+	mixedBoundary := newBoundary()
+	altBoundary := newBoundary()
 
-	// Top-level headers.
-	fmt.Fprintf(&buf, "From: %s\r\n", fromHeader(m.From, m.FromName))
-	fmt.Fprintf(&buf, "To: %s\r\n", strings.Join(m.To, ", "))
+	// -- Top-level headers ---------------------------------------------
+	writeHeader(&buf, "Date", time.Now().UTC().Format(time.RFC1123Z))
+	writeHeader(&buf, "From", fromHeader(m.From, m.FromName))
+	writeHeader(&buf, "To", strings.Join(m.To, ", "))
 	if len(m.CC) > 0 {
-		fmt.Fprintf(&buf, "Cc: %s\r\n", strings.Join(m.CC, ", "))
+		writeHeader(&buf, "Cc", strings.Join(m.CC, ", "))
 	}
 	if m.ReplyTo != "" {
-		fmt.Fprintf(&buf, "Reply-To: %s\r\n", m.ReplyTo)
+		writeHeader(&buf, "Reply-To", m.ReplyTo)
 	}
-	fmt.Fprintf(&buf, "Subject: %s\r\n", m.Subject)
-	fmt.Fprintf(&buf, "MIME-Version: 1.0\r\n")
-	fmt.Fprintf(&buf, "Content-Type: multipart/mixed; boundary=%q\r\n\r\n", mixed.Boundary())
+	writeHeader(&buf, "Subject", encodeHeaderWord(m.Subject))
+	writeHeader(&buf, "Message-ID", newMessageID(m.From))
+	writeHeader(&buf, "MIME-Version", "1.0")
+	// Mark this as a system-generated transactional mail. Two upsides:
+	// (1) auto-responders won't bounce back at us; (2) filters score
+	// "auto-generated" lower than uncategorised cold mail.
+	writeHeader(&buf, "Auto-Submitted", "auto-generated")
+	writeHeader(&buf, "X-Auto-Response-Suppress", "All")
+	writeHeader(&buf, "Precedence", "bulk")
+	writeHeader(&buf, "X-Mailer", "Drive360 Mailer")
+	writeHeader(&buf, "Content-Type",
+		fmt.Sprintf(`multipart/mixed; boundary="%s"`, mixedBoundary))
+	buf.WriteString("\r\n")
 
-	// Alternative part (text + html). Email clients render whichever they can.
-	altHeader := textproto.MIMEHeader{}
-	alt := multipart.NewWriter(&buf)
-	altHeader.Set("Content-Type", fmt.Sprintf("multipart/alternative; boundary=%q", alt.Boundary()))
+	// -- multipart/alternative (text + html) ---------------------------
+	fmt.Fprintf(&buf, "--%s\r\n", mixedBoundary)
+	fmt.Fprintf(&buf, "Content-Type: multipart/alternative; boundary=\"%s\"\r\n\r\n", altBoundary)
 
-	altBoundary := mixed.Boundary()
-	_ = altBoundary // silence linter — boundaries are written below
-
-	// Start the first mixed part: multipart/alternative.
-	if _, err := fmt.Fprintf(&buf, "--%s\r\n", mixed.Boundary()); err != nil {
-		return nil, err
+	// We always emit at least one of the two parts; if a caller forgot
+	// the text/plain alternative we generate a one-line stub from the
+	// subject so clients that prefer plaintext (and filters that
+	// punish "html-only" mails) still see something.
+	textBody := m.TextBody
+	if textBody == "" {
+		textBody = m.Subject
 	}
-	if _, err := fmt.Fprintf(&buf, "Content-Type: multipart/alternative; boundary=%q\r\n\r\n", alt.Boundary()); err != nil {
-		return nil, err
-	}
-	if m.TextBody != "" {
-		fmt.Fprintf(&buf, "--%s\r\n", alt.Boundary())
-		fmt.Fprintf(&buf, "Content-Type: text/plain; charset=utf-8\r\n\r\n%s\r\n", m.TextBody)
+	if textBody != "" {
+		fmt.Fprintf(&buf, "--%s\r\n", altBoundary)
+		buf.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
+		buf.WriteString("Content-Transfer-Encoding: quoted-printable\r\n\r\n")
+		buf.WriteString(quotedPrintable(textBody))
+		buf.WriteString("\r\n")
 	}
 	if m.HTMLBody != "" {
-		fmt.Fprintf(&buf, "--%s\r\n", alt.Boundary())
-		fmt.Fprintf(&buf, "Content-Type: text/html; charset=utf-8\r\n\r\n%s\r\n", m.HTMLBody)
+		fmt.Fprintf(&buf, "--%s\r\n", altBoundary)
+		buf.WriteString("Content-Type: text/html; charset=utf-8\r\n")
+		buf.WriteString("Content-Transfer-Encoding: quoted-printable\r\n\r\n")
+		buf.WriteString(quotedPrintable(m.HTMLBody))
+		buf.WriteString("\r\n")
 	}
-	fmt.Fprintf(&buf, "--%s--\r\n", alt.Boundary())
+	fmt.Fprintf(&buf, "--%s--\r\n", altBoundary)
 
-	// Attachments.
+	// -- Attachments ---------------------------------------------------
 	for _, a := range m.Attachments {
-		fmt.Fprintf(&buf, "--%s\r\n", mixed.Boundary())
+		fmt.Fprintf(&buf, "--%s\r\n", mixedBoundary)
 		ct := a.ContentType
 		if ct == "" {
 			ct = "application/octet-stream"
 		}
-		fmt.Fprintf(&buf, "Content-Type: %s\r\n", ct)
-		fmt.Fprintf(&buf, "Content-Disposition: attachment; filename=%q\r\n", a.Filename)
-		fmt.Fprintf(&buf, "Content-Transfer-Encoding: base64\r\n\r\n")
+		// Encode filename per RFC 2231 so non-ASCII names survive.
+		filenameParam := mime.BEncoding.Encode("utf-8", a.Filename)
+		fmt.Fprintf(&buf, "Content-Type: %s; name=\"%s\"\r\n", ct, filenameParam)
+		fmt.Fprintf(&buf, "Content-Disposition: attachment; filename=\"%s\"\r\n", filenameParam)
+		buf.WriteString("Content-Transfer-Encoding: base64\r\n\r\n")
 		enc := base64.StdEncoding.EncodeToString(a.Data)
-		// Wrap base64 at 76 cols for sanity.
+		// Wrap base64 at 76 cols (RFC 2045).
 		for i := 0; i < len(enc); i += 76 {
 			end := i + 76
 			if end > len(enc) {
@@ -269,15 +319,139 @@ func buildRFC822(m Message) ([]byte, error) {
 			buf.WriteString("\r\n")
 		}
 	}
-	fmt.Fprintf(&buf, "--%s--\r\n", mixed.Boundary())
+	fmt.Fprintf(&buf, "--%s--\r\n", mixedBoundary)
 	return buf.Bytes(), nil
 }
 
-func fromHeader(email, name string) string {
-	if name == "" {
-		return email
+// writeHeader writes one header, folding long lines so any single
+// header doesn't exceed RFC 5322's 998-char limit. Most headers are
+// short; the folding only kicks in for the From / Subject when names
+// or sender lists are large.
+func writeHeader(buf *bytes.Buffer, name, value string) {
+	value = strings.ReplaceAll(value, "\r", "")
+	value = strings.ReplaceAll(value, "\n", " ")
+	line := name + ": " + value
+	const max = 990
+	for len(line) > max {
+		// Fold at the last whitespace before the limit.
+		cut := strings.LastIndexAny(line[:max], " \t")
+		if cut <= len(name)+2 {
+			cut = max
+		}
+		buf.WriteString(line[:cut])
+		buf.WriteString("\r\n ")
+		line = strings.TrimLeft(line[cut:], " \t")
 	}
-	return fmt.Sprintf("%q <%s>", name, email)
+	buf.WriteString(line)
+	buf.WriteString("\r\n")
+}
+
+// fromHeader produces a properly RFC-5322-quoted From / Sender value.
+// Names containing "specials" (commas, parentheses, quotes, etc.) need
+// to live inside a quoted-string; bare names with spaces don't strictly
+// require quoting but every major MTA prefers them quoted, so we always
+// emit `"Name" <addr@host>` when a name is present. Non-ASCII display
+// names are encoded with RFC 2047 B-encoding so filters that reject
+// raw 8-bit headers still accept us.
+func fromHeader(addr, name string) string {
+	if name == "" {
+		return addr
+	}
+	encoded := encodeHeaderWord(name)
+	if encoded == name {
+		// Pure ASCII — plain quoted-string, escaping inner quotes.
+		safe := strings.ReplaceAll(name, `\`, `\\`)
+		safe = strings.ReplaceAll(safe, `"`, `\"`)
+		return fmt.Sprintf(`"%s" <%s>`, safe, addr)
+	}
+	return fmt.Sprintf("%s <%s>", encoded, addr)
+}
+
+// encodeHeaderWord wraps the value in RFC 2047 B-encoding when it
+// contains any non-ASCII byte. Pure-ASCII values pass through as-is so
+// the common case stays human-readable in the wire format.
+func encodeHeaderWord(s string) string {
+	for _, r := range s {
+		if r > 0x7f {
+			return mime.BEncoding.Encode("utf-8", s)
+		}
+	}
+	return s
+}
+
+// quotedPrintable encodes a body part per RFC 2045 §6.7. Modern smart
+// quotes / em-dashes / non-breaking spaces (which our marketing copy
+// uses liberally) are 8-bit and would otherwise need a `8bit` CTE which
+// not every relay supports.
+func quotedPrintable(s string) string {
+	var out bytes.Buffer
+	col := 0
+	flush := func(n int) {
+		if col+n > 75 {
+			out.WriteString("=\r\n")
+			col = 0
+		}
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '\n':
+			out.WriteString("\r\n")
+			col = 0
+		case c == '\r':
+			// drop bare CR — \r\n handled via \n above
+		case c == '=' || c < 32 || c > 126:
+			if c == '\t' {
+				flush(1)
+				out.WriteByte('\t')
+				col++
+				continue
+			}
+			flush(3)
+			fmt.Fprintf(&out, "=%02X", c)
+			col += 3
+		default:
+			flush(1)
+			out.WriteByte(c)
+			col++
+		}
+	}
+	return out.String()
+}
+
+// newBoundary returns a 24-hex-char boundary unlikely to collide with
+// anything in the body. Multipart boundaries that look "structured"
+// (e.g. always start with `boundary_`) are sometimes pattern-matched by
+// naive filters, so we use plain hex.
+func newBoundary() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("b%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// newMessageID synthesises an RFC 5322 Message-ID. The local part is
+// random; the domain mirrors the sender so SPF/DKIM-aligned filters
+// won't downgrade us for an off-domain Message-ID. Falls back to the
+// process hostname when the From address is malformed.
+func newMessageID(from string) string {
+	domain := "drive360.local"
+	if at := strings.LastIndex(from, "@"); at >= 0 && at+1 < len(from) {
+		domain = strings.TrimSpace(from[at+1:])
+		// Strip any "<addr>" wrapping that sneaks in via fromHeader.
+		domain = strings.TrimRight(domain, ">")
+	}
+	if domain == "" {
+		if h, err := os.Hostname(); err == nil && h != "" {
+			domain = h
+		} else {
+			domain = "drive360.local"
+		}
+	}
+	var b [12]byte
+	_, _ = rand.Read(b[:])
+	return fmt.Sprintf("<%s.%d@%s>", hex.EncodeToString(b[:]), time.Now().UnixNano(), domain)
 }
 
 // -- Resend ---------------------------------------------------------------

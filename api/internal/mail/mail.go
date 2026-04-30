@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -25,6 +26,16 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// envOr returns the env var for key, falling back to def when blank.
+// Used for APP_URL resolution in transactional copy so links round-trip
+// to the same host the recipient signs in on.
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
 
 type Handler struct {
 	DB      *pgxpool.Pool
@@ -204,6 +215,18 @@ func (h *Handler) TestSend(w http.ResponseWriter, r *http.Request) {
 		req.To = c.Email
 	}
 
+	htmlBody, textBody := email.Render(email.Branded{
+		PreviewText: "Your Drive360 email settings are working — this test landed in your inbox.",
+		Title:       "Email settings are working",
+		Greeting:    "Hi,",
+		Paragraphs: []string{
+			"This is a test send from Drive360. If you're reading this, your email settings are configured correctly and transactional mail (invitations, access requests, billing notices) will reach your team.",
+			"You can re-run this test any time from Settings → Email.",
+		},
+		CTAText: "Open email settings",
+		CTAURL:  envOr("APP_URL", "https://drive360.app") + "/settings/email",
+		Reason:  "You're receiving this because someone with admin access on your workspace clicked \"Send test email\".",
+	})
 	_, err := h.Mailer.Send(r.Context(), SendOptions{
 		OrgID:  c.OrgID,
 		UserID: c.UserID,
@@ -211,9 +234,9 @@ func (h *Handler) TestSend(w http.ResponseWriter, r *http.Request) {
 		Source: "mail.test",
 		Message: email.Message{
 			To:       []string{req.To},
-			Subject:  "Drive360 test email",
-			TextBody: "This is a test from Drive360 — your email settings are working.",
-			HTMLBody: "<p>This is a test from <strong>Drive360</strong> — your email settings are working.</p>",
+			Subject:  "Drive360 email test",
+			TextBody: textBody,
+			HTMLBody: htmlBody,
 		},
 	})
 	if err != nil {

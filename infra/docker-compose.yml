@@ -21,6 +21,16 @@ services:
   redis:
     image: redis:7-alpine
     ports: ["6379:6379"]
+    # `redis-cli ping` returns PONG when the server is accepting
+    # connections — cheaper than a full SET/GET round-trip and
+    # ships with the same image, no extra binary needed. Anything
+    # downstream that wants to wait for redis (queue workers in
+    # prod compose, integration tests) can use `service_healthy`.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   minio:
     image: minio/minio:latest
@@ -33,16 +43,28 @@ services:
       - "9000:9000"
       - "9001:9001"
     volumes: [miniodata:/data]
+    # MinIO ships `mc ready` checks via /minio/health/live — a 200
+    # means the server has finished its self-check and is ready to
+    # accept S3 calls. Probing this lets `minio-init` drop the
+    # `sleep 3` and start the bucket-creation step immediately
+    # once the server is actually up.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   minio-init:
     image: minio/mc:latest
-    depends_on: [minio]
+    depends_on:
+      minio:
+        condition: service_healthy
     entrypoint: >
       /bin/sh -c "
-      sleep 3 &&
       mc alias set local http://minio:9000 minioadmin minioadmin &&
       mc mb --ignore-existing local/drive360 || true
       "
+    restart: "no"
 
   # ONLYOFFICE Document Server (Community Edition, AGPL).
   #
@@ -128,6 +150,203 @@ services:
       "
     restart: "no"
 
+  # Prometheus — local scrape target for the API and worker /metrics
+  # endpoints. Exposed on host port 9091 (NOT 9090, because the
+  # worker process already binds :9090 on the host for its own
+  # /metrics listener). Set `PROMETHEUS_URL=http://localhost:9091`
+  # in api/.env to light up the Live Dashboard panels in
+  # /settings/admin/observability.
+  #
+  # The dev config (prometheus.dev.yml) skips basic auth and scrapes
+  # host.docker.internal:{8080,9090}. The recording + alerting rule
+  # files are mounted read-only next to it; edit them and `docker
+  # compose kill -s SIGHUP prometheus` to reload without restart.
+  prometheus:
+    image: prom/prometheus:latest
+    # Wait on the two services Prometheus actively talks to inside
+    # the compose network. Prometheus would retry on its own if
+    # alertmanager were unreachable, but starting it after
+    # alertmanager is healthy means the very first alert evaluation
+    # has somewhere to dispatch instead of logging push errors.
+    # Blackbox is the same: every scrape of `formly-blackbox-*`
+    # would 502 until blackbox is up, polluting the targets view.
+    depends_on:
+      alertmanager:
+        condition: service_healthy
+      blackbox:
+        condition: service_healthy
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./prometheus/prometheus.dev.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/recording.rules.yml:/etc/prometheus/recording.rules.yml:ro
+      - ./prometheus/alerts.rules.yml:/etc/prometheus/alerts.rules.yml:ro
+      - promdata:/prometheus
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - -q
+        - --spider
+        - http://localhost:9090/-/healthy
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+  # Alertmanager — receives alerts from Prometheus and routes them
+  # to PagerDuty / Slack / etc per the rules in
+  # infra/alertmanager/alertmanager.yml. In dev the root route
+  # default is `null` so alerts go nowhere; flip the root receiver
+  # to `dev-firehose` (and set a real Slack webhook) to test
+  # delivery locally. UI on http://localhost:9093.
+  #
+  # Reachable from Prometheus inside the compose network as
+  # `alertmanager:9093`; the Prometheus alerting block in
+  # prometheus.dev.yml uses that hostname.
+  alertmanager:
+    image: prom/alertmanager:latest
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --web.external-url=http://localhost:9093
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - ./alertmanager/templates:/etc/alertmanager/templates:ro
+      - alertmanagerdata:/alertmanager
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - -q
+        - --spider
+        - http://localhost:9093/-/healthy
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+  # Tempo — local OpenTelemetry trace store. The API + worker
+  # processes export OTLP/HTTP spans to localhost:4318 (mapped from
+  # this container) and Tempo persists them for 14d. Exemplars on
+  # the HTTP histogram (see api/internal/metrics) carry the
+  # corresponding trace_id so a Grafana exemplar click takes the
+  # operator straight to the slow request that produced the dot.
+  #
+  # Without Tempo (or another OTLP receiver) the exemplars still
+  # render but click-through doesn't resolve to a trace.
+  tempo:
+    # Pinned to 2.6.x — the latest tag has shifted to a much
+    # bigger backend-scheduler architecture whose config schema is
+    # in flux. 2.6 is the last stable release with the simpler
+    # ingester/compactor/storage blocks documented across the
+    # broader OTel ecosystem. Bump intentionally when 3.x's config
+    # surface settles.
+    image: grafana/tempo:2.6.1
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    ports:
+      - "3200:3200"   # tempo HTTP API (query)
+      - "4317:4317"   # OTLP/gRPC ingest
+      - "4318:4318"   # OTLP/HTTP ingest
+    volumes:
+      - ./tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempodata:/var/tempo
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - -q
+        - --spider
+        - http://localhost:3200/ready
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+  # Blackbox exporter — runs HTTP/TCP/DNS probes against an
+  # operator-supplied list of targets and exposes `probe_*`
+  # metrics on :9115/probe. Prometheus calls /probe with a
+  # `module=` + `target=` query string per scrape; see the
+  # `formly-blackbox` job in prometheus.dev.yml.
+  #
+  # Why a separate exporter (vs the API hitting itself): a probe
+  # from outside the API process verifies the whole network
+  # path (DNS → load balancer → TLS → the listener), not just
+  # "the in-process handler returns 200." The /metrics endpoint
+  # is also a much weaker liveness signal than a synthetic
+  # request to a real route.
+  blackbox:
+    image: prom/blackbox-exporter:latest
+    command:
+      - --config.file=/etc/blackbox/blackbox.yml
+    ports:
+      - "9115:9115"
+    volumes:
+      - ./blackbox/blackbox.yml:/etc/blackbox/blackbox.yml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - -q
+        - --spider
+        - http://localhost:9115/-/healthy
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+  # Grafana — operator dashboards. Provisioned from disk:
+  # datasources (Prometheus + Tempo + Alertmanager) and the four
+  # dashboards under infra/grafana/dashboards/. The container
+  # itself is treated as cattle — wipe `grafanadata` and the
+  # same dashboards come back on startup.
+  #
+  # Port 3001 on the host because :3000 is taken by the Next.js
+  # web app. The Grafana process inside still listens on 3000.
+  #
+  # First-login credentials: admin / admin (forced password
+  # rotation on first sign-in). Datasources work without a
+  # login because they're proxy-mode and gated by the dashboard
+  # itself, not by a per-source credential.
+  grafana:
+    image: grafana/grafana:11.2.0
+    # All three datasources are provisioned at boot — Grafana
+    # marks a datasource as failing if it can't reach the URL on
+    # the first health check. Waiting for each backend to report
+    # healthy means the Datasources page is green from the very
+    # first refresh instead of needing a manual reload.
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      tempo:
+        condition: service_healthy
+      alertmanager:
+        condition: service_healthy
+    ports:
+      - "3001:3000"
+    environment:
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+      GF_INSTALL_PLUGINS: ""
+    volumes:
+      - ./grafana/grafana.ini:/etc/grafana/grafana.ini:ro
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "wget -q --spider http://localhost:3000/api/health || exit 1"
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
 volumes:
   pgdata:
   miniodata:
@@ -135,3 +354,7 @@ volumes:
   onlyoffice_log:
   onlyoffice_cache:
   ollama_data:
+  promdata:
+  alertmanagerdata:
+  tempodata:
+  grafanadata:

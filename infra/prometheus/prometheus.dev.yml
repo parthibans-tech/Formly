@@ -1,0 +1,111 @@
+# Dev-only Prometheus config for the Formly stack.
+#
+# Differences vs prometheus.yml.example:
+#   - no basic_auth — the API and worker /metrics endpoints fall back
+#     to loopback-only access when METRICS_BASIC_AUTH_* env vars are
+#     unset. The Prometheus container reaches them via
+#     host.docker.internal, which the loopback check accepts because
+#     the inbound RemoteAddr is the host's loopback interface (the
+#     compose bridge NATs it).
+#   - shorter eval interval (10s) so dashboards feel snappy on a
+#     laptop without paying the cost a real deployment would.
+#   - external_labels.env=dev so a developer who points their
+#     Grafana at staging by accident sees the mismatch immediately.
+#
+# Mounted into the container at /etc/prometheus/prometheus.yml by
+# infra/docker-compose.yml. The recording + alerting rule files live
+# next to this one and are mounted alongside.
+
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+  external_labels:
+    env: dev
+
+# Alertmanager runs in the same compose network on its default
+# port 9093. The rules in alerts.rules.yml fire here and
+# Alertmanager handles dispatch / grouping / inhibits.
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+rule_files:
+  - /etc/prometheus/recording.rules.yml
+  - /etc/prometheus/alerts.rules.yml
+
+scrape_configs:
+  # API process — runs on the host (not in this compose network).
+  # `host.docker.internal` is the magic hostname Docker Desktop
+  # provides; on Linux the docker-compose service uses extra_hosts
+  # to map it to host-gateway.
+  - job_name: formly-api
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets:
+          - host.docker.internal:8080
+        labels:
+          process: api
+
+  # Worker process — also runs on the host, on its dedicated
+  # metrics port (default :9090, configurable via WORKER_METRICS_ADDR).
+  - job_name: formly-worker
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets:
+          - host.docker.internal:9090
+        labels:
+          process: worker
+
+  # Synthetic HTTP probes. The blackbox exporter performs the
+  # actual probe — Prometheus drives it by passing the probe
+  # target via the `target` query param. The relabeling block
+  # rewrites the metric labels so that `instance` is the probed
+  # URL (not the exporter), which is what every dashboard panel
+  # and Probe* alert filters on.
+  #
+  # Add new targets to the static_configs.targets list below.
+  # Keep the list short — every probe is one HTTP request per
+  # scrape per Prometheus replica.
+  - job_name: formly-blackbox-http
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets:
+          # Health endpoint — proves the API process is reachable end-to-end.
+          - http://host.docker.internal:8080/healthz
+          # Worker metrics endpoint — proves the worker is up and binding its port.
+          - http://host.docker.internal:9090/metrics
+        labels:
+          probe: api-health
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115
+
+  # DNS probe — sanity check that the embedded resolver in the
+  # blackbox exporter can resolve our public hostname. Catches
+  # accidentally-broken DNS on a developer laptop. Cheap.
+  - job_name: formly-blackbox-dns
+    metrics_path: /probe
+    params:
+      module: [dns_a]
+    static_configs:
+      - targets:
+          - 1.1.1.1
+        labels:
+          probe: cloudflare-dns
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115

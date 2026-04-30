@@ -121,7 +121,12 @@ function AppShellInner({
   // only path forward is "pick a plan and pay" or "sign out". We don't
   // render this until the first billing fetch resolves, otherwise the
   // page would flash the normal shell for a frame on every navigation.
-  if (!billing.loading && billing.requiresUpgrade) {
+  //
+  // Super-admins are exempt: they navigate orgs they don't own (support,
+  // billing reconciliation, audits) and the paywall would lock them out
+  // of doing the very work that resolves a tenant's billing problem.
+  // The gate is per-tenant; the support role is cross-tenant.
+  if (!user.isSuperAdmin && !billing.loading && billing.requiresUpgrade) {
     return <PaywallGate />;
   }
 

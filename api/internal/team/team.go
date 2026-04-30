@@ -15,7 +15,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	htmlpkg "html"
 	"net/http"
 	"os"
 	"strconv"
@@ -24,6 +23,7 @@ import (
 
 	"github.com/docforge/api/internal/auth"
 	"github.com/docforge/api/internal/billing"
+	emailpkg "github.com/docforge/api/internal/email"
 	"github.com/docforge/api/internal/events"
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
@@ -580,40 +580,35 @@ func (h *Handler) sendInviteEmail(
 		to,
 	).Scan(&existing)
 
+	// Subject deliberately leads with the inviter's email — Gmail's
+	// inbox UI surfaces the first ~70 chars and "<person> invited you"
+	// is exactly the cue recipients act on. Avoiding spammy verbs
+	// ("CLAIM", "Free", "URGENT") and excessive punctuation in the
+	// subject is the single biggest copy-side spam-score lever.
 	subject := c.Email + " invited you to Drive360"
-	headline := "You're invited to Drive360"
-	intro := `<strong>` + escapeHTML(c.Email) + `</strong> added you as a
-		<strong>` + escapeHTML(role) + `</strong> on their workspace.`
+	title := "You're invited to Drive360"
+	intro := c.Email + " added you to their Drive360 workspace as a " +
+		role + ". Click below to set up your account and start collaborating."
 	cta := "Accept invitation"
-	textIntro := c.Email + " invited you to Drive360 as " + role + "."
 	if existing {
-		headline = "You've been invited to a new workspace"
-		intro = `<strong>` + escapeHTML(c.Email) + `</strong> invited you to
-			join their workspace as a <strong>` + escapeHTML(role) + `</strong>.
-			Sign in with your existing Drive360 account to accept.`
-		cta = "Sign in to accept"
-		textIntro = c.Email + " invited you to a new Drive360 workspace as " +
+		title = "You've been added to a new workspace"
+		intro = c.Email + " invited you to join their Drive360 workspace as a " +
 			role + ". Sign in with your existing account to accept."
+		cta = "Sign in to accept"
 	}
 
-	html := `<div style="font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:560px">
-  <h2 style="margin:0 0 12px">` + escapeHTML(headline) + `</h2>
-  <p>` + intro + `</p>
-  <p style="margin:20px 0">
-    <a href="` + acceptURL + `"
-       style="display:inline-block;background:#0f172a;color:#fff;padding:10px 16px;border-radius:6px;text-decoration:none;font-weight:600">
-      ` + escapeHTML(cta) + `
-    </a>
-  </p>
-  <p style="color:#6b7280;font-size:12px">
-    This link expires on ` + expiresAt.Format("Jan 2, 2006") + `. If the button
-    doesn't work, copy and paste this URL: <br/>
-    <code style="font-family:monospace">` + acceptURL + `</code>
-  </p>
-</div>`
-	text := textIntro + "\n" +
-		"Accept here: " + acceptURL + "\n" +
-		"This link expires on " + expiresAt.Format("Jan 2, 2006") + "."
+	html, text := emailpkg.Render(emailpkg.Branded{
+		PreviewText:   c.Email + " invited you as a " + role + " on Drive360.",
+		Title:         title,
+		Greeting:      "Hi,",
+		Paragraphs:    []string{intro},
+		CTAText:       cta,
+		CTAURL:        acceptURL,
+		SecondaryNote: "This invitation expires on " + expiresAt.Format("January 2, 2006") + ".",
+		Reason: "You're receiving this because " + c.Email +
+			" sent you an invitation to their Drive360 workspace. " +
+			"If you don't recognise this person, you can safely ignore this email.",
+	})
 
 	_, err := h.Mailer.Send(ctx, NotifyOptions{
 		OrgID:    c.OrgID,
@@ -645,7 +640,6 @@ func appURL(path string) string {
 	return base + path
 }
 
-func escapeHTML(s string) string { return htmlpkg.EscapeString(s) }
 
 // ResendInvite rotates the token + extends the expiry on a pending
 // invite, then re-mails it. Rotating (vs. just re-mailing the existing

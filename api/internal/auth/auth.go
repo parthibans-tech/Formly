@@ -80,6 +80,34 @@ type Handler struct {
 	// per-org defaults (subscription trial, default folders, etc.).
 	// Returning an error rolls back the registration.
 	OnRegister func(ctx context.Context, q PostRegisterDB, orgID string) error
+
+	// TenantAnnotator is invoked from the auth middleware AFTER Claims
+	// have been attached to the request context but BEFORE the inner
+	// chain runs. The hook resolves the caller's billing tier and
+	// stashes it in metrics' request-scoped slot (see
+	// internal/metrics/tenant.go) so the outer metrics middleware can
+	// label the request when the chain returns. Optional — when nil,
+	// the metrics middleware just uses the default "anon" tier.
+	TenantAnnotator func(r *http.Request)
+
+	// OnLoginAttempt fires from each authentication entry point with a
+	// stable kind ∈ {login, register, mfa_verify} and a result ∈
+	// {success, failed}. Wired in cmd/api to the metrics package's
+	// AuthAttempts counter — a sustained spike in (login, failed)
+	// while (login, success) is flat is the canonical credential-
+	// stuffing signal. Kept package-agnostic so auth doesn't import
+	// prometheus.
+	OnLoginAttempt func(ctx context.Context, kind, result string)
+}
+
+// loginAttempt is the tiny helper that emits the OnLoginAttempt hook
+// when one is wired. Inline-call sites would have to nil-check
+// everywhere; this keeps the call sites a single line.
+func (h *Handler) loginAttempt(ctx context.Context, kind, result string) {
+	if h == nil || h.OnLoginAttempt == nil {
+		return
+	}
+	h.OnLoginAttempt(ctx, kind, result)
 }
 
 func New(db *pgxpool.Pool) *Handler {
@@ -210,6 +238,7 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 	// platform-operator action (or the seed migration), not a side
 	// effect of self-service registration.
 	token, _ := h.issueTokenSuper(userID, orgID, req.Email, RoleAdmin, false)
+	h.loginAttempt(ctx, "register", "success")
 	writeJSON(w, 200, authResp{Token: token, User: user{
 		ID: userID, Email: req.Email, Name: req.Name, OrgID: orgID, Role: RoleAdmin,
 		// OrgKind is known at register-time without a re-read because
@@ -270,12 +299,18 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	).Scan(&id, &orgID, &name, &hash, &role, &isSuper, &lockedAt, &lockedReason,
 		&forcePwReset, &orgDeletedAt, &orgKind)
 	if err != nil {
+		// Unknown email gets the same metric label as a bad password —
+		// from the abuse-detection perspective they're indistinguishable
+		// (and we deliberately want to keep them indistinguishable so a
+		// metric scrape can't be used to enumerate users).
+		h.loginAttempt(r.Context(), "login", "failed")
 		writeErr(w, 401, "invalid_credentials", "bad email or password")
 		return
 	}
 	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)) != nil {
 		h.audit(r, "auth.login.failed", "", "", req.Email,
 			withClient(map[string]any{"reason": "bad_password"}))
+		h.loginAttempt(r.Context(), "login", "failed")
 		writeErr(w, 401, "invalid_credentials", "bad email or password")
 		return
 	}
@@ -284,6 +319,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	// at delete time; this catches any stale-credential login attempt.
 	if orgDeletedAt != nil {
 		h.audit(r, "auth.login.org_deleted", id, orgID, req.Email, withClient(nil))
+		h.loginAttempt(r.Context(), "login", "failed")
 		writeErr(w, 410, "org_deleted",
 			"this workspace has been deleted — contact support")
 		return
@@ -299,16 +335,21 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		}
 		h.audit(r, "auth.login.locked", id, orgID, req.Email,
 			withClient(map[string]any{"reason": reason}))
+		h.loginAttempt(r.Context(), "login", "failed")
 		writeErr(w, 403, "account_locked",
 			"this account is temporarily locked — contact support")
 		return
 	}
 
-	// MFA challenge, if enrolled.
+	// MFA challenge, if enrolled. The mfa_verify counter is separate
+	// from login — a user fat-fingering a TOTP code is a different
+	// signal from password stuffing.
 	if h.MFAChallengeRequired != nil {
 		required, _ := h.MFAChallengeRequired(r.Context(), id)
 		if required {
 			if req.MFACode == "" {
+				// Challenge issued; the caller will re-POST with a
+				// code. Don't count it as login-success yet.
 				writeJSON(w, 200, map[string]any{
 					"mfaRequired": true,
 					"userId":      id,
@@ -317,13 +358,16 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 			}
 			if h.MFAVerifyChallenge == nil || !h.MFAVerifyChallenge(r.Context(), id, req.MFACode) {
 				h.audit(r, "auth.login.mfa_failed", id, orgID, req.Email, withClient(nil))
+				h.loginAttempt(r.Context(), "mfa_verify", "failed")
 				writeErr(w, 401, "invalid_mfa", "invalid MFA code")
 				return
 			}
+			h.loginAttempt(r.Context(), "mfa_verify", "success")
 		}
 	}
 
 	token, _ := h.issueTokenSuper(id, orgID, req.Email, role, isSuper)
+	h.loginAttempt(r.Context(), "login", "success")
 	if h.OnLogin != nil {
 		h.OnLogin(r.Context(), id, orgID, token, clientIP(r), r.UserAgent())
 	}
@@ -575,7 +619,9 @@ func (h *Handler) Middleware(next http.Handler) http.Handler {
 				claims := &Claims{UserID: uid, OrgID: oid, Email: email, Role: role}
 				ctx := context.WithValue(r.Context(), UserCtxKey, claims)
 				ctx = context.WithValue(ctx, APIKeyInfoCtxKey, &APIKeyInfo{ID: keyID, Scopes: scopes})
-				next.ServeHTTP(w, r.WithContext(ctx))
+				r = r.WithContext(ctx)
+				h.annotateTenant(r)
+				next.ServeHTTP(w, r)
 				return
 			}
 			if apiKeyVerifier == nil {
@@ -589,7 +635,9 @@ func (h *Handler) Middleware(next http.Handler) http.Handler {
 			}
 			claims := &Claims{UserID: uid, OrgID: oid, Email: email, Role: role}
 			ctx := context.WithValue(r.Context(), UserCtxKey, claims)
-			next.ServeHTTP(w, r.WithContext(ctx))
+			r = r.WithContext(ctx)
+			h.annotateTenant(r)
+			next.ServeHTTP(w, r)
 			return
 		}
 
@@ -611,8 +659,21 @@ func (h *Handler) Middleware(next http.Handler) http.Handler {
 			return
 		}
 		ctx := context.WithValue(r.Context(), UserCtxKey, claims)
-		next.ServeHTTP(w, r.WithContext(ctx))
+		r = r.WithContext(ctx)
+		h.annotateTenant(r)
+		next.ServeHTTP(w, r)
 	})
+}
+
+// annotateTenant hands the request to the optional TenantAnnotator
+// hook — wired in cmd/api to a (cached) plan resolver that writes the
+// tier into metrics' request-scoped slot. nil-checked so unit tests
+// that exercise auth.Middleware in isolation don't need to wire it.
+func (h *Handler) annotateTenant(r *http.Request) {
+	if h == nil || h.TenantAnnotator == nil {
+		return
+	}
+	h.TenantAnnotator(r)
 }
 
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {

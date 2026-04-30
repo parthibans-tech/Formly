@@ -1,0 +1,193 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "name": "Alerts",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "enable": true,
+        "iconColor": "red",
+        "expr": "ALERTS{alertstate=\"firing\"}",
+        "titleFormat": "{{alertname}} [{{severity}}]",
+        "textFormat": "{{description}}"
+      }
+    ]
+  },
+  "description": "Top-level Formly health: HTTP rate, error ratio, p95 latency, in-flight, scrape state.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "type": "stat",
+      "title": "HTTP requests/sec (api)",
+      "id": 1,
+      "gridPos": {"x": 0, "y": 0, "w": 6, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(formly_http_requests_total{process=\"api\"}[5m]))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "reqps", "decimals": 2}
+      }
+    },
+    {
+      "type": "stat",
+      "title": "5xx error ratio (api, 5m)",
+      "id": 2,
+      "gridPos": {"x": 6, "y": 0, "w": 6, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(formly_http_requests_total{process=\"api\",code=\"5xx\"}[5m])) / clamp_min(sum(rate(formly_http_requests_total{process=\"api\"}[5m])), 0.001)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 0.01},
+              {"color": "red", "value": 0.05}
+            ]
+          }
+        }
+      },
+      "options": {"colorMode": "background"}
+    },
+    {
+      "type": "stat",
+      "title": "p95 latency (api, 5m)",
+      "id": 3,
+      "gridPos": {"x": 12, "y": 0, "w": 6, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(formly_http_request_duration_seconds_bucket{process=\"api\"}[5m])))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 1},
+              {"color": "red", "value": 2}
+            ]
+          }
+        }
+      },
+      "options": {"colorMode": "background"}
+    },
+    {
+      "type": "stat",
+      "title": "In-flight requests",
+      "id": 4,
+      "gridPos": {"x": 18, "y": 0, "w": 6, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(formly_http_requests_in_flight)"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "type": "timeseries",
+      "title": "HTTP requests/sec by code",
+      "id": 5,
+      "gridPos": {"x": 0, "y": 4, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (code) (rate(formly_http_requests_total{process=\"api\"}[5m]))",
+          "legendFormat": "{{code}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "reqps", "custom": {"drawStyle": "line", "fillOpacity": 10, "lineInterpolation": "smooth", "stacking": {"mode": "normal"}}}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Latency p50/p95/p99 (with exemplars → Tempo)",
+      "id": 6,
+      "gridPos": {"x": 12, "y": 4, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(formly_http_request_duration_seconds_bucket{process=\"api\"}[5m])))",
+          "legendFormat": "p50",
+          "exemplar": true
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(formly_http_request_duration_seconds_bucket{process=\"api\"}[5m])))",
+          "legendFormat": "p95",
+          "exemplar": true
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(formly_http_request_duration_seconds_bucket{process=\"api\"}[5m])))",
+          "legendFormat": "p99",
+          "exemplar": true
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "s", "custom": {"drawStyle": "line", "fillOpacity": 5, "lineInterpolation": "smooth"}}}
+    },
+    {
+      "type": "table",
+      "title": "Scrape targets",
+      "id": 7,
+      "gridPos": {"x": 0, "y": 12, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "up",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {"id": "organize", "options": {"excludeByName": {"Time": true, "__name__": true}}}
+      ]
+    },
+    {
+      "type": "alertlist",
+      "title": "Active alerts",
+      "id": 8,
+      "gridPos": {"x": 12, "y": 12, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "options": {
+        "showOptions": "current",
+        "maxItems": 20,
+        "stateFilter": {"firing": true, "pending": true},
+        "alertName": "",
+        "dashboardTitle": "",
+        "tags": [],
+        "folderId": null
+      }
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["formly", "global"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Formly · Global health",
+  "uid": "formly-global-health",
+  "version": 1,
+  "weekStart": ""
+}

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"net/http"
 	"os"
 	"time"
 
@@ -12,11 +13,13 @@ import (
 	"github.com/docforge/api/internal/embeddings"
 	"github.com/docforge/api/internal/generate"
 	"github.com/docforge/api/internal/mergerecipes"
+	"github.com/docforge/api/internal/metrics"
 	"github.com/docforge/api/internal/pdfmerge"
 	"github.com/docforge/api/internal/queue"
 	"github.com/docforge/api/internal/scanner"
 	"github.com/docforge/api/internal/scheduled"
 	"github.com/docforge/api/internal/storage"
+	"github.com/docforge/api/internal/tracing"
 	"github.com/docforge/api/internal/webhooks"
 	"github.com/docforge/api/internal/worker"
 	"github.com/hibiken/asynq"
@@ -34,11 +37,37 @@ func main() {
 	}
 	defer pool.Close()
 
+	// OpenTelemetry tracer for the worker. The worker doesn't
+	// receive HTTP requests, but jobs that originate from the API
+	// carry a traceparent on the asynq payload (when we add that
+	// follow-up); even today, having a tracer running here means
+	// the `service.name=formly-worker` node shows up on Tempo's
+	// service graph and any future outbound HTTP wrapped in
+	// otelhttp will produce well-formed spans.
+	tracingShutdown := tracing.Init(context.Background(), "formly-worker")
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tracingShutdown(flushCtx); err != nil {
+			logger.Warn("tracing shutdown", "err", err)
+		}
+	}()
+
 	store, err := storage.New()
 	if err != nil {
 		logger.Error("storage init", "err", err)
 		os.Exit(1)
 	}
+
+	// Prometheus registry — built early so the AI client can be wrapped
+	// with the observer at construction time. /metrics is exposed on a
+	// dedicated listener further down (asynq has no HTTP surface).
+	metricsReg := metrics.New(metrics.Options{
+		Process: "worker",
+		Version: os.Getenv("APP_VERSION"),
+		Commit:  os.Getenv("APP_COMMIT"),
+	})
+	metricsReg.StartDBPoolCollector(context.Background(), pool)
 
 	runner := &generate.Runner{DB: pool, Storage: store}
 	// PDF merge handler shares its lifecycle with the HTTP layer; the
@@ -53,7 +82,7 @@ func main() {
 	// AI_ENABLED is unset we get a Disabled provider; the embed handler
 	// will gracefully no-op for any TaskEmbedFile that arrives (e.g.
 	// from a stale enqueue before AI was turned off).
-	aiClient := ai.NewFromEnv()
+	aiClient := ai.WithMetrics(ai.NewFromEnv(), workerAIObserver{reg: metricsReg})
 	var emb *embeddings.Embedder
 	if aiClient.Enabled() && aiClient.Capabilities().Embed {
 		emb = embeddings.New(pool, store, aiClient, logger)
@@ -80,15 +109,58 @@ func main() {
 	logger.Info("scanner selected", "engine", h.Scanner.Name())
 	logger.Info("ai", "enabled", aiClient.Enabled(), "provider", aiClient.Provider())
 
+	// /metrics is served on a dedicated listener since asynq has no
+	// HTTP surface of its own. Default :9090 is the canonical "metrics
+	// on a sidecar port" choice — distinct from the API's public port
+	// so a single Prometheus job can target both with one relabel.
+	// Auth gating mirrors the API path: basic auth in production,
+	// loopback-only in dev.
+	metricsAddr := os.Getenv("WORKER_METRICS_ADDR")
+	if metricsAddr == "" {
+		metricsAddr = ":9090"
+	}
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", metricsReg.Handler(
+			os.Getenv("METRICS_BASIC_AUTH_USER"),
+			os.Getenv("METRICS_BASIC_AUTH_PASSWORD"),
+		))
+		mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok\n"))
+		})
+		srv := &http.Server{
+			Addr:              metricsAddr,
+			Handler:           mux,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		logger.Info("worker metrics listening", "addr", metricsAddr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("worker metrics server", "err", err)
+		}
+	}()
+
 	srv := asynq.NewServer(queue.ClientOpt(), asynq.Config{
 		Concurrency: 4,
 		Queues:      map[string]int{"default": 1},
 	})
 	mux := asynq.NewServeMux()
+	// Metrics middleware mounted before handler registration so it
+	// wraps every task — including the bespoke webhook handler
+	// registered below — and emits the same {queue,task,result}
+	// labels the dashboards expect.
+	mux.Use(metricsReg.AsynqMiddleware())
 	h.Register(mux)
 
 	// Webhook delivery task (retries via asynq exponential backoff).
 	whh := &webhooks.Handler{DB: pool}
+	whh.SetMetricsObserver(func(result string, _ int, dur time.Duration) {
+		// `code` is dropped at the metric layer — bucketed in `result`
+		// already. The deliveries DB table keeps the raw code for
+		// drill-down forensics.
+		metricsReg.WebhookDeliveries.WithLabelValues(result).Inc()
+		metricsReg.WebhookDuration.WithLabelValues(result).Observe(dur.Seconds())
+	})
 	mux.HandleFunc(queue.TaskWebhookDeliver, whh.ProcessDelivery)
 
 	// Scheduled-jobs tick: every minute, fan due schedules into generate tasks.
@@ -100,8 +172,16 @@ func main() {
 		defer tick.Stop()
 		// Fire immediately once at boot so short-interval schedules don't
 		// have to wait a full minute.
-		if n, err := sch.Tick(ctx); err == nil && n > 0 {
-			logger.Info("schedules fired", "count", n)
+		if n, err := sch.Tick(ctx); err == nil {
+			// Tier 4 deadman: mark every successful tick, even when no
+			// schedules fired — the alert fires when this gauge STOPS
+			// advancing, so an idle scheduler must still record its
+			// heartbeat. The gauge stays unset on error so a failing
+			// tick correctly looks like a stuck cron.
+			metricsReg.MarkCronRun("schedules")
+			if n > 0 {
+				logger.Info("schedules fired", "count", n)
+			}
 		}
 		for range tick.C {
 			n, err := sch.Tick(ctx)
@@ -109,6 +189,7 @@ func main() {
 				logger.Error("schedule tick", "err", err)
 				continue
 			}
+			metricsReg.MarkCronRun("schedules")
 			if n > 0 {
 				logger.Info("schedules fired", "count", n)
 			}
@@ -119,5 +200,38 @@ func main() {
 	if err := srv.Run(mux); err != nil {
 		logger.Error("worker stopped", "err", err)
 		os.Exit(1)
+	}
+}
+
+// workerAIObserver bridges ai.Observer onto the prometheus AI vectors
+// from the worker process. Mirrors metricsAIObserver in cmd/api/main.go
+// — kept distinct (rather than shared in internal/metrics) because
+// neither package should grow a dependency on the other; main is the
+// wiring level by design.
+type workerAIObserver struct {
+	reg *metrics.Registry
+}
+
+func (o workerAIObserver) Observe(op, provider string, dur time.Duration, tokensIn, tokensOut int, err error) {
+	if o.reg == nil {
+		return
+	}
+	if op == "" {
+		op = "unknown"
+	}
+	if provider == "" {
+		provider = "unknown"
+	}
+	result := "ok"
+	if err != nil {
+		result = "error"
+	}
+	o.reg.AIRequests.WithLabelValues(provider, op, result).Inc()
+	o.reg.AIDuration.WithLabelValues(provider, op).Observe(dur.Seconds())
+	if tokensIn > 0 {
+		o.reg.AITokens.WithLabelValues(provider, op, "prompt").Add(float64(tokensIn))
+	}
+	if tokensOut > 0 {
+		o.reg.AITokens.WithLabelValues(provider, op, "completion").Add(float64(tokensOut))
 	}
 }

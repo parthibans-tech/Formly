@@ -1,0 +1,714 @@
+# Alerting rules. Each alert is built around a single principle:
+# fire before users complain, but not so often that the on-call
+# muscles atrophy and start ignoring the pages.
+#
+# Severity is one of `page` (wake someone up) and `ticket` (file
+# during business hours). The label is consumed by Alertmanager
+# routing.
+
+groups:
+  - name: formly-availability
+    rules:
+      # Process down — the canonical "is anything alive" check. If a
+      # scrape target hasn't responded in 2 minutes, page. We don't
+      # gate on traffic because a dead worker that nobody is hitting
+      # is still a problem (queue work piles up silently).
+      - alert: FormlyProcessDown
+        expr: up{job=~"formly-.*"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.job }} ({{ $labels.instance }}) is down"
+          description: |
+            Prometheus has been unable to scrape {{ $labels.instance }}
+            for 2 minutes. The process is either crashed, hung, or
+            unreachable on the network.
+
+      # Build_info absent — catches the case where the process is up
+      # but the metrics package failed to register, or someone shipped
+      # a binary that doesn't expose /metrics. Less urgent than down.
+      - alert: FormlyBuildInfoMissing
+        expr: absent(formly_build_info)
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "formly_build_info missing across all targets"
+          description: |
+            No formly_build_info samples for 10m. Either every target
+            is down (see FormlyProcessDown) or the metrics package
+            isn't wired into the binary that's running.
+
+  - name: formly-http-errors
+    rules:
+      # 5xx burn. A 5% error rate sustained for 10 minutes is the
+      # canonical "page someone" trigger — most flaky deploys settle
+      # within 5m, so 10m is the patience window before we wake
+      # someone up.
+      - alert: FormlyHighErrorRate
+        expr: |
+          (
+            sum by (process) (rate(formly_http_requests_total{code="5xx"}[5m]))
+              /
+            sum by (process) (rate(formly_http_requests_total[5m]))
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.process }} error rate above 5% for 10m"
+          description: |
+            5xx ratio over the last 5m is
+            {{ $value | humanizePercentage }} on {{ $labels.process }}.
+            Check the logs for a recent deploy or upstream outage.
+
+      # Per-route slow burn — catches a single endpoint regressing
+      # without dragging down the global ratio. 10% threshold with a
+      # min-traffic gate (>0.1 rps) so a low-volume admin endpoint
+      # erroring twice doesn't page anyone.
+      - alert: FormlyRouteErrorRate
+        expr: |
+          (
+            route:formly_http_requests_5xx:rate5m > 0
+            and
+            route:formly_http_requests:rate5m > 0.1
+            and
+            route:formly_http_error_ratio:rate5m > 0.10
+          )
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.route }} error rate >10% on {{ $labels.process }}"
+          description: |
+            {{ $labels.method }} {{ $labels.route }} on
+            {{ $labels.process }} is erroring at
+            {{ $value | humanizePercentage }} over 15m. Inspect recent
+            changes to that handler or its dependencies.
+
+  - name: formly-http-latency
+    rules:
+      # p95 latency budget. 2s is generous for a CRUD API but reflects
+      # that we have routes that legitimately render PDFs. Any route
+      # that should be faster gets a tighter per-route override.
+      - alert: FormlyHighP95Latency
+        expr: |
+          (
+            route:formly_http_request_duration_seconds:p95 > 2
+            and
+            route:formly_http_requests:rate5m > 0.1
+          )
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.route }} p95 latency above 2s"
+          description: |
+            p95 latency for {{ $labels.method }} {{ $labels.route }} on
+            {{ $labels.process }} is {{ $value | humanizeDuration }}.
+            Sustained for 15m. Check downstream (DB, storage, Chromium).
+
+      # Saturation: if in-flight requests routinely sit near
+      # GOMAXPROCS we're CPU-bound and the next traffic burst will
+      # tip into latency cliffs. The threshold is the GOMAXPROCS
+      # number you provision; 8 is a reasonable default. Override
+      # per-instance if you run on bigger boxes.
+      - alert: FormlyHighInFlight
+        expr: formly_http_requests_in_flight > 8
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.process }} sustaining {{ $value }} in-flight requests"
+          description: |
+            In-flight HTTP requests on {{ $labels.process }} have
+            stayed above 8 for 5 minutes. Likely CPU-bound; consider
+            scaling out or profiling the slowest routes.
+
+  - name: formly-runtime
+    rules:
+      # GC pause spike — a sustained long pause means heap pressure,
+      # which usually precedes a memory-fueled outage.
+      - alert: FormlyHighGCPause
+        expr: |
+          rate(go_gc_duration_seconds_sum[5m])
+            /
+          rate(go_gc_duration_seconds_count[5m])
+            > 0.1
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.process }} mean GC pause >100ms"
+          description: |
+            Mean Go GC pause on {{ $labels.process }} has been above
+            100ms for 15m — investigate heap usage and allocation
+            hotspots.
+
+      # File descriptor exhaustion. Most prod processes run under
+      # ulimit 65k or 1M; alert at 80% of whatever the kernel is
+      # advertising via formly_process_max_fds.
+      - alert: FormlyFDExhaustion
+        expr: |
+          (
+            formly_process_open_fds
+              /
+            formly_process_max_fds
+          ) > 0.8
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.process }} using >80% of FD limit"
+          description: |
+            Open file descriptors on {{ $labels.process }} are at
+            {{ $value | humanizePercentage }} of the kernel limit.
+            New connections will start failing soon.
+
+  # -------------------------------------------------------------- #
+  # Tier 1 operational alerts                                      #
+  # -------------------------------------------------------------- #
+
+  - name: formly-db
+    rules:
+      # Pool saturation — `acquired` near `max` means the next request
+      # will block on Acquire. 95% sustained 5m is the page line; the
+      # 80% line is a ticket so we get a warning before users feel it.
+      - alert: FormlyDBPoolNearExhaustion
+        expr: process:formly_db_pool_utilization:ratio > 0.95
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.process }} DB pool >95% utilized"
+          description: |
+            pgxpool acquired/max on {{ $labels.process }} is at
+            {{ $value | humanizePercentage }}. Requests are about
+            to start blocking on Acquire.
+
+      - alert: FormlyDBPoolHigh
+        expr: process:formly_db_pool_utilization:ratio > 0.8
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.process }} DB pool sustained >80%"
+          description: |
+            Pool utilization on {{ $labels.process }} has stayed
+            above 80% for 15m. Investigate slow queries holding
+            connections, or scale the pool.
+
+  - name: formly-queue
+    rules:
+      # Per-task error rate. We require a min throughput (>0.05 rps,
+      # i.e. ≥ 15 tasks in 5m) so a single failed test enqueue at
+      # 3am doesn't page anyone.
+      - alert: FormlyQueueTaskErrorRate
+        expr: |
+          (
+            task:formly_queue_tasks:rate5m > 0.05
+            and
+            task:formly_queue_error_ratio:rate5m > 0.10
+          )
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.task }} on {{ $labels.queue }} failing >10%"
+          description: |
+            Asynq task {{ $labels.task }} on queue
+            {{ $labels.queue }} is failing at
+            {{ $value | humanizePercentage }} over 15m. Check worker
+            logs and the task handler.
+
+      # Worker saturation — in_flight near concurrency means new
+      # tasks queue up rather than execute. asynq.Config.Concurrency
+      # is 4 in cmd/worker; alert when > 3.5 sustained.
+      - alert: FormlyWorkerSaturated
+        expr: sum by (process, queue) (formly_queue_tasks_in_flight) > 3.5
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Worker queue {{ $labels.queue }} saturated"
+          description: |
+            Worker concurrency for queue {{ $labels.queue }} has
+            stayed near the limit (>3.5/4) for 10m. New tasks are
+            queueing instead of running. Scale workers.
+
+  - name: formly-webhook
+    rules:
+      # Outbound webhook failure rate. We tolerate spikes (customer
+      # endpoints come and go) but a sustained 25% over 30m means
+      # we're either routing to a dead URL across orgs or the worker's
+      # outbound HTTP client itself is broken.
+      - alert: FormlyWebhookHighFailureRate
+        expr: |
+          (
+            webhook:formly_webhook_total:rate5m > 0.05
+            and
+            webhook:formly_webhook_failure_ratio:rate5m > 0.25
+          )
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Webhook failure rate >25% for 30m"
+          description: |
+            Outbound webhook failure ratio is
+            {{ $value | humanizePercentage }} over 30m. Check
+            asynq retries — sustained high failure means tasks
+            keep entering the dead-letter queue.
+
+  - name: formly-mail
+    rules:
+      # Transactional mail failures. Billing/invite/access kinds are
+      # the ones that hurt — pick out billing as the page-worthy slice.
+      - alert: FormlyBillingMailFailures
+        expr: |
+          sum (
+            rate(formly_mail_sent_total{result="failed", kind=~"billing_.*"}[15m])
+          ) > 0
+        for: 30m
+        labels:
+          severity: page
+        annotations:
+          summary: "Billing email failing to send"
+          description: |
+            At least one billing email (payment_failed, canceled,
+            trial_*) failed to send in the last 15m, sustained for
+            30m. Customers may be missing payment alerts.
+
+      # Generic catch-all for everything else — tickets only.
+      - alert: FormlyMailFailureRate
+        expr: |
+          (
+            sum by (kind) (rate(formly_mail_sent_total[10m])) > 0.01
+            and
+            (
+              kind:formly_mail_failed:rate5m
+                /
+              kind:formly_mail_total:rate5m
+            ) > 0.20
+          )
+        for: 20m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Mail kind {{ $labels.kind }} failure ratio >20%"
+          description: |
+            Mail kind {{ $labels.kind }} via {{ $labels.provider }}
+            is failing at {{ $value | humanizePercentage }} over 20m.
+
+  - name: formly-ai
+    rules:
+      # AI provider errors — usually means the upstream is having
+      # problems, but it's still worth a ticket so the operator can
+      # decide whether to flip AI_ENABLED off.
+      - alert: FormlyAIProviderErrors
+        expr: |
+          (
+            sum by (provider, op) (rate(formly_ai_requests_total[10m])) > 0.05
+            and
+            provider:formly_ai_error_ratio:rate5m > 0.20
+          )
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "AI {{ $labels.provider }}/{{ $labels.op }} error rate >20%"
+          description: |
+            AI provider {{ $labels.provider }} on op
+            {{ $labels.op }} is erroring at
+            {{ $value | humanizePercentage }} over 15m. Check
+            provider status; consider toggling AI_ENABLED off.
+
+  # -------------------------------------------------------------- #
+  # Tier 2: multi-tenant SLO + abuse detection                     #
+  #                                                                #
+  # The SLO target is 99.5% successful HTTP per tier (a 0.5% error #
+  # budget). Multi-window burn-rate alerts combine a fast and a    #
+  # slow window so that we page on real outages but tolerate the   #
+  # 30-second blips that aren't worth a 3am phone call.            #
+  #                                                                #
+  # Burn rate = (error_ratio / 0.005). Standard pair thresholds    #
+  # from the Google SRE workbook:                                  #
+  #                                                                #
+  #   page    burn>14.4 over 1h  AND  burn>14.4 over 5m            #
+  #   ticket  burn>6    over 6h  AND  burn>6    over 30m           #
+  #                                                                #
+  # We require the inner (short) window to also be over the        #
+  # threshold so a slow-burn alert can self-clear instantly when   #
+  # the issue resolves — without the inner gate, a burned budget   #
+  # would leave the alert firing for the full 6h window.           #
+  # -------------------------------------------------------------- #
+
+  - name: formly-tenant-slo
+    rules:
+      # Fast-burn — the page. 14.4× burn rate consumes 2% of a 30-day
+      # error budget per hour, so 1h sustained ≈ 2% gone. Combined
+      # with the 5m gate it stays quiet during a redeploy and fires
+      # during a real failure.
+      - alert: FormlyTenantSLOFastBurn
+        expr: |
+          (
+            tier:formly_tenant_error_ratio:rate1h > (14.4 * 0.005)
+            and
+            tier:formly_tenant_error_ratio:rate5m > (14.4 * 0.005)
+            and
+            tier:formly_tenant_requests:rate5m > 0.1
+          )
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "tier={{ $labels.tier }} SLO fast burn (>14.4×) — 99.5% target at risk"
+          description: |
+            Tier `{{ $labels.tier }}` is burning its 30-day error
+            budget at >14.4× the rate that keeps it inside 99.5%
+            availability. 1h ratio + 5m ratio both above threshold
+            for at least 2 minutes — the customer cohort sharing
+            this tier is seeing a real outage right now.
+
+      # Slow-burn — the ticket. 6× over 6h consumes ~5% of the budget
+      # before firing; coupled with the 30m inner gate so a sustained
+      # but not catastrophic regression still surfaces during the day.
+      - alert: FormlyTenantSLOSlowBurn
+        expr: |
+          (
+            tier:formly_tenant_error_ratio:rate6h > (6 * 0.005)
+            and
+            tier:formly_tenant_error_ratio:rate30m > (6 * 0.005)
+            and
+            tier:formly_tenant_requests:rate5m > 0.1
+          )
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "tier={{ $labels.tier }} SLO slow burn (>6×) over 6h"
+          description: |
+            Tier `{{ $labels.tier }}` is burning its 30-day error
+            budget at >6× target over 6h. Not an outage but the
+            error rate has been elevated long enough to chew through
+            the budget — investigate during business hours.
+
+  - name: formly-auth-abuse
+    rules:
+      # Credential stuffing — failed-login rate spikes without the
+      # success rate keeping pace. The threshold (1 fail/sec sustained
+      # 10m) is well above the noise of legit users mistyping their
+      # password and below what a small botnet generates.
+      - alert: FormlyAuthFailureSpike
+        expr: |
+          (
+            kind:formly_auth_failed:rate5m{kind="login"} > 1
+            and
+            kind:formly_auth_failure_ratio:rate5m{kind="login"} > 0.5
+          )
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Login failure spike — possible credential stuffing"
+          description: |
+            Failed-login rate is {{ $value }}/s over 5m with >50%
+            failure ratio. Check the rate-limit hits dashboard and
+            audit the source IPs in `auth.login.failed` events.
+
+      # MFA verify failure spike — narrower scope than login but
+      # higher signal: a real user fat-fingering TOTP codes doesn't
+      # generate a sustained per-second rate.
+      - alert: FormlyMFAVerifyFailureSpike
+        expr: |
+          kind:formly_auth_failed:rate5m{kind="mfa_verify"} > 0.2
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "MFA verify failures sustained — investigate"
+          description: |
+            MFA verify failures running at {{ $value }}/s over 5m.
+            Either a user is locked out (check audit log) or someone
+            is brute-forcing a stolen password against an MFA-enabled
+            account.
+
+      # Rate-limit tripping. A sustained 0.5/s of 429s on `auth`
+      # means a single bad client is hammering — the limiter is
+      # doing its job, but the operator should know.
+      - alert: FormlyRateLimitTripping
+        expr: bucket:formly_rate_limit_hits:rate5m{bucket="auth"} > 0.5
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "auth rate-limit tripping at {{ $value | humanize }}/s"
+          description: |
+            The `auth` rate-limit bucket has been emitting 429s at
+            >0.5/s for 10m. Check `auth.login.failed` audit rows for
+            the offending IP — block at the edge if this is abuse.
+
+      # Leaked API key probe. invalid + revoked over a sustained
+      # window with ZERO ok in the same window is the canonical
+      # "someone is scanning a leaked key" pattern.
+      - alert: FormlyAPIKeyAbuseProbe
+        expr: |
+          (
+            formly_apikey_abuse:rate5m > 0.1
+            and
+            sum(rate(formly_auth_apikey_attempts_total{result="ok"}[5m])) == 0
+          )
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "API key invalid/revoked rate spiking with no successes"
+          description: |
+            {{ $value | humanize }}/s invalid-or-revoked API key
+            attempts with zero successful ok results in the same
+            window. Likely a leaked key being probed. Inspect
+            `formly_auth_apikey_attempts_total` source IPs and rotate
+            the suspected key family.
+
+  # -------------------------------------------------------------- #
+  # Tier 4: read/write split SLO + budget forecast + deadmans +    #
+  # cardinality watchdog. These all assume you're running          #
+  # Prometheus seriously enough that long-window averages and      #
+  # predict_linear are worth their CPU on a recording rule.        #
+  # -------------------------------------------------------------- #
+
+  - name: formly-tenant-slo-by-kind
+    rules:
+      # Write-side fast burn — page. Writes have stricter SLOs because
+      # a 5xx on a mutation can leave a half-formed record behind, so
+      # we run the same 14.4× threshold as the global burn but with
+      # an explicit kind="write" filter and a slightly tighter
+      # min-traffic gate (writes are lower volume than reads).
+      - alert: FormlyTenantWriteSLOFastBurn
+        expr: |
+          (
+            tier_kind:formly_tenant_error_ratio:rate1h{kind="write"} > (14.4 * 0.005)
+            and
+            tier_kind:formly_tenant_error_ratio:rate5m{kind="write"} > (14.4 * 0.005)
+            and
+            tier_kind:formly_tenant_requests:rate5m{kind="write"} > 0.05
+          )
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "tier={{ $labels.tier }} WRITE SLO fast burn (>14.4×)"
+          description: |
+            Writes for tier `{{ $labels.tier }}` are burning the SLO
+            budget at >14.4×. A failed write is worse than a failed
+            read — a stuck mutation often leaves application state
+            inconsistent. Inspect the write-path handlers and the DB
+            for lock contention or constraint violations.
+
+      # Read-side fast burn — same shape, slightly more relaxed
+      # min-traffic gate (reads are higher volume) and ticket
+      # severity by default. Cache-miss storms shouldn't wake anyone;
+      # a real read regression sustained for 2m+ should still ticket.
+      - alert: FormlyTenantReadSLOFastBurn
+        expr: |
+          (
+            tier_kind:formly_tenant_error_ratio:rate1h{kind="read"} > (14.4 * 0.005)
+            and
+            tier_kind:formly_tenant_error_ratio:rate5m{kind="read"} > (14.4 * 0.005)
+            and
+            tier_kind:formly_tenant_requests:rate5m{kind="read"} > 0.5
+          )
+        for: 2m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "tier={{ $labels.tier }} READ SLO fast burn (>14.4×)"
+          description: |
+            Reads for tier `{{ $labels.tier }}` are erroring at
+            >14.4× the SLO burn rate. Check downstream caches,
+            replica lag, or a recent query plan regression.
+
+  - name: formly-error-budget
+    rules:
+      # Budget exhausted — we've blown through the entire 28d 99.5%
+      # budget and are in deficit. This is the "we already missed
+      # SLO this month" alert; ticket severity because the page
+      # already happened during the burn.
+      - alert: FormlyErrorBudgetExhausted
+        expr: tier:formly_error_budget_remaining:ratio28d <= 0
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "tier={{ $labels.tier }} 28d error budget exhausted"
+          description: |
+            Tier `{{ $labels.tier }}` has consumed 100%+ of its 28-day
+            error budget. Freeze risky deploys, run the SLO
+            postmortem, and back off any planned chaos work until
+            the rolling window clears.
+
+      # Forecast: predict_linear says the budget will hit zero in
+      # less than 7 days at the current rate. Flag during business
+      # hours so engineering can pre-empt the next page. The
+      # `> 0` clamp avoids firing on a still-healthy-but-noisy
+      # signal where the forecast bounces around future negative
+      # values.
+      - alert: FormlyErrorBudgetExhaustionForecast
+        expr: |
+          (
+            tier:formly_error_budget_exhaustion_seconds:predict6h > 0
+            and
+            tier:formly_error_budget_exhaustion_seconds:predict6h < (7 * 24 * 3600)
+            and
+            tier:formly_error_budget_remaining:ratio28d > 0
+          )
+        for: 1h
+        labels:
+          severity: ticket
+        annotations:
+          summary: "tier={{ $labels.tier }} budget forecast: <7d at current burn"
+          description: |
+            At the current 6h burn rate, tier `{{ $labels.tier }}`
+            will exhaust its 28d error budget in
+            {{ $value | humanizeDuration }}. Either reduce risky
+            changes or accept the SLO miss and document it.
+
+  - name: formly-cron-deadman
+    rules:
+      # Worker schedules tick — every 60s normally. Alert if the
+      # heartbeat hasn't advanced in 10 minutes; that's enough margin
+      # for a slow tick or a brief network blip and tight enough
+      # that a real wedge gets caught before the next billing cycle.
+      - alert: FormlyCronSchedulesStuck
+        expr: |
+          time() - max(formly_cron_last_run_timestamp_seconds{name="schedules"}) > 600
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Worker schedules cron has not ticked in >10m"
+          description: |
+            The `schedules` cron in cmd/worker hasn't recorded a
+            heartbeat in over 10 minutes. The worker is either dead,
+            wedged on a stuck tick, or its context was canceled.
+            Scheduled exports + report generations are not running
+            until this clears.
+
+      # Billing dunning loop — runs every hour normally. We allow up
+      # to 3 hours of silence before paging because customers tolerate
+      # a delayed dunning email far better than a delayed render.
+      - alert: FormlyCronDunningStuck
+        expr: |
+          time() - max(formly_cron_last_run_timestamp_seconds{name="billing-dunning"}) > 10800
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Billing dunning cron silent >3h"
+          description: |
+            The billing-dunning loop hasn't recorded a heartbeat in
+            over 3 hours. Trial-ending and payment-failed
+            notifications may be delayed. Check the api logs for
+            panics or a canceled root context.
+
+  # -------------------------------------------------------------- #
+  # Synthetic probes (blackbox exporter)                            #
+  #                                                                #
+  # Run by `formly-blackbox-*` scrape jobs in prometheus.dev.yml.  #
+  # `probe_success` is 1 on a passing probe, 0 on failure. Each    #
+  # alert here fires from outside the API process, so it catches  #
+  # network-path failures (DNS, listener wedged, TLS) that the    #
+  # in-process /metrics endpoint cannot.                           #
+  # -------------------------------------------------------------- #
+
+  - name: formly-synthetic-probes
+    rules:
+      # Endpoint down — page after 2 minutes of consecutive probe
+      # failures. Same `for:` window as FormlyProcessDown so the
+      # two alerts arrive together when the process actually dies
+      # (the inhibit rule in alertmanager.yml keeps it from being
+      # double-paged).
+      - alert: FormlyEndpointDown
+        expr: probe_success == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "Probe failing: {{ $labels.instance }}"
+          description: |
+            Synthetic probe `{{ $labels.probe }}` against
+            `{{ $labels.instance }}` has been failing for 2m.
+            Check the network path — DNS, load balancer, TLS,
+            or the listener itself.
+
+      # Slow probe — the endpoint is up but a synthetic GET is
+      # taking longer than 2s consistently. Ticket because the
+      # `formly-http-latency` page covers the in-process p95 case;
+      # this is specifically the network-stack-around-it.
+      - alert: FormlyEndpointSlow
+        expr: probe_duration_seconds > 2
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Probe duration >2s: {{ $labels.instance }}"
+          description: |
+            Synthetic probe against `{{ $labels.instance }}` has
+            taken longer than 2s for 15m. The endpoint is up but
+            the network path is slow — check the load balancer,
+            edge proxy, or DNS.
+
+      # Cert expiry watchdog — fires 14d before the earliest cert
+      # in the chain expires. Ticket: an actual outage at expiry
+      # would page on FormlyEndpointDown anyway. The
+      # `probe_ssl_earliest_cert_expiry` metric is in unix-seconds.
+      - alert: FormlyTLSCertExpiring
+        expr: |
+          (probe_ssl_earliest_cert_expiry - time()) < (14 * 24 * 3600)
+        for: 1h
+        labels:
+          severity: ticket
+        annotations:
+          summary: "TLS cert for {{ $labels.instance }} expires in <14d"
+          description: |
+            The earliest cert in the TLS chain for
+            `{{ $labels.instance }}` expires in
+            {{ $value | humanizeDuration }}. Renew or rotate
+            before customers see a hard fail.
+
+      # DNS broken — separate alert from "endpoint down" because
+      # a DNS outage in the blackbox container's resolver would
+      # otherwise mask itself as endpoint-down across every probe.
+      - alert: FormlyDNSFailing
+        expr: probe_dns_lookup_time_seconds == 0 and probe_success == 0
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "DNS resolution failing in blackbox container"
+          description: |
+            The blackbox exporter cannot resolve names for 5m.
+            Either the resolver in the container is broken or
+            the upstream we probe (1.1.1.1 by default) is dead.
+
+  - name: formly-cardinality-watchdog
+    rules:
+      # Per-metric series budget. 10k series for a single metric name
+      # is the soft ceiling — Prometheus can handle more, but it's
+      # almost always a label leak (org_id slipped into a counter,
+      # request_id into a histogram). Catching it here before the
+      # TSDB compaction starts thrashing.
+      - alert: FormlyMetricCardinalityHigh
+        expr: metric:formly_series_count:active > 10000
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.__name__ }} has {{ $value }} active series"
+          description: |
+            Metric {{ $labels.__name__ }} is exposing more than 10k
+            active series. This usually means a label is accidentally
+            bound to a high-cardinality value (org_id, request_id,
+            IP). Find the offending WithLabelValues call and replace
+            it with a stable enum or a hash bucket.

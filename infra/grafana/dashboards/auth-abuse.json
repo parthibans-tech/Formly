@@ -1,0 +1,173 @@
+{
+  "annotations": {"list": []},
+  "description": "Login + MFA + API-key + rate-limit signal. Optimized for incident response on credential stuffing / leaked-key probes.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Login fail rate (5m)",
+      "id": 1,
+      "gridPos": {"x": 0, "y": 0, "w": 6, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "kind:formly_auth_failed:rate5m{kind=\"login\"}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 0.5},
+              {"color": "red", "value": 1}
+            ]
+          }
+        }
+      },
+      "options": {"colorMode": "background"}
+    },
+    {
+      "type": "stat",
+      "title": "Login fail ratio (5m)",
+      "id": 2,
+      "gridPos": {"x": 6, "y": 0, "w": 6, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "kind:formly_auth_failure_ratio:rate5m{kind=\"login\"}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 0.25},
+              {"color": "red", "value": 0.5}
+            ]
+          }
+        }
+      },
+      "options": {"colorMode": "background"}
+    },
+    {
+      "type": "stat",
+      "title": "MFA verify fail rate (5m)",
+      "id": 3,
+      "gridPos": {"x": 12, "y": 0, "w": 6, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "kind:formly_auth_failed:rate5m{kind=\"mfa_verify\"}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 0.1},
+              {"color": "red", "value": 0.2}
+            ]
+          }
+        }
+      },
+      "options": {"colorMode": "background"}
+    },
+    {
+      "type": "stat",
+      "title": "API key abuse rate (5m)",
+      "id": 4,
+      "gridPos": {"x": 18, "y": 0, "w": 6, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "formly_apikey_abuse:rate5m"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 0.05},
+              {"color": "red", "value": 0.1}
+            ]
+          }
+        }
+      },
+      "options": {"colorMode": "background"}
+    },
+    {
+      "type": "timeseries",
+      "title": "Auth result mix (5m, by kind+result)",
+      "id": 5,
+      "gridPos": {"x": 0, "y": 5, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (kind, result) (rate(formly_auth_attempts_total[5m]))",
+          "legendFormat": "{{kind}} / {{result}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "custom": {"drawStyle": "line", "fillOpacity": 10, "stacking": {"mode": "normal"}}}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Rate-limit 429s by bucket (5m)",
+      "id": 6,
+      "gridPos": {"x": 12, "y": 5, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "bucket:formly_rate_limit_hits:rate5m",
+          "legendFormat": "{{bucket}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "custom": {"drawStyle": "line", "fillOpacity": 10}}}
+    },
+    {
+      "type": "timeseries",
+      "title": "API key attempts (ok / invalid / revoked)",
+      "id": 7,
+      "gridPos": {"x": 0, "y": 13, "w": 24, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (result) (rate(formly_auth_apikey_attempts_total[5m]))",
+          "legendFormat": "{{result}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "custom": {"drawStyle": "line", "fillOpacity": 10, "stacking": {"mode": "normal"}}}}
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["formly", "auth", "abuse"],
+  "templating": {"list": []},
+  "time": {"from": "now-3h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Formly · Auth & abuse",
+  "uid": "formly-auth-abuse",
+  "version": 1,
+  "weekStart": ""
+}

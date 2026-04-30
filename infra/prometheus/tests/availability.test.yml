@@ -1,0 +1,91 @@
+# Behavioural tests for the formly-availability and
+# formly-synthetic-probes rule groups. Run with:
+#
+#   promtool test rules infra/prometheus/tests/availability.test.yml
+#
+# promtool reads `rule_files`, evaluates them against the
+# synthetic series we feed in `input_series`, and asserts the
+# named alerts fire (or don't) at each `eval_time`.
+
+rule_files:
+  - ../alerts.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    name: FormlyProcessDown — pages on a 2m gap
+    input_series:
+      - series: up{job="formly-api", instance="api:8080"}
+        # 0m..1m: scraping, then offline 2m..end
+        values: "1 1 0 0 0 0 0"
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: FormlyProcessDown
+        # No alert at 1m: still up.
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: FormlyProcessDown
+        exp_alerts:
+          - exp_labels:
+              alertname: FormlyProcessDown
+              severity: page
+              job: formly-api
+              instance: api:8080
+            exp_annotations:
+              summary: "formly-api (api:8080) is down"
+              description: |
+                Prometheus has been unable to scrape api:8080
+                for 2 minutes. The process is either crashed, hung, or
+                unreachable on the network.
+
+  - interval: 1m
+    name: FormlyEndpointDown — pages after 2m of probe_success==0
+    input_series:
+      - series: probe_success{instance="http://api/healthz", probe="api-health"}
+        values: "1 1 0 0 0 0 0"
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: FormlyEndpointDown
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: FormlyEndpointDown
+        exp_alerts:
+          - exp_labels:
+              alertname: FormlyEndpointDown
+              severity: page
+              instance: http://api/healthz
+              probe: api-health
+            exp_annotations:
+              summary: "Probe failing: http://api/healthz"
+              description: |
+                Synthetic probe `api-health` against
+                `http://api/healthz` has been failing for 2m.
+                Check the network path — DNS, load balancer, TLS,
+                or the listener itself.
+
+  - interval: 1m
+    name: FormlyEndpointSlow — fires after 15m of slow probes
+    input_series:
+      - series: probe_duration_seconds{instance="http://api/healthz", probe="api-health"}
+        values: "0.5 0.5 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: FormlyEndpointSlow
+        # Not yet — only at 10m, threshold needs 15m.
+        exp_alerts: []
+      - eval_time: 17m
+        alertname: FormlyEndpointSlow
+        exp_alerts:
+          - exp_labels:
+              alertname: FormlyEndpointSlow
+              severity: ticket
+              instance: http://api/healthz
+              probe: api-health
+            exp_annotations:
+              summary: "Probe duration >2s: http://api/healthz"
+              description: |
+                Synthetic probe against `http://api/healthz` has
+                taken longer than 2s for 15m. The endpoint is up but
+                the network path is slow — check the load balancer,
+                edge proxy, or DNS.

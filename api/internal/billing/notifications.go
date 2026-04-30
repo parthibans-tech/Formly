@@ -3,7 +3,7 @@ package billing
 import (
 	"context"
 	"fmt"
-	"strings"
+	"os"
 
 	"github.com/docforge/api/internal/email"
 	"github.com/docforge/api/internal/mail"
@@ -64,13 +64,15 @@ func orgAdmins(ctx context.Context, db *pgxpool.Pool, orgID string) ([]struct {
 }
 
 // SendBillingNotice is the single helper every billing email goes
-// through. It looks up admins, layers the org-scoped mailer config,
-// and writes one audit row per recipient.
+// through. Callers hand in a Branded struct so the layout, footer, and
+// plain-text fallback come from one place — keeping every billing
+// mail visually consistent and on the same anti-spam profile.
 func SendBillingNotice(
 	ctx context.Context,
 	db *pgxpool.Pool,
 	mailer MailerSender,
-	orgID, kind, subject, htmlBody, textBody string,
+	orgID, kind, subject string,
+	body email.Branded,
 	meta map[string]any,
 ) {
 	if mailer == nil || orgID == "" {
@@ -80,6 +82,7 @@ func SendBillingNotice(
 	if err != nil || len(admins) == 0 {
 		return
 	}
+	htmlBody, textBody := email.Render(body)
 	for _, a := range admins {
 		_, _ = mailer.Send(ctx, mail.SendOptions{
 			OrgID:  orgID,
@@ -101,39 +104,53 @@ func SendBillingNotice(
 // action; the mail just nudges them to the right page.
 func notifyPaymentFailed(ctx context.Context, db *pgxpool.Pool, mailer MailerSender, orgID, planName string) {
 	subject := "Payment failed — please update your card"
-	body := fmt.Sprintf(
-		"We couldn't charge your card for %s. Visit /settings/billing to update your payment method before your subscription is paused.",
-		planName,
-	)
-	SendBillingNotice(ctx, db, mailer, orgID, "billing_payment_failed",
-		subject, htmlWrap(subject, body), body,
-		map[string]any{"planName": planName})
+	SendBillingNotice(ctx, db, mailer, orgID, "billing_payment_failed", subject, email.Branded{
+		PreviewText: "Update your card on file to keep " + planName + " active.",
+		Title:       "Payment failed",
+		Paragraphs: []string{
+			fmt.Sprintf("We couldn't charge your card for %s.", planName),
+			"Update your payment method to avoid an interruption — your subscription pauses automatically if the next retry fails.",
+		},
+		CTAText:       "Update payment method",
+		CTAURL:        appURL("/settings/billing"),
+		SecondaryNote: "Already updated your card? You can ignore this email — the next retry will pick up the new payment method.",
+		Reason:        "You're receiving this because you're an admin on a workspace with a billing issue.",
+	}, map[string]any{"planName": planName})
 }
 
 // notifyCanceled is the "your subscription ended" mail. Triggers on
 // subscription.cancelled / customer.subscription.deleted webhooks.
 func notifyCanceled(ctx context.Context, db *pgxpool.Pool, mailer MailerSender, orgID, planName string) {
 	subject := "Your subscription has been canceled"
-	body := fmt.Sprintf(
-		"Your %s subscription has been canceled. Workspace data is retained — you can resubscribe at any time from /settings/billing.",
-		planName,
-	)
-	SendBillingNotice(ctx, db, mailer, orgID, "billing_canceled",
-		subject, htmlWrap(subject, body), body, nil)
+	SendBillingNotice(ctx, db, mailer, orgID, "billing_canceled", subject, email.Branded{
+		PreviewText: "Your " + planName + " subscription has ended.",
+		Title:       "Subscription canceled",
+		Paragraphs: []string{
+			fmt.Sprintf("Your %s subscription has been canceled.", planName),
+			"Your workspace and data are retained — you can resubscribe any time and pick up exactly where you left off.",
+		},
+		CTAText: "Resubscribe",
+		CTAURL:  appURL("/settings/billing"),
+		Reason:  "You're receiving this because you're an admin on the canceled workspace.",
+	}, nil)
 }
 
 // notifyTrialEnding fires from the daily cron when a trial has 3 (or 1)
 // days left. Frequency cap is enforced by the cron, not here.
 func notifyTrialEnding(ctx context.Context, db *pgxpool.Pool, mailer MailerSender, orgID, planName string, daysLeft int) {
-	subject := fmt.Sprintf("Trial ends in %d day%s",
-		daysLeft, plural(daysLeft))
-	body := fmt.Sprintf(
-		"Your trial of %s ends in %d day%s. Add a payment method on /settings/billing to keep going without interruption.",
-		planName, daysLeft, plural(daysLeft),
-	)
-	SendBillingNotice(ctx, db, mailer, orgID, "billing_trial_ending",
-		subject, htmlWrap(subject, body), body,
-		map[string]any{"daysLeft": daysLeft})
+	subject := fmt.Sprintf("Trial ends in %d day%s", daysLeft, plural(daysLeft))
+	SendBillingNotice(ctx, db, mailer, orgID, "billing_trial_ending", subject, email.Branded{
+		PreviewText: fmt.Sprintf("Your %s trial ends in %d day%s.", planName, daysLeft, plural(daysLeft)),
+		Title:       subject,
+		Paragraphs: []string{
+			fmt.Sprintf("Your trial of %s ends in %d day%s.", planName, daysLeft, plural(daysLeft)),
+			"Add a payment method now to keep things running without interruption — your data and settings stay exactly as they are.",
+		},
+		CTAText:       "Add payment method",
+		CTAURL:        appURL("/settings/billing"),
+		SecondaryNote: "Don't need it? You can ignore this email — your workspace will switch to read-only when the trial ends.",
+		Reason:        "You're receiving this because you're an admin on a workspace with an active trial.",
+	}, map[string]any{"daysLeft": daysLeft})
 }
 
 // notifyTrialExpired fires from the dunning sweep that catches trials
@@ -143,13 +160,17 @@ func notifyTrialEnding(ctx context.Context, db *pgxpool.Pool, mailer MailerSende
 // be re-granted, so the only way forward is checkout.
 func notifyTrialExpired(ctx context.Context, db *pgxpool.Pool, mailer MailerSender, orgID, planName string) {
 	subject := "Your trial has ended — choose a plan to continue"
-	body := fmt.Sprintf(
-		"Your %s trial has ended. Workspace data is preserved, but new uploads, invites, and integrations are paused until you choose a plan. Pick one on /settings/billing — checkout takes a minute.",
-		planName,
-	)
-	SendBillingNotice(ctx, db, mailer, orgID, "billing_trial_expired",
-		subject, htmlWrap(subject, body), body,
-		map[string]any{"planName": planName})
+	SendBillingNotice(ctx, db, mailer, orgID, "billing_trial_expired", subject, email.Branded{
+		PreviewText: "Pick a plan to keep your workspace active.",
+		Title:       "Your trial has ended",
+		Paragraphs: []string{
+			fmt.Sprintf("Your %s trial has ended.", planName),
+			"Workspace data is preserved, but new uploads, invites, and integrations are paused until you pick a plan. Checkout takes a minute.",
+		},
+		CTAText: "Choose a plan",
+		CTAURL:  appURL("/settings/billing"),
+		Reason:  "You're receiving this because you're an admin on a workspace whose trial just expired.",
+	}, map[string]any{"planName": planName})
 }
 
 func plural(n int) string {
@@ -159,12 +180,14 @@ func plural(n int) string {
 	return "s"
 }
 
-func htmlWrap(title, body string) string {
-	return strings.Join([]string{
-		`<!DOCTYPE html><html><body style="font-family:system-ui,sans-serif;max-width:560px;margin:32px auto;color:#0f172a">`,
-		`<h2 style="font-size:18px;margin-bottom:12px">` + title + `</h2>`,
-		`<p style="font-size:14px;line-height:1.5">` + body + `</p>`,
-		`<p style="font-size:12px;color:#64748b;margin-top:32px">— Formly Billing</p>`,
-		`</body></html>`,
-	}, "")
+// appURL is a small wrapper over the APP_URL env so the billing emails
+// link back to the same host the recipient signs in on. We keep this
+// local rather than importing one from team / sharing because billing
+// already imports neither and we want to avoid a cycle.
+func appURL(path string) string {
+	base := os.Getenv("APP_URL")
+	if base == "" {
+		base = "https://drive360.app"
+	}
+	return base + path
 }

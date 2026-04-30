@@ -1,0 +1,20 @@
+# Dashboard provider — points Grafana at the JSON files committed
+# under infra/grafana/dashboards/. Edits saved through the Grafana
+# UI go to disk because `allowUiUpdates: true`, which keeps the
+# door open for "tweak in UI, copy JSON back into git" without
+# trapping operators in vi-on-call mode. CI is responsible for
+# refusing PRs that drift the schema (a `jq` validation step in
+# .github/workflows/ops.yml).
+
+apiVersion: 1
+
+providers:
+  - name: formly
+    folder: Formly
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true
+    updateIntervalSeconds: 10
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

@@ -1,0 +1,127 @@
+# Behavioural tests for the multi-window SLO burn-rate alerts.
+# These are the most subtle alerts in the system — the burn-rate
+# math is easy to get wrong and a regression here means either
+# false pages at 3am or missed real outages, so we lock the
+# thresholds in with explicit tests.
+#
+# Reminder: the SLO target is 99.5% availability, so the error
+# budget is 0.5% (= 0.005). Burn-rate thresholds:
+#   page    14.4× → > 0.072 sustained over 1h AND 5m
+#   ticket   6×   → > 0.030 sustained over 6h AND 30m
+
+rule_files:
+  - ../alerts.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    name: FormlyTenantSLOFastBurn — pages at 14.4× burn for 2m
+    input_series:
+      # 1h ratio sustained at 8% (above 7.2% threshold), 5m ratio
+      # also at 8%, traffic above the gate.
+      - series: tier:formly_tenant_error_ratio:rate1h{tier="pro"}
+        values: "0.08x10"
+      - series: tier:formly_tenant_error_ratio:rate5m{tier="pro"}
+        values: "0.08x10"
+      - series: tier:formly_tenant_requests:rate5m{tier="pro"}
+        values: "1x10"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: FormlyTenantSLOFastBurn
+        exp_alerts:
+          - exp_labels:
+              alertname: FormlyTenantSLOFastBurn
+              severity: page
+              tier: pro
+            exp_annotations:
+              summary: "tier=pro SLO fast burn (>14.4×) — 99.5% target at risk"
+              description: |
+                Tier `pro` is burning its 30-day error
+                budget at >14.4× the rate that keeps it inside 99.5%
+                availability. 1h ratio + 5m ratio both above threshold
+                for at least 2 minutes — the customer cohort sharing
+                this tier is seeing a real outage right now.
+
+  - interval: 1m
+    name: FormlyTenantSLOFastBurn — does NOT page at 5% (below threshold)
+    input_series:
+      - series: tier:formly_tenant_error_ratio:rate1h{tier="free"}
+        values: "0.05x10"
+      - series: tier:formly_tenant_error_ratio:rate5m{tier="free"}
+        values: "0.05x10"
+      - series: tier:formly_tenant_requests:rate5m{tier="free"}
+        values: "1x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: FormlyTenantSLOFastBurn
+        exp_alerts: []
+
+  - interval: 1m
+    name: FormlyTenantSLOFastBurn — does NOT page on low traffic (gate)
+    input_series:
+      # Burn rate well above threshold but traffic is below the
+      # 0.1 rps gate — a single failed health check should not
+      # fast-burn anything.
+      - series: tier:formly_tenant_error_ratio:rate1h{tier="enterprise"}
+        values: "0.5x10"
+      - series: tier:formly_tenant_error_ratio:rate5m{tier="enterprise"}
+        values: "0.5x10"
+      - series: tier:formly_tenant_requests:rate5m{tier="enterprise"}
+        values: "0.05x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: FormlyTenantSLOFastBurn
+        exp_alerts: []
+
+  - interval: 1m
+    name: FormlyTenantSLOSlowBurn — tickets after 15m at 6× burn
+    input_series:
+      - series: tier:formly_tenant_error_ratio:rate6h{tier="pro"}
+        values: "0.04x20"
+      - series: tier:formly_tenant_error_ratio:rate30m{tier="pro"}
+        values: "0.04x20"
+      - series: tier:formly_tenant_requests:rate5m{tier="pro"}
+        values: "1x20"
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: FormlyTenantSLOSlowBurn
+        exp_alerts:
+          - exp_labels:
+              alertname: FormlyTenantSLOSlowBurn
+              severity: ticket
+              tier: pro
+            exp_annotations:
+              summary: "tier=pro SLO slow burn (>6×) over 6h"
+              description: |
+                Tier `pro` is burning its 30-day error
+                budget at >6× target over 6h. Not an outage but the
+                error rate has been elevated long enough to chew through
+                the budget — investigate during business hours.
+
+  - interval: 1m
+    name: FormlyTenantWriteSLOFastBurn — pages on write-side burn
+    input_series:
+      - series: tier_kind:formly_tenant_error_ratio:rate1h{tier="pro", kind="write"}
+        values: "0.08x10"
+      - series: tier_kind:formly_tenant_error_ratio:rate5m{tier="pro", kind="write"}
+        values: "0.08x10"
+      - series: tier_kind:formly_tenant_requests:rate5m{tier="pro", kind="write"}
+        values: "0.5x10"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: FormlyTenantWriteSLOFastBurn
+        exp_alerts:
+          - exp_labels:
+              alertname: FormlyTenantWriteSLOFastBurn
+              severity: page
+              tier: pro
+              kind: write
+            exp_annotations:
+              summary: "tier=pro WRITE SLO fast burn (>14.4×)"
+              description: |
+                Writes for tier `pro` are burning the SLO
+                budget at >14.4×. A failed write is worse than a failed
+                read — a stuck mutation often leaves application state
+                inconsistent. Inspect the write-path handlers and the DB
+                for lock contention or constraint violations.

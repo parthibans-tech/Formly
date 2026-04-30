@@ -66,6 +66,14 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// MetricsObserver is invoked once per Send with the resolved
+// (kind, provider, ok) tuple — the metrics package wires this up
+// from cmd/api/main.go to keep `mail` free of any prometheus import.
+// `provider` is the resolved provider name (resend / ses / smtp /
+// "unconfigured" when no config could be loaded). `ok` is true when
+// the audit row landed as 'sent'.
+type MetricsObserver func(kind, provider string, ok bool)
+
 // Mailer is the package-level service. Construct one in cmd/api/main.go
 // and inject into every other handler that needs to send mail.
 type Mailer struct {
@@ -76,6 +84,20 @@ type Mailer struct {
 	envCfg     email.Config
 	envHasFrom bool
 	once       sync.Once
+
+	// observer fires after the audit row is written. nil when the
+	// caller didn't wire metrics (tests, dev without /metrics).
+	observer MetricsObserver
+}
+
+// SetMetricsObserver attaches a metrics observer. Safe to call once
+// at boot; not safe to swap concurrently with in-flight Sends (we
+// don't lock — the field is read-only after wiring).
+func (m *Mailer) SetMetricsObserver(o MetricsObserver) {
+	if m == nil {
+		return
+	}
+	m.observer = o
 }
 
 // NewMailer wires up the Mailer and snapshots the env-derived defaults.
@@ -160,6 +182,12 @@ func (m *Mailer) Send(ctx context.Context, opts SendOptions) (string, error) {
 	}
 
 	sendID := m.writeAuditRow(ctx, opts, cfg, status, res.ProviderID, errStr)
+
+	// Metrics observer — fires after the audit row lands so a metric
+	// uptick always corresponds to a row in email_sends. Safe when nil.
+	if m.observer != nil {
+		m.observer(opts.Kind, cfg.Provider, sendErr == nil)
+	}
 
 	// Events are best-effort — failure to publish should never mask the
 	// real send result.
@@ -305,6 +333,16 @@ func (m *Mailer) recordFailure(
 	es := cause.Error()
 	cfg := email.Config{Provider: provider}
 	id := m.writeAuditRow(ctx, opts, cfg, "failed", providerID, &es)
+	if m.observer != nil {
+		// Provider may be empty here (config-load failure) — pass through
+		// as "unknown" so the metric still surfaces the failure rather
+		// than dropping the sample on a missing label.
+		p := provider
+		if p == "" {
+			p = "unknown"
+		}
+		m.observer(opts.Kind, p, false)
+	}
 	return id, cause
 }
 

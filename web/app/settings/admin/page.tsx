@@ -516,6 +516,11 @@ export default function AdminDashboardPage() {
             icon={<Inbox className="h-4 w-4" />}
             label="Email audit"
           />
+          <QuickLink
+            href="/settings/admin/observability"
+            icon={<Gauge className="h-4 w-4" />}
+            label="Observability (Prometheus)"
+          />
         </CardContent>
       </Card>
     </>

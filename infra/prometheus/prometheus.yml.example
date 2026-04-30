@@ -1,0 +1,71 @@
+# Example Prometheus scrape config for the Formly API + worker.
+#
+# Drop this in next to your prometheus.yml (or rename it) and adjust:
+#
+#   - the `targets` list to point at the host:port the API and worker
+#     processes actually listen on. By default the API serves /metrics
+#     on the same port as the public HTTP API; the worker stands up a
+#     dedicated :9090 port (override with WORKER_METRICS_ADDR).
+#
+#   - the `basic_auth` block — fill in the same value you set for
+#     METRICS_BASIC_AUTH_USER / METRICS_BASIC_AUTH_PASSWORD on the
+#     scraped processes. Skip the block entirely if you scrape from
+#     localhost (the handler falls back to loopback-only auth).
+#
+# Recording + alerting rules live alongside this file:
+#
+#   rule_files:
+#     - "recording.rules.yml"
+#     - "alerts.rules.yml"
+#
+# A 15s scrape interval keeps the histograms responsive while staying
+# well under the 5m staleness window. Bump to 30s if cardinality grows.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    # Tag every series with the environment so a single Prometheus
+    # instance can host staging + prod side-by-side without confusion.
+    env: production
+
+rule_files:
+  - "recording.rules.yml"
+  - "alerts.rules.yml"
+
+scrape_configs:
+  # The API process. /metrics is served on the same router as the
+  # public API, gated by basic auth (production) or loopback (dev).
+  - job_name: formly-api
+    metrics_path: /metrics
+    scheme: http
+    basic_auth:
+      username: ${METRICS_BASIC_AUTH_USER}
+      password: ${METRICS_BASIC_AUTH_PASSWORD}
+    static_configs:
+      - targets:
+          - api.internal:8080
+        labels:
+          process: api
+
+  # The worker process. Bring up its dedicated :9090 listener via
+  # WORKER_METRICS_ADDR (or accept the default).
+  - job_name: formly-worker
+    metrics_path: /metrics
+    scheme: http
+    basic_auth:
+      username: ${METRICS_BASIC_AUTH_USER}
+      password: ${METRICS_BASIC_AUTH_PASSWORD}
+    static_configs:
+      - targets:
+          - worker.internal:9090
+        labels:
+          process: worker
+
+# Alerting target — point at your Alertmanager(s). Comment out the
+# whole block if you only want recording rules for now.
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets:
+#             - alertmanager.internal:9093

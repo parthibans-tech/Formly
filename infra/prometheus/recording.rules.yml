@@ -1,0 +1,449 @@
+# Recording rules pre-compute the expensive joins and quantiles the
+# dashboards keep asking for. Cheaper to run them once on the
+# Prometheus side than to re-evaluate on every dashboard refresh; also
+# means alerts and dashboards share a single canonical definition of
+# "p95" or "error rate" instead of drifting.
+#
+# Naming follows the Prom convention `level:metric:operation` so
+# `route:formly_http_request_duration_seconds:p95` reads as "p95 of
+# request duration, aggregated to the route level".
+
+groups:
+  - name: formly-http-rates
+    interval: 30s
+    rules:
+      # Per-route request rate. The 5-minute window is the standard
+      # tradeoff: long enough to smooth bursty traffic, short enough
+      # that an alert fires before a real outage looks healthy in the
+      # 1h aggregate.
+      - record: route:formly_http_requests:rate5m
+        expr: |
+          sum by (process, method, route) (
+            rate(formly_http_requests_total[5m])
+          )
+
+      # Per-route 5xx rate — the numerator for error-budget burn.
+      - record: route:formly_http_requests_5xx:rate5m
+        expr: |
+          sum by (process, method, route) (
+            rate(formly_http_requests_total{code="5xx"}[5m])
+          )
+
+      # Per-route error ratio. NaN-safe: divides the 5xx rate by the
+      # total rate, so a route with zero traffic yields 0/0 = NaN
+      # rather than a spurious 0% — important for alerts using
+      # absent_over_time().
+      - record: route:formly_http_error_ratio:rate5m
+        expr: |
+          route:formly_http_requests_5xx:rate5m
+            /
+          route:formly_http_requests:rate5m
+
+  - name: formly-http-latency
+    interval: 30s
+    rules:
+      # Per-route p50, p95, p99 latency. histogram_quantile() over a
+      # rate() gives the "what's the typical / tail latency right now"
+      # answer; collapsing the `le` label is required by the
+      # histogram_quantile contract.
+      - record: route:formly_http_request_duration_seconds:p50
+        expr: |
+          histogram_quantile(
+            0.50,
+            sum by (process, method, route, le) (
+              rate(formly_http_request_duration_seconds_bucket[5m])
+            )
+          )
+
+      - record: route:formly_http_request_duration_seconds:p95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (process, method, route, le) (
+              rate(formly_http_request_duration_seconds_bucket[5m])
+            )
+          )
+
+      - record: route:formly_http_request_duration_seconds:p99
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (process, method, route, le) (
+              rate(formly_http_request_duration_seconds_bucket[5m])
+            )
+          )
+
+  - name: formly-availability
+    interval: 1m
+    rules:
+      # 1h availability per route — used by the SLO burn-rate alerts.
+      # `clamp_max(_, 1)` guards against rounding past 100% when the
+      # histogram counts and request counter drift by a sample.
+      - record: route:formly_http_availability:ratio1h
+        expr: |
+          clamp_max(
+            1 - (
+              sum by (process, route) (
+                rate(formly_http_requests_total{code="5xx"}[1h])
+              )
+                /
+              sum by (process, route) (
+                rate(formly_http_requests_total[1h])
+              )
+            ),
+            1
+          )
+
+  # ---------------------------------------------------------------- #
+  # Tier 1 operational rollups: queue, db pool, webhook, mail, ai.   #
+  # Each rule captures the question the on-call asks first, so the   #
+  # dashboard pulls one cheap series instead of recomputing.         #
+  # ---------------------------------------------------------------- #
+
+  - name: formly-queue
+    interval: 30s
+    rules:
+      # Per-task throughput. The on-call dashboard pivots on this to
+      # spot a stuck queue (rate goes to 0 while in_flight stays > 0)
+      # vs a busy queue (both move).
+      - record: task:formly_queue_tasks:rate5m
+        expr: |
+          sum by (process, queue, task) (
+            rate(formly_queue_tasks_total[5m])
+          )
+
+      # Per-task failure rate.
+      - record: task:formly_queue_tasks_failed:rate5m
+        expr: |
+          sum by (process, queue, task) (
+            rate(formly_queue_tasks_total{result="failed"}[5m])
+          )
+
+      # Per-task error ratio. Same NaN-safe pattern as the HTTP one.
+      - record: task:formly_queue_error_ratio:rate5m
+        expr: |
+          task:formly_queue_tasks_failed:rate5m
+            /
+          task:formly_queue_tasks:rate5m
+
+      # p95 task duration — surfaces the long-tail (slow Chromium
+      # render, slow embed) without dragging the histogram into a
+      # giant series count.
+      - record: task:formly_queue_task_duration_seconds:p95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (process, queue, task, le) (
+              rate(formly_queue_task_duration_seconds_bucket[5m])
+            )
+          )
+
+  - name: formly-db
+    interval: 30s
+    rules:
+      # Pool-utilization ratio. > 0.8 sustained = pool saturation
+      # warning; > 0.95 = page. Lives here so dashboards and alerts
+      # share the same definition.
+      - record: process:formly_db_pool_utilization:ratio
+        expr: |
+          formly_db_pool_connections{state="acquired"}
+            /
+          clamp_min(formly_db_pool_connections{state="max"}, 1)
+
+  - name: formly-webhook
+    interval: 30s
+    rules:
+      # 4xx + 5xx + transport-error rate — what the operator means
+      # when they say "webhook failure rate". 3xx is excluded because
+      # a redirect to a moved endpoint is the customer's problem to
+      # fix, not ours to alert on.
+      - record: webhook:formly_webhook_failures:rate5m
+        expr: |
+          sum (
+            rate(formly_webhook_deliveries_total{result=~"4xx|5xx|error"}[5m])
+          )
+      - record: webhook:formly_webhook_total:rate5m
+        expr: sum(rate(formly_webhook_deliveries_total[5m]))
+      - record: webhook:formly_webhook_failure_ratio:rate5m
+        expr: |
+          webhook:formly_webhook_failures:rate5m
+            /
+          webhook:formly_webhook_total:rate5m
+
+  - name: formly-mail
+    interval: 30s
+    rules:
+      # Mail failure rate by kind — keeps dashboards from accidentally
+      # mixing test sends with billing-critical sends.
+      - record: kind:formly_mail_failed:rate5m
+        expr: |
+          sum by (kind, provider) (
+            rate(formly_mail_sent_total{result="failed"}[5m])
+          )
+      - record: kind:formly_mail_total:rate5m
+        expr: |
+          sum by (kind, provider) (
+            rate(formly_mail_sent_total[5m])
+          )
+
+  - name: formly-ai
+    interval: 30s
+    rules:
+      - record: provider:formly_ai_error_ratio:rate5m
+        expr: |
+          sum by (provider, op) (
+            rate(formly_ai_requests_total{result="error"}[5m])
+          )
+            /
+          sum by (provider, op) (
+            rate(formly_ai_requests_total[5m])
+          )
+      - record: provider:formly_ai_request_duration_seconds:p95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (provider, op, le) (
+              rate(formly_ai_request_duration_seconds_bucket[5m])
+            )
+          )
+
+  # ---------------------------------------------------------------- #
+  # Tier 2: per-tier SLO rollups + multi-window burn rates.          #
+  #                                                                  #
+  # The shape follows the Google SRE workbook: a single error-ratio  #
+  # series rolled up at 5m / 30m / 1h / 6h windows, then alerts      #
+  # combine pairs of windows (fast burn / slow burn) to balance      #
+  # detection latency against false positives.                       #
+  #                                                                  #
+  # Cardinality budget: ~6 tiers × 4 windows = 24 series per metric. #
+  # Bounded.                                                         #
+  # ---------------------------------------------------------------- #
+
+  - name: formly-tenant-slo
+    interval: 30s
+    rules:
+      # Per-tier 5xx burn at four windows. Each is the input to the
+      # multi-window burn-rate alert pairs in alerts.rules.yml. The
+      # rolled-up series exists so the alert evaluation cost is fixed
+      # regardless of how busy the underlying counter gets.
+      - record: tier:formly_tenant_error_ratio:rate5m
+        expr: |
+          sum by (tier) (
+            rate(formly_tenant_requests_total{code="5xx"}[5m])
+          )
+            /
+          clamp_min(
+            sum by (tier) (
+              rate(formly_tenant_requests_total[5m])
+            ),
+            1e-9
+          )
+
+      - record: tier:formly_tenant_error_ratio:rate30m
+        expr: |
+          sum by (tier) (
+            rate(formly_tenant_requests_total{code="5xx"}[30m])
+          )
+            /
+          clamp_min(
+            sum by (tier) (
+              rate(formly_tenant_requests_total[30m])
+            ),
+            1e-9
+          )
+
+      - record: tier:formly_tenant_error_ratio:rate1h
+        expr: |
+          sum by (tier) (
+            rate(formly_tenant_requests_total{code="5xx"}[1h])
+          )
+            /
+          clamp_min(
+            sum by (tier) (
+              rate(formly_tenant_requests_total[1h])
+            ),
+            1e-9
+          )
+
+      - record: tier:formly_tenant_error_ratio:rate6h
+        expr: |
+          sum by (tier) (
+            rate(formly_tenant_requests_total{code="5xx"}[6h])
+          )
+            /
+          clamp_min(
+            sum by (tier) (
+              rate(formly_tenant_requests_total[6h])
+            ),
+            1e-9
+          )
+
+      # Per-tier request rate. Used by the alert min-traffic gate so
+      # a tier with one-test-org-and-no-traffic doesn't fire.
+      - record: tier:formly_tenant_requests:rate5m
+        expr: |
+          sum by (tier) (
+            rate(formly_tenant_requests_total[5m])
+          )
+
+  - name: formly-auth
+    interval: 30s
+    rules:
+      # Failed-login rate. The whole point is to spot a credential-
+      # stuffing burst — sum across kinds keeps the alert simple
+      # while AuthAttempts retains kind in the underlying counter
+      # for forensic queries.
+      - record: kind:formly_auth_failed:rate5m
+        expr: |
+          sum by (kind) (
+            rate(formly_auth_attempts_total{result="failed"}[5m])
+          )
+      - record: kind:formly_auth_total:rate5m
+        expr: |
+          sum by (kind) (
+            rate(formly_auth_attempts_total[5m])
+          )
+      - record: kind:formly_auth_failure_ratio:rate5m
+        expr: |
+          kind:formly_auth_failed:rate5m
+            /
+          clamp_min(kind:formly_auth_total:rate5m, 1e-9)
+
+      # API-key auth invalid+revoked rate — the leaked-key signal.
+      # `expired` and `error` are excluded because they're customer-
+      # side bugs (clock skew, network) and don't smell like abuse.
+      - record: formly_apikey_abuse:rate5m
+        expr: |
+          sum (
+            rate(formly_auth_apikey_attempts_total{result=~"invalid|revoked"}[5m])
+          )
+
+  - name: formly-rate-limits
+    interval: 30s
+    rules:
+      # Per-bucket 429 rate. Surfaces the "are we tripping the limiter
+      # at all?" signal — Tier 2's early warning before the auth
+      # failure ratio actually moves.
+      - record: bucket:formly_rate_limit_hits:rate5m
+        expr: |
+          sum by (bucket) (
+            rate(formly_security_rate_limit_hits_total[5m])
+          )
+
+  # ---------------------------------------------------------------- #
+  # Tier 4: deeper SLO accounting.                                   #
+  #                                                                  #
+  # The Tier 2 series collapse the kind label; Tier 4 keeps it so    #
+  # reads and writes can have separate alert thresholds. The error   #
+  # budget series compute "how much of the 30-day 99.5% budget has   #
+  # been consumed so far" — the on-call's answer to "do we have      #
+  # headroom for the next risky deploy?".                            #
+  #                                                                  #
+  # Cardinality budget: ~6 tiers × 2 kinds × N windows. Bounded.     #
+  # ---------------------------------------------------------------- #
+
+  - name: formly-tenant-slo-by-kind
+    interval: 30s
+    rules:
+      # Per-tier, per-kind error ratios at the same windows the burn
+      # alerts use. Read-vs-write matters because the operator's
+      # response is different — write 5xx is a stuck mutation that
+      # may have left the DB in an inconsistent state, read 5xx is
+      # often a downstream cache or transient retry. Pairing the
+      # alerts to kind lets us route them differently.
+      - record: tier_kind:formly_tenant_error_ratio:rate5m
+        expr: |
+          sum by (tier, kind) (
+            rate(formly_tenant_requests_total{code="5xx"}[5m])
+          )
+            /
+          clamp_min(
+            sum by (tier, kind) (
+              rate(formly_tenant_requests_total[5m])
+            ),
+            1e-9
+          )
+
+      - record: tier_kind:formly_tenant_error_ratio:rate1h
+        expr: |
+          sum by (tier, kind) (
+            rate(formly_tenant_requests_total{code="5xx"}[1h])
+          )
+            /
+          clamp_min(
+            sum by (tier, kind) (
+              rate(formly_tenant_requests_total[1h])
+            ),
+            1e-9
+          )
+
+      - record: tier_kind:formly_tenant_requests:rate5m
+        expr: |
+          sum by (tier, kind) (
+            rate(formly_tenant_requests_total[5m])
+          )
+
+  - name: formly-error-budget
+    # 5m interval is enough; the input windows are 28d, so an exact
+    # fast tick gains nothing and just heats up the TSDB.
+    interval: 5m
+    rules:
+      # Average 5xx ratio over 28 days, per tier. The denominator of
+      # the budget calculation. Long-window avg_over_time is cheap on
+      # a recorded ratio (vs rate-of-counter directly) because the
+      # input is already a small float.
+      - record: tier:formly_tenant_error_ratio:avg28d
+        expr: |
+          avg_over_time(
+            tier:formly_tenant_error_ratio:rate5m[28d]
+          )
+
+      # Budget remaining = 1 - (consumed_ratio / target_ratio). With
+      # SLO 99.5% the target_ratio is 0.005 of allowed errors. A
+      # value of 1 means no budget burned, 0 means fully consumed,
+      # negative means we're in deficit (already missed SLO this
+      # window). Clamped to [-1, 1] so the chart stays readable.
+      - record: tier:formly_error_budget_remaining:ratio28d
+        expr: |
+          clamp(
+            1 - (
+              tier:formly_tenant_error_ratio:avg28d
+                /
+              0.005
+            ),
+            -1,
+            1
+          )
+
+      # Forecast: at the current 6h burn rate, how many seconds
+      # before the remaining 28d budget hits zero? predict_linear
+      # extrapolates the gauge's slope. Output is in seconds; the
+      # alert thresholds are in days. NaN-safe via clamp_min on the
+      # divisor in the source ratio rules.
+      - record: tier:formly_error_budget_exhaustion_seconds:predict6h
+        expr: |
+          predict_linear(
+            tier:formly_error_budget_remaining:ratio28d[6h],
+            0
+          )
+          /
+          clamp_min(
+            -deriv(tier:formly_error_budget_remaining:ratio28d[6h]),
+            1e-12
+          )
+
+  - name: formly-cardinality-watchdog
+    # Run sparingly — counting __name__ groups across the whole TSDB
+    # is one of the more expensive recording rules. 5m is plenty.
+    interval: 5m
+    rules:
+      # Total active series per metric name in the formly_* family.
+      # The watchdog alert fires if any single name exceeds a budget,
+      # which usually means a label was accidentally bound to a high-
+      # cardinality value (org_id, IP, request_id). Catching this
+      # before the TSDB melts is the whole point.
+      - record: metric:formly_series_count:active
+        expr: |
+          count by (__name__) (
+            {__name__=~"formly_.*"}
+          )

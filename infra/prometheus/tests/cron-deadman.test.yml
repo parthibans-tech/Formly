@@ -1,0 +1,63 @@
+# Behavioural tests for the cron deadman + cardinality watchdog.
+# These are easy to forget about until they save you, so tests
+# lock in the timing behaviour explicitly.
+
+rule_files:
+  - ../alerts.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    name: FormlyCronSchedulesStuck — pages when heartbeat stops for >10m
+    input_series:
+      # Last heartbeat at t=0 (epoch + 0). promtool advances
+      # `time()` by the eval_interval each step. The alert fires
+      # when `time() - max(...) > 600`, sustained 5m. Locking the
+      # timestamp to 0 means the gap grows monotonically.
+      - series: formly_cron_last_run_timestamp_seconds{name="schedules"}
+        values: "0x30"
+    alert_rule_test:
+      - eval_time: 18m
+        alertname: FormlyCronSchedulesStuck
+        exp_alerts:
+          - exp_labels:
+              alertname: FormlyCronSchedulesStuck
+              severity: page
+            exp_annotations:
+              summary: "Worker schedules cron has not ticked in >10m"
+              description: |
+                The `schedules` cron in cmd/worker hasn't recorded a
+                heartbeat in over 10 minutes. The worker is either dead,
+                wedged on a stuck tick, or its context was canceled.
+                Scheduled exports + report generations are not running
+                until this clears.
+
+  - interval: 1m
+    name: FormlyMetricCardinalityHigh — tickets at >10k series for 30m
+    # `__name__` is a reserved label in promtool input series — you
+    # can't synthesize a __name__ label directly; it has to flow
+    # through the recording rule that emits `metric:formly_series_count:active`.
+    # We assert the firing event only (label/annotation values are
+    # exercised by the recording rule's own evaluation in production
+    # and would require feeding the raw `formly_*` series through
+    # both the recording rule + the alert rule here, which adds more
+    # noise than it removes).
+    input_series:
+      - series: metric:formly_series_count:active
+        values: "15000x40"
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: FormlyMetricCardinalityHigh
+        exp_alerts:
+          - exp_labels:
+              alertname: FormlyMetricCardinalityHigh
+              severity: ticket
+            exp_annotations:
+              summary: "metric:formly_series_count:active has 15000 active series"
+              description: |
+                Metric metric:formly_series_count:active is exposing more than 10k
+                active series. This usually means a label is accidentally
+                bound to a high-cardinality value (org_id, request_id,
+                IP). Find the offending WithLabelValues call and replace
+                it with a stable enum or a hash bucket.

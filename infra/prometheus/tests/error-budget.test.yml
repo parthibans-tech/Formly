@@ -1,0 +1,67 @@
+# Behavioural tests for the 28-day error-budget alerts. These
+# fire on long-window recording rules; we feed pre-computed
+# values directly rather than driving the recording rules
+# themselves (which would require 28d of synthetic input). The
+# alert rules just consume `tier:formly_error_budget_*` metrics.
+
+rule_files:
+  - ../alerts.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    name: FormlyErrorBudgetExhausted — tickets at 0%
+    input_series:
+      - series: tier:formly_error_budget_remaining:ratio28d{tier="pro"}
+        values: "-0.05x40"
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: FormlyErrorBudgetExhausted
+        exp_alerts:
+          - exp_labels:
+              alertname: FormlyErrorBudgetExhausted
+              severity: ticket
+              tier: pro
+            exp_annotations:
+              summary: "tier=pro 28d error budget exhausted"
+              description: |
+                Tier `pro` has consumed 100%+ of its 28-day
+                error budget. Freeze risky deploys, run the SLO
+                postmortem, and back off any planned chaos work until
+                the rolling window clears.
+
+  - interval: 1m
+    name: FormlyErrorBudgetExhausted — does NOT fire when budget remains
+    input_series:
+      - series: tier:formly_error_budget_remaining:ratio28d{tier="free"}
+        values: "0.4x40"
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: FormlyErrorBudgetExhausted
+        exp_alerts: []
+
+  - interval: 1m
+    name: FormlyErrorBudgetExhaustionForecast — tickets when forecast <7d
+    input_series:
+      # Budget will run out in ~3 days at current rate, still has
+      # 20% remaining (so it's a forecast, not the exhausted case).
+      - series: tier:formly_error_budget_exhaustion_seconds:predict6h{tier="pro"}
+        values: "259200x70"
+      - series: tier:formly_error_budget_remaining:ratio28d{tier="pro"}
+        values: "0.2x70"
+    alert_rule_test:
+      - eval_time: 65m
+        alertname: FormlyErrorBudgetExhaustionForecast
+        exp_alerts:
+          - exp_labels:
+              alertname: FormlyErrorBudgetExhaustionForecast
+              severity: ticket
+              tier: pro
+            exp_annotations:
+              summary: "tier=pro budget forecast: <7d at current burn"
+              description: |
+                At the current 6h burn rate, tier `pro`
+                will exhaust its 28d error budget in
+                3d 0h 0m 0s. Either reduce risky
+                changes or accept the SLO miss and document it.

@@ -59,6 +59,21 @@ type LimitOpts struct {
 	Window    time.Duration
 	Max       int
 	BucketKey func(*http.Request) string
+
+	// Name is a friendly bucket label (e.g. "login", "register",
+	// "mfa_verify") used by the OnLimit observer when the limiter
+	// trips. Distinct from BucketKey, which is the per-request
+	// (IP+path)-scoped string used for the actual counter — Name is
+	// the cardinality-bounded shape we want on dashboards. Defaults
+	// to "default" when unset, so a metric series exists even if the
+	// caller forgot to label.
+	Name string
+
+	// OnLimit fires once per 429 emission with the bucket Name. Wired
+	// in cmd/api to the metrics package's RateLimitHits counter. The
+	// hook runs from the request goroutine and must not block — the
+	// metric increment is a single atomic.Add.
+	OnLimit func(name string)
 }
 
 func RateLimit(db *pgxpool.Pool, opts LimitOpts) func(http.Handler) http.Handler {
@@ -70,6 +85,9 @@ func RateLimit(db *pgxpool.Pool, opts LimitOpts) func(http.Handler) http.Handler
 	}
 	if opts.BucketKey == nil {
 		opts.BucketKey = defaultBucketKey
+	}
+	if opts.Name == "" {
+		opts.Name = "default"
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -90,6 +108,9 @@ func RateLimit(db *pgxpool.Pool, opts LimitOpts) func(http.Handler) http.Handler
 				return
 			}
 			if count >= opts.Max {
+				if opts.OnLimit != nil {
+					opts.OnLimit(opts.Name)
+				}
 				w.Header().Set("Retry-After", "60")
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusTooManyRequests)

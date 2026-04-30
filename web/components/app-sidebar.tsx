@@ -288,6 +288,17 @@ const SECTIONS: Section[] = [
         superAdmin: true,
         hint: "Cross-org activity & email",
       },
+      {
+        // Live ops dashboard — Prometheus snapshot, sparklines, and
+        // the curated SLO/runbook reference. Pinned in the sidebar so
+        // the on-call doesn't have to scroll the dashboard's Quick
+        // Links card mid-incident.
+        href: "/settings/admin/observability",
+        label: "Observability",
+        icon: Gauge,
+        superAdmin: true,
+        hint: "Prometheus live + rules",
+      },
     ],
   },
   {

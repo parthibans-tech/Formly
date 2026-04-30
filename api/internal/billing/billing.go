@@ -58,6 +58,12 @@ type Handler struct {
 	DB      *pgxpool.Pool
 	drivers Drivers
 	Mailer  MailerSender
+
+	// OnDunningTick fires after each successful dunning sweep.
+	// Wiring lives in main.go (cmd/api), which translates the call
+	// into a metrics.MarkCronRun for the deadman alert. nil-safe:
+	// the loop checks before calling.
+	OnDunningTick func()
 }
 
 func New(db *pgxpool.Pool) *Handler { return &Handler{DB: db} }

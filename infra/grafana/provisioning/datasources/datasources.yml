@@ -1,0 +1,85 @@
+# Provisioned datasources — read on Grafana startup. Three sources:
+#
+#   1. Prometheus  — metrics + alert rules + recording rules
+#   2. Tempo       — distributed traces (OTLP from API + worker)
+#   3. Alertmanager — current alert state, silences, receivers
+#
+# The Prometheus → Tempo cross-link via `exemplarTraceIdDestinations`
+# is what lights up the "click an exemplar dot, jump to the slow
+# trace" workflow. It's the single piece of plumbing that turns
+# a dashboard into an investigation tool instead of a status board.
+
+apiVersion: 1
+
+deleteDatasources:
+  - name: Prometheus
+  - name: Tempo
+  - name: Alertmanager
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 10s
+      # Tie exemplars on histogram metrics back to traces in Tempo.
+      # `traceID` is the label name client_golang stamps onto an
+      # exemplar; `datasourceUid: tempo` resolves the click.
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: tempo
+          urlDisplayLabel: View trace in Tempo
+
+  - name: Tempo
+    uid: tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    editable: false
+    jsonData:
+      # Bidirectional: from a trace span we can also pivot back into
+      # Prometheus to see the metrics around that timestamp.
+      tracesToMetrics:
+        datasourceUid: prometheus
+        spanStartTimeShift: -1m
+        spanEndTimeShift: 1m
+        tags:
+          - key: service.name
+            value: process
+          - key: http.route
+            value: route
+        queries:
+          - name: HTTP request rate
+            query: |
+              sum by (route) (rate(formly_http_requests_total{$$__tags}[5m]))
+          - name: HTTP error rate
+            query: |
+              sum by (route) (rate(formly_http_requests_total{code="5xx", $$__tags}[5m]))
+      # Service map in Tempo Explore — uses Prometheus to compute
+      # service-to-service request rates from spans (requires the
+      # `traces_spanmetrics_*` recording rules; harmless if missing).
+      serviceMap:
+        datasourceUid: prometheus
+      nodeGraph:
+        enabled: true
+      search:
+        hide: false
+      lokiSearch:
+        # No Loki in this stack — leave this off.
+        hide: true
+
+  - name: Alertmanager
+    uid: alertmanager
+    type: alertmanager
+    access: proxy
+    url: http://alertmanager:9093
+    editable: false
+    jsonData:
+      # Enables the unified Alerting UI to discover and render
+      # Alertmanager-managed silences and active groups.
+      implementation: prometheus
+      handleGrafanaManagedAlerts: false

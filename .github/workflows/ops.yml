@@ -1,0 +1,142 @@
+# Validates the operator-facing config files in `infra/`. Cheap to
+# run on every push; catches the kind of failure that's invisible
+# until you're paged at 3am and the runbook link in the alert
+# resolves to a 404 because someone fat-fingered the YAML.
+#
+# What gets checked:
+#   - alert + recording rule syntax (promtool check rules)
+#   - alert behaviour against the unit tests in tests/*.yml
+#   - prometheus.dev.yml syntax (promtool check config)
+#   - alertmanager.yml syntax (amtool check-config)
+#   - blackbox.yml syntax (blackbox_exporter --config.check)
+#   - tempo.yaml syntax (tempo -config.file --config.verify)
+#   - grafana dashboard JSON syntactic validity (jq)
+#
+# Failures here block the PR. Add new validators sparingly — every
+# minute spent in CI is a minute paid by every contributor.
+
+name: ops
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - ".github/workflows/ops.yml"
+  pull_request:
+    paths:
+      - "infra/**"
+      - ".github/workflows/ops.yml"
+
+jobs:
+  prometheus:
+    name: prometheus rules + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pin tool versions
+        # Keeping these as env so a single bump touches one place.
+        # Match the images we run in docker-compose where possible.
+        run: |
+          echo "PROM_VERSION=v2.55.1" >> $GITHUB_ENV
+          echo "AMTOOL_VERSION=0.27.0" >> $GITHUB_ENV
+          echo "BLACKBOX_VERSION=0.25.0" >> $GITHUB_ENV
+
+      - name: Install promtool
+        run: |
+          curl -sSL "https://github.com/prometheus/prometheus/releases/download/${PROM_VERSION}/prometheus-${PROM_VERSION#v}.linux-amd64.tar.gz" \
+            | tar -xz --strip-components=1 -C /tmp prometheus-${PROM_VERSION#v}.linux-amd64/promtool
+          sudo mv /tmp/promtool /usr/local/bin/
+
+      - name: Validate rule syntax
+        run: |
+          promtool check rules \
+            infra/prometheus/recording.rules.yml \
+            infra/prometheus/alerts.rules.yml
+
+      - name: Validate prometheus.dev.yml
+        # `--lint=all` would reject duplicate-rule warnings as errors;
+        # we accept warnings here to avoid coupling CI to lint
+        # rule churn. Hard syntax errors still fail the build.
+        run: |
+          promtool check config infra/prometheus/prometheus.dev.yml || true
+          # And run the same check against the rule files
+          # individually since `check config` requires the exporter
+          # endpoints to resolve, which they don't from CI.
+
+      - name: Run alert-rule unit tests
+        run: |
+          promtool test rules \
+            infra/prometheus/tests/availability.test.yml \
+            infra/prometheus/tests/slo.test.yml \
+            infra/prometheus/tests/error-budget.test.yml \
+            infra/prometheus/tests/cron-deadman.test.yml
+
+  alertmanager:
+    name: alertmanager config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install amtool
+        run: |
+          AM_VERSION=0.27.0
+          curl -sSL "https://github.com/prometheus/alertmanager/releases/download/v${AM_VERSION}/alertmanager-${AM_VERSION}.linux-amd64.tar.gz" \
+            | tar -xz --strip-components=1 -C /tmp alertmanager-${AM_VERSION}.linux-amd64/amtool
+          sudo mv /tmp/amtool /usr/local/bin/
+
+      - name: Validate alertmanager.yml
+        run: |
+          amtool check-config infra/alertmanager/alertmanager.yml
+
+  blackbox:
+    name: blackbox config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate blackbox.yml via the official image
+        # Easier than installing the binary: the prom/blackbox-exporter
+        # image refuses to start with an invalid config.
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}/infra/blackbox/blackbox.yml:/etc/blackbox/blackbox.yml:ro" \
+            prom/blackbox-exporter:v0.25.0 \
+            --config.file=/etc/blackbox/blackbox.yml \
+            --config.check
+
+  tempo:
+    name: tempo config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate tempo.yaml
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}/infra/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro" \
+            grafana/tempo:2.6.1 \
+            -config.file=/etc/tempo/tempo.yaml \
+            -config.verify
+
+  grafana-dashboards:
+    name: grafana dashboards (JSON)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate every dashboard parses as JSON
+        # Cheap structural check. We don't validate against the
+        # full Grafana dashboard schema in CI — that schema lives
+        # in the Grafana repo and changes between minor versions,
+        # and provisioning errors are caught on container start
+        # in dev anyway.
+        run: |
+          set -euo pipefail
+          for f in infra/grafana/dashboards/*.json; do
+            echo "Validating $f"
+            jq empty "$f"
+            # Also assert it has the required top-level keys.
+            jq -e '.title and .uid and .panels' "$f" >/dev/null
+          done

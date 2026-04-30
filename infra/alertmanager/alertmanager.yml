@@ -1,0 +1,179 @@
+# Alertmanager configuration for the Formly stack.
+#
+# What this routes
+# ----------------
+# Every alert defined in infra/prometheus/alerts.rules.yml lands
+# here with a `severity` label of either `page` (wake somebody up
+# now) or `ticket` (file during business hours). The route tree
+# below dispatches them to receivers based on that label.
+#
+# Receivers in dev vs prod
+# ------------------------
+# In dev the default route is `null` — alerts fire into a black
+# hole so nobody gets paged while you're hacking. To turn on a
+# Slack-style firehose locally for testing, swap the `receiver:` on
+# the root route from `null` to `dev-firehose` and set
+# SLACK_DEV_WEBHOOK_URL in your shell.
+#
+# In production: replace `dev-firehose` URL with your real Slack
+# webhook, set the PagerDuty integration key on the `pager`
+# receiver, and flip the root route's `receiver` to `tickets` (so
+# tickets default-route there and only severity=page escalates to
+# pager). The match-tree below stays the same.
+#
+# Inhibit rules
+# -------------
+# We collapse the noise around big incidents:
+#   - When a process is down (FormlyProcessDown firing), suppress
+#     every other alert from the same instance. Otherwise a single
+#     dead worker generates a paragraph of derivative alerts (queue
+#     drained, exemplars stop, build_info missing, etc.) that all
+#     resolve when the underlying process comes back.
+#   - When a "page" alert is firing for a (job, instance), suppress
+#     any "ticket" alert with the same alertname — the ticket is
+#     redundant once an on-call is already engaged.
+#
+# Templating
+# ----------
+# templates/formly.tmpl renders Slack/PagerDuty bodies with
+# severity color, summary, runbook link, and a deep-link back to
+# the prometheus query that is firing. Keep messages short — a
+# pager that needs scrolling is a pager that gets ignored.
+
+global:
+  # Resolve interval — Alertmanager waits this long for an alert to
+  # stay resolved before sending the "ok" message. Short enough
+  # that the channel doesn't dwell on a flap, long enough that a
+  # single 30s scrape gap doesn't paint a green-then-red.
+  resolve_timeout: 5m
+
+  # The dev container uses HTTP only; in prod terminate TLS at the
+  # ingress and leave the inner hop unencrypted on a private
+  # network, OR set http_config.tls_config here.
+
+# Templates referenced below by `templates:` keys on each receiver.
+templates:
+  - /etc/alertmanager/templates/formly.tmpl
+
+# ─── Routing tree ────────────────────────────────────────────────
+#
+# Walk top-down. The first matching child handles the alert; if no
+# child matches, the parent's `receiver:` is used. Children
+# inherit `group_by` / `group_wait` / `group_interval` /
+# `repeat_interval` unless they override.
+route:
+  # Group by alertname + severity so a single incident becomes one
+  # message rather than 50. job/instance go inside the message body
+  # so a 3-replica fleet down still arrives as one collapsible
+  # entry instead of three pages.
+  group_by: ["alertname", "severity"]
+
+  # Buffer for new alerts in a fresh group — small so fast bursts
+  # still arrive promptly.
+  group_wait: 30s
+  # Subsequent batches in the same group — the on-call doesn't need
+  # a notification every 30s while an incident is unfolding.
+  group_interval: 5m
+  # Re-page interval if nothing has resolved.
+  repeat_interval: 4h
+
+  # Default catch-all. In dev this is `null` so no nag; flip to
+  # `tickets` (Slack) in prod and you'll get every unmatched alert
+  # with severity=ticket.
+  receiver: "null"
+
+  routes:
+    # Critical: page on-call. PagerDuty integration key lives on
+    # the `pager` receiver below.
+    - matchers:
+        - severity = "page"
+      receiver: "pager"
+      # Tighter cadence than the default — page-class alerts
+      # shouldn't wait 5m between batches.
+      group_wait: 10s
+      group_interval: 1m
+      repeat_interval: 30m
+      continue: true # also fan out to Slack "tickets" channel for visibility
+
+    # Non-critical: file in Slack.
+    - matchers:
+        - severity = "ticket"
+      receiver: "tickets"
+      repeat_interval: 24h
+
+# ─── Inhibit rules ───────────────────────────────────────────────
+inhibit_rules:
+  # If the process is dead, every other alert from that target is
+  # noise — suppress them until the process is back.
+  - source_matchers:
+      - alertname = "FormlyProcessDown"
+    target_matchers:
+      - alertname != "FormlyProcessDown"
+    equal: ["job", "instance"]
+
+  # If a `page` of the same alertname is already firing, the
+  # `ticket` for it is redundant. (Rare in our ruleset — only the
+  # SLO read/write split is paired this way today — but prevents
+  # the on-call from getting two notifications for one issue.)
+  - source_matchers:
+      - severity = "page"
+    target_matchers:
+      - severity = "ticket"
+    equal: ["alertname"]
+
+# ─── Receivers ───────────────────────────────────────────────────
+receivers:
+  # Black hole — used by the root route in dev so alerts fire into
+  # nothing. Keep the receiver defined; Alertmanager won't load a
+  # config that references an undeclared receiver.
+  - name: "null"
+
+  # On-call pager. PagerDuty Events API v2.
+  #
+  # Production setup: replace SECRET_PAGERDUTY_INTEGRATION_KEY with
+  # the integration key for your "Formly platform" service in
+  # PagerDuty (Service → Integrations → Events API V2). Don't
+  # check the real key in here; either template it in at deploy
+  # time or use Alertmanager's `routing_key_file:` to read from a
+  # mounted secret.
+  - name: "pager"
+    pagerduty_configs:
+      - routing_key: "SECRET_PAGERDUTY_INTEGRATION_KEY"
+        # severity Prometheus label → PagerDuty severity field
+        severity: '{{ if eq .GroupLabels.severity "page" }}critical{{ else }}warning{{ end }}'
+        description: '{{ template "formly.pagerduty.description" . }}'
+        details:
+          alertname: "{{ .GroupLabels.alertname }}"
+          summary: '{{ template "formly.summary" . }}'
+          runbook: '{{ (index .Alerts 0).Annotations.runbook_url }}'
+          firing: "{{ .Alerts.Firing | len }}"
+          resolved: "{{ .Alerts.Resolved | len }}"
+        client: "Formly Alertmanager"
+        client_url: '{{ template "formly.externalURL" . }}'
+
+  # Ticket queue. Slack incoming webhook.
+  #
+  # Production setup: replace https://hooks.slack.com/... with the
+  # webhook URL for the channel you actually want noise in. Same
+  # secret-management rule as PagerDuty applies — prefer
+  # `api_url_file:` over inlining the URL.
+  - name: "tickets"
+    slack_configs:
+      - api_url: "https://hooks.slack.com/services/REPLACE/WITH/REAL"
+        channel: "#formly-alerts"
+        send_resolved: true
+        title: '{{ template "formly.slack.title" . }}'
+        text: '{{ template "formly.slack.text" . }}'
+        color: '{{ template "formly.slack.color" . }}'
+
+  # Dev firehose — opt-in receiver you can switch the root route
+  # to during local testing. Same shape as `tickets` but reads the
+  # webhook from an env-templated file so an accidental commit
+  # never leaks the URL.
+  - name: "dev-firehose"
+    slack_configs:
+      - api_url: "https://hooks.slack.com/services/REPLACE/WITH/DEV"
+        channel: "#formly-dev-alerts"
+        send_resolved: true
+        title: '[dev] {{ .GroupLabels.alertname }}'
+        text: '{{ template "formly.slack.text" . }}'

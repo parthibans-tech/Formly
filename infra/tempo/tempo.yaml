@@ -1,0 +1,82 @@
+# Tempo (Grafana's distributed tracing backend) — dev config.
+#
+# Why Tempo and not Jaeger
+# ------------------------
+# Tempo's storage model is "blob store + index" (think S3) which
+# scales linearly without per-trace bookkeeping that Jaeger keeps.
+# In dev we use the local filesystem; in prod swap `local` for
+# `s3` / `gcs` / `azure`. The receiver and query surfaces are the
+# same.
+#
+# What this config does
+# ---------------------
+# Listens on OTLP gRPC (4317) and OTLP HTTP (4318) for incoming
+# spans from the API + worker (see api/internal/tracing). Persists
+# blocks under /var/tempo in the container, queryable via the HTTP
+# API on :3200 (and via Grafana's Tempo data source when wired).
+#
+# Retention is 14 days — twice the Prometheus retention so the
+# error-budget exemplars (which point at a trace_id) stay
+# resolvable for the full 7d Prom window.
+#
+# Exemplar pipeline
+# -----------------
+# api/internal/metrics records OpenMetrics exemplars on the HTTP
+# histogram with the trace_id from the W3C traceparent header.
+# The same trace_id arrives here via the OTLP exporter wired up in
+# api/internal/tracing. So: a slow-request bucket in Prometheus
+# carries an exemplar dot → click → Grafana follows the trace_id
+# label to Tempo → full span tree of the request. The metric and
+# the trace are produced from the same incoming request, in the
+# same process — they're guaranteed to match.
+
+server:
+  http_listen_port: 3200
+
+# Distributor — accepts incoming OTLP from the API + worker.
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        # gRPC is the cheaper path on modern infra. We expose both
+        # so the Go SDK can flip between them via env without
+        # changing the receiver config.
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+
+ingester:
+  trace_idle_period: 30s
+  max_block_duration: 5m
+
+compactor:
+  compaction:
+    block_retention: 336h  # 14 days
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/blocks
+    wal:
+      path: /var/tempo/wal
+    pool:
+      max_workers: 50
+      queue_depth: 2000
+
+# Limits — keep the default tenant in dev. In prod you'd want
+# per-org_id ingest rate limits; we don't multitenant-tag spans
+# yet so the global tenant stays single-tenant.
+overrides:
+  defaults:
+    metrics_generator:
+      processors: []
+
+# Metrics — Tempo can re-emit RED metrics from spans, but our
+# Prometheus already has direct RED metrics from the API
+# middleware. Disabling here avoids double-counting and the
+# accompanying scrape pressure.
+metrics_generator:
+  storage:
+    path: /var/tempo/generator/wal

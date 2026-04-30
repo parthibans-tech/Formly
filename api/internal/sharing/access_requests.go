@@ -29,13 +29,13 @@ package sharing
 import (
 	"context"
 	"encoding/json"
-	"html"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/docforge/api/internal/auth"
+	emailpkg "github.com/docforge/api/internal/email"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -342,9 +342,7 @@ func (h *Handler) notifyOwnerOfRequest(
 		return
 	}
 	subject := requesterEmail + " is requesting access to " + fileName
-	html := buildOwnerRequestHTML(ownerName, requesterEmail, fileName, requestedRole, message)
-	text := requesterEmail + " is asking for " + requestedRole +
-		" access to \"" + fileName + "\". Decide at /settings/access-requests."
+	html, text := buildOwnerRequestEmail(ownerName, requesterEmail, fileName, requestedRole, message)
 
 	_, _ = h.Mailer.Send(ctx, NotifyOptions{
 		OrgID:    orgID,
@@ -379,8 +377,7 @@ func (h *Handler) notifyRequesterOfDecision(
 	_ = h.DB.QueryRow(ctx, `SELECT name FROM files WHERE id=$1`, fileID).Scan(&fileName)
 
 	subject := "Your access request was " + decision
-	html := buildRequesterDecisionHTML(reqName, fileName, role, decision)
-	text := "Your request for " + role + " access to \"" + fileName + "\" was " + decision + "."
+	html, text := buildRequesterDecisionEmail(reqName, fileName, role, decision)
 
 	kind := "access_request_" + decision
 	_, _ = h.Mailer.Send(ctx, NotifyOptions{
@@ -407,51 +404,56 @@ func (h *Handler) lookupUser(ctx context.Context, userID string) (emailAddr, nam
 	return
 }
 
-// buildOwnerRequestHTML renders the email the owner sees when a viewer
-// asks for access. Plain inline-style HTML — no template engine — keeps
-// the dependency surface small and the email looks fine in every client.
-func buildOwnerRequestHTML(ownerName, requesterEmail, fileName, role, message string) string {
-	greeting := "Hi"
+// buildOwnerRequestEmail renders the email the file owner gets when a
+// viewer hits "Request access". One pass through emailpkg.Render so the
+// HTML and plaintext stay in lockstep — anti-spam multipart-diff rules
+// fire when the two diverge significantly.
+func buildOwnerRequestEmail(ownerName, requesterEmail, fileName, role, message string) (string, string) {
+	greeting := "Hi,"
 	if ownerName != "" {
-		greeting = "Hi " + ownerName
+		greeting = "Hi " + ownerName + ","
 	}
-	body := `<div style="font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:560px">
-  <h2 style="margin:0 0 12px">Access request</h2>
-  <p>` + greeting + `,</p>
-  <p><strong>` + escapeHTML(requesterEmail) + `</strong> is requesting <strong>` + escapeHTML(role) +
-		`</strong> access to <strong>` + escapeHTML(fileName) + `</strong>.</p>`
-	if message != "" {
-		body += `<blockquote style="margin:12px 0;padding:8px 12px;border-left:3px solid #e5e7eb;color:#4b5563">` +
-			escapeHTML(message) + `</blockquote>`
-	}
-	body += `<p>Open <a href="` + appURL("/settings/access-requests") +
-		`">your access requests inbox</a> to approve or deny.</p>
-  <p style="color:#6b7280;font-size:12px">You're receiving this because you own the file in question.</p>
-</div>`
-	return body
+	intro := requesterEmail + " is requesting " + role +
+		" access to \"" + fileName + "\" on your Drive360 workspace."
+	return emailpkg.Render(emailpkg.Branded{
+		PreviewText:   requesterEmail + " wants " + role + " access to " + fileName,
+		Title:         "Access request",
+		Greeting:      greeting,
+		Paragraphs:    []string{intro, "Approve or deny it from your access requests inbox."},
+		Quote:         message,
+		CTAText:       "Review request",
+		CTAURL:        appURL("/settings/access-requests"),
+		SecondaryNote: "If you didn't expect this, you can deny the request — the requester will be notified.",
+		Reason:        "You're receiving this because you own \"" + fileName + "\".",
+	})
 }
 
-func buildRequesterDecisionHTML(name, fileName, role, decision string) string {
-	greeting := "Hi"
+func buildRequesterDecisionEmail(name, fileName, role, decision string) (string, string) {
+	greeting := "Hi,"
 	if name != "" {
-		greeting = "Hi " + name
+		greeting = "Hi " + name + ","
 	}
-	color := "#16a34a"
+	verb := "approved"
+	cta := "Open the file"
+	url := appURL("/drive")
+	note := "You can now open the file from your Drive."
 	if decision == "denied" {
-		color = "#dc2626"
+		verb = "denied"
+		cta = ""
+		url = ""
+		note = "If you still need access, reach out to the file's owner directly."
 	}
-	cta := ""
-	if decision == "approved" {
-		cta = `<p>Open the file: <a href="` + appURL("/drive") + `">go to Drive</a>.</p>`
-	}
-	return `<div style="font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:560px">
-  <h2 style="margin:0 0 12px">Access request ` + decision + `</h2>
-  <p>` + greeting + `,</p>
-  <p>Your request for <strong>` + escapeHTML(role) + `</strong> access to
-     <strong>` + escapeHTML(fileName) + `</strong> was
-     <span style="color:` + color + `;font-weight:600">` + decision + `</span>.</p>
-  ` + cta + `
-</div>`
+	intro := "Your request for " + role + " access to \"" +
+		fileName + "\" was " + verb + "."
+	return emailpkg.Render(emailpkg.Branded{
+		PreviewText:   "Your access request was " + verb + ".",
+		Title:         "Access request " + verb,
+		Greeting:      greeting,
+		Paragraphs:    []string{intro, note},
+		CTAText:       cta,
+		CTAURL:        url,
+		Reason:        "You're receiving this because you requested access to a file on a Drive360 workspace.",
+	})
 }
 
 func appURL(path string) string {
@@ -461,10 +463,6 @@ func appURL(path string) string {
 	}
 	return base + path
 }
-
-// escapeHTML wraps html.EscapeString — split out so the email builders
-// read top-to-bottom without an import-heavy aside.
-func escapeHTML(s string) string { return html.EscapeString(s) }
 
 // HasPendingRequest returns true iff the caller has an open request
 // on the given file. Used by the TemplateViewer to toggle the

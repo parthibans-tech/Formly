@@ -218,6 +218,9 @@ func (h *Handler) StartDunningLoop(ctx context.Context, interval time.Duration) 
 		// Run once at start so dev/staging sees something happen
 		// without waiting an hour.
 		h.RunDunning(ctx)
+		if h.OnDunningTick != nil {
+			h.OnDunningTick()
+		}
 		for {
 			select {
 			case <-ctx.Done():
@@ -230,6 +233,9 @@ func (h *Handler) StartDunningLoop(ctx context.Context, interval time.Duration) 
 						}
 					}()
 					h.RunDunning(ctx)
+					if h.OnDunningTick != nil {
+						h.OnDunningTick()
+					}
 				}()
 			}
 		}
