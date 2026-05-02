@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"os"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -163,6 +164,131 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		OneTime:         req.OneTime,
 		DownloadLimit:   dlLimit,
 	})
+}
+
+// InternalCreateOptions is the input shape for CreateInternal — the
+// non-HTTP path used by background flows (e.g. the auto-share-link
+// produced by generate.delivery on every successful render).
+//
+// Mirrors createReq + the surrounding HTTP-handler context (orgID,
+// fileID, userID) so background callers don't have to fabricate
+// request/response objects to mint a link.
+type InternalCreateOptions struct {
+	OrgID         string
+	UserID        string // creator; "" for system-generated links
+	FileID        string
+	Role          string // viewer | downloader; defaults to viewer
+	ExpiresIn     int    // seconds; 0 = no expiry
+	Password      string
+	OneTime       bool
+	DownloadLimit int
+}
+
+// InternalCreateResult carries enough back to render a public URL
+// and stash IDs in event payloads. The URL itself is built from
+// APP_URL + "/share/<token>" so the caller doesn't have to know
+// the public path layout.
+type InternalCreateResult struct {
+	ShareID string
+	Token   string
+	URL     string
+}
+
+// CreateInternal mints a share link without an HTTP request — the
+// counterpart to Create() for background callers like the post-render
+// auto-share-link flow.  All policy logic (role validation, password
+// hashing, expiry calculation) is identical to the HTTP path; the
+// only difference is who's reporting the audit row (no http.Request
+// → audit row is skipped here, since there's no actor IP / UA to
+// capture; the caller's own audit trail covers the higher-level
+// "render produced a share link" event).
+func (h *Handler) CreateInternal(ctx context.Context, opts InternalCreateOptions) (InternalCreateResult, error) {
+	role := opts.Role
+	if role == "" {
+		role = "viewer"
+	}
+	if role != "viewer" && role != "downloader" {
+		return InternalCreateResult{}, errInvalidRole
+	}
+
+	token, err := randomToken(24)
+	if err != nil {
+		return InternalCreateResult{}, err
+	}
+
+	var expires *time.Time
+	if opts.ExpiresIn > 0 {
+		t := time.Now().Add(time.Duration(opts.ExpiresIn) * time.Second)
+		expires = &t
+	}
+
+	var passwordHash *string
+	if opts.Password != "" {
+		ph, err := bcrypt.GenerateFromPassword([]byte(opts.Password), 12)
+		if err != nil {
+			return InternalCreateResult{}, err
+		}
+		s := string(ph)
+		passwordHash = &s
+	}
+	var dlLimit *int
+	if opts.DownloadLimit > 0 {
+		n := opts.DownloadLimit
+		dlLimit = &n
+	}
+
+	// NULLIF(...) on UserID so we can record "system-generated"
+	// links cleanly — created_by is nullable in the schema.
+	var createdBy any
+	if opts.UserID != "" {
+		createdBy = opts.UserID
+	}
+
+	var id string
+	err = h.DB.QueryRow(ctx,
+		`INSERT INTO share_links
+		   (org_id, file_id, token, role, expires_at, created_by,
+		    password_hash, one_time, download_limit)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+		opts.OrgID, opts.FileID, token, role, expires, createdBy,
+		passwordHash, opts.OneTime, dlLimit,
+	).Scan(&id)
+	if err != nil {
+		return InternalCreateResult{}, err
+	}
+
+	return InternalCreateResult{
+		ShareID: id,
+		Token:   token,
+		URL:     publicShareURL(token),
+	}, nil
+}
+
+// errInvalidRole is the sentinel returned by CreateInternal when the
+// role isn't one of the two allowed values. Exported via Errors()
+// helpers if callers need to discriminate, but most just propagate.
+var errInvalidRole = invalidRoleError("role must be viewer or downloader")
+
+type invalidRoleError string
+
+func (e invalidRoleError) Error() string { return string(e) }
+
+// publicShareURL builds the public link from APP_URL. Mirrors the
+// access-request appURL helper (kept duplicated rather than shared
+// to avoid a cross-file dependency for one-line getenv lookup).
+func publicShareURL(token string) string {
+	base := osGetenv("APP_URL")
+	if base == "" {
+		base = "http://localhost:3000"
+	}
+	return base + "/share/" + token
+}
+
+// osGetenv is a thin pass-through so tests can stub APP_URL without
+// touching process env. Keeps tests deterministic when run in
+// parallel with other code that may also touch APP_URL.
+var osGetenv = func(k string) string {
+	return os.Getenv(k)
 }
 
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {

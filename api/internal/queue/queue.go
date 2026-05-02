@@ -92,6 +92,19 @@ type GenerateOnePayload struct {
 	Flatten    *bool  `json:"flatten,omitempty"`
 	OutputName string `json:"outputName,omitempty"`
 	OutputPath string `json:"outputPath,omitempty"`
+	// SaveToDrive mirrors the sync handler's req.SaveToDrive — pointer
+	// so nil = "use legacy default of true", &false = "render to an
+	// ephemeral presigned URL only, don't persist". Without this field
+	// every async render unconditionally saved to Drive even when the
+	// caller asked for an ephemeral one. The worker hands it through
+	// to RunOptions.Persist verbatim.
+	SaveToDrive *bool `json:"saveToDrive,omitempty"`
+	// Security mirrors the sync handler's per-call security override
+	// (passwords, encryption, permissions). Stored as raw JSON so this
+	// package doesn't need a build-time dep on the generate package
+	// (which itself imports queue indirectly via the worker). The
+	// worker re-decodes into generate.SecurityOverride at consume time.
+	Security json.RawMessage `json:"security,omitempty"`
 }
 
 // GenerateBatchPayload references a previously-uploaded tabular input via

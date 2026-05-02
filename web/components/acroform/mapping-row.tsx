@@ -5,7 +5,7 @@
 // per-field flatten toggle, inspector trigger, live preview, and inline
 // validation errors.
 
-import { forwardRef, useMemo, useState } from "react";
+import { forwardRef, memo, useCallback, useMemo, useState } from "react";
 import {
   AlertCircle,
   ChevronDown,
@@ -38,20 +38,26 @@ type Props = {
   sampleData: Record<string, any>;
   selectedCount?: number;
   errors?: FieldError[];
-  onSelect: () => void;
-  onChange: (patch: Partial<AcroMapping>) => void;
-  onOpenInspector: () => void;
-  onToggleMultiSelect?: () => void;
+  // Stable parent callbacks — they take the field name as the first
+  // argument so a single parent function works for every row, which is
+  // what makes React.memo on MappingRow effective. Closure-per-row
+  // callbacks would change identity on every parent render, defeating
+  // memoization at exactly the field counts where it matters most.
+  onSelect: (name: string) => void;
+  onChange: (name: string, patch: Partial<AcroMapping>) => void;
+  onOpenInspector: (field: AcroFormField) => void;
+  onToggleMultiSelect?: (name: string) => void;
   multiSelected?: boolean;
-  // Only provided for rect-less ("supplement-only") fields — the ones
+  // Only set true for rect-less ("supplement-only") fields — the ones
   // pdfcpu's FormFields API surfaced but the /Annots walker couldn't
   // geometrically locate. Clicking hands the designer the field name
   // so the next drawn rectangle binds to this field instead of
-  // creating a new one.
-  onPlace?: () => void;
+  // creating a new one. Always passed; row decides whether to show
+  // the Place button based on `field.rect`.
+  onPlace?: (name: string) => void;
 };
 
-export const MappingRow = forwardRef<HTMLDivElement, Props>(function MappingRow(
+export const MappingRow = memo(forwardRef<HTMLDivElement, Props>(function MappingRow(
   {
     field,
     mapping,
@@ -73,6 +79,27 @@ export const MappingRow = forwardRef<HTMLDivElement, Props>(function MappingRow(
     !!mapping.validation || !!mapping.fillWhen
   );
 
+  // Local stable handlers that adapt the parent's name-keyed callbacks
+  // back to the inline event-handler shape the JSX uses. These are
+  // memoized on field.name so they don't change identity unless the
+  // row's underlying field changes — keeping React.memo effective for
+  // the heavier sub-trees (TransformEditor, ValidationRulesEditor).
+  const handleSelect = useCallback(() => onSelect(field.name), [onSelect, field.name]);
+  const handleChange = useCallback(
+    (patch: Partial<AcroMapping>) => onChange(field.name, patch),
+    [onChange, field.name]
+  );
+  const handleOpenInspector = useCallback(
+    () => onOpenInspector(field),
+    [onOpenInspector, field]
+  );
+  const handleToggleMulti = useCallback(() => {
+    if (onToggleMultiSelect) onToggleMultiSelect(field.name);
+  }, [onToggleMultiSelect, field.name]);
+  const handlePlace = useCallback(() => {
+    if (onPlace) onPlace(field.name);
+  }, [onPlace, field.name]);
+
   const preview = useMemo(() => {
     if (!mapping.dataKey) return null;
     const raw = sampleData[mapping.dataKey] ?? mapping.default;
@@ -86,12 +113,23 @@ export const MappingRow = forwardRef<HTMLDivElement, Props>(function MappingRow(
   return (
     <div
       ref={ref}
-      onClick={onSelect}
+      onClick={handleSelect}
       className={cn(
         "cursor-pointer space-y-3 p-4 transition-colors",
         selected ? "bg-primary/5" : "hover:bg-muted/30",
         hasErrors && "border-l-2 border-l-red-500"
       )}
+      // Native browser-level virtualization. `content-visibility: auto`
+      // tells the browser it can skip rendering work (layout, style,
+      // paint) for off-screen rows entirely; `contain-intrinsic-size`
+      // gives it a placeholder size to use until it has actually laid
+      // the row out, so the scrollbar stays stable. At 1000+ rows this
+      // is what keeps scroll responsive without us writing a custom
+      // virtualizer. Supported in all modern browsers.
+      style={{
+        contentVisibility: "auto",
+        containIntrinsicSize: "auto 240px",
+      }}
     >
       <div className="flex items-start justify-between gap-2">
         <div className="flex items-start gap-2 min-w-0">
@@ -101,7 +139,7 @@ export const MappingRow = forwardRef<HTMLDivElement, Props>(function MappingRow(
               className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-primary"
               checked={!!multiSelected}
               onClick={(e) => e.stopPropagation()}
-              onChange={onToggleMultiSelect}
+              onChange={handleToggleMulti}
               aria-label={`Select ${field.name}`}
             />
           )}
@@ -126,7 +164,7 @@ export const MappingRow = forwardRef<HTMLDivElement, Props>(function MappingRow(
                 className="h-5 w-5 p-0"
                 onClick={(e) => {
                   e.stopPropagation();
-                  onOpenInspector();
+                  handleOpenInspector();
                 }}
                 title="Inspect raw PDF metadata"
               >
@@ -148,7 +186,7 @@ export const MappingRow = forwardRef<HTMLDivElement, Props>(function MappingRow(
                 className="mt-1 h-6 gap-1 px-2 text-[11px]"
                 onClick={(e) => {
                   e.stopPropagation();
-                  onPlace!();
+                  handlePlace();
                 }}
                 title="Draw a rectangle on the PDF to position this field"
               >
@@ -167,7 +205,7 @@ export const MappingRow = forwardRef<HTMLDivElement, Props>(function MappingRow(
               type="checkbox"
               className="h-3.5 w-3.5 accent-primary"
               checked={!!mapping.required}
-              onChange={(e) => onChange({ required: e.target.checked })}
+              onChange={(e) => handleChange({ required: e.target.checked })}
             />
             Required
           </label>
@@ -175,7 +213,7 @@ export const MappingRow = forwardRef<HTMLDivElement, Props>(function MappingRow(
             type="button"
             onClick={(e) => {
               e.stopPropagation();
-              onChange({ flatten: mapping.flatten ? undefined : true });
+              handleChange({ flatten: mapping.flatten ? undefined : true });
             }}
             className={cn(
               "flex h-6 w-6 items-center justify-center rounded text-[10px]",
@@ -195,7 +233,7 @@ export const MappingRow = forwardRef<HTMLDivElement, Props>(function MappingRow(
             className="h-8 font-mono text-xs"
             placeholder="data key"
             value={mapping.dataKey}
-            onChange={(e) => onChange({ dataKey: e.target.value })}
+            onChange={(e) => handleChange({ dataKey: e.target.value })}
           />
         </div>
         <div className="space-y-1">
@@ -204,7 +242,7 @@ export const MappingRow = forwardRef<HTMLDivElement, Props>(function MappingRow(
             className="h-8 text-xs"
             placeholder="(none)"
             value={mapping.default || ""}
-            onChange={(e) => onChange({ default: e.target.value })}
+            onChange={(e) => handleChange({ default: e.target.value })}
           />
         </div>
       </div>
@@ -217,11 +255,11 @@ export const MappingRow = forwardRef<HTMLDivElement, Props>(function MappingRow(
           onChange={(t) => {
             if (Array.isArray(t)) {
               const pipeline = normalizePipeline(t);
-              if (pipeline.length === 0) onChange({ transform: undefined });
-              else if (pipeline.length === 1) onChange({ transform: pipeline[0] });
-              else onChange({ transform: pipeline });
+              if (pipeline.length === 0) handleChange({ transform: undefined });
+              else if (pipeline.length === 1) handleChange({ transform: pipeline[0] });
+              else handleChange({ transform: pipeline });
             } else {
-              onChange({ transform: t.op === "none" ? undefined : t });
+              handleChange({ transform: t.op === "none" ? undefined : t });
             }
           }}
         />
@@ -245,13 +283,13 @@ export const MappingRow = forwardRef<HTMLDivElement, Props>(function MappingRow(
             <ValidationRulesEditor
               value={mapping.validation}
               field={field}
-              onChange={(rule) => onChange({ validation: rule })}
+              onChange={(rule) => handleChange({ validation: rule })}
             />
             <ConditionalEditor
               value={mapping.fillWhen}
               allFieldDataKeys={allFieldDataKeys}
               sampleData={sampleData}
-              onChange={(expr) => onChange({ fillWhen: expr })}
+              onChange={(expr) => handleChange({ fillWhen: expr })}
             />
           </div>
         )}
@@ -276,4 +314,4 @@ export const MappingRow = forwardRef<HTMLDivElement, Props>(function MappingRow(
       ) : null}
     </div>
   );
-});
+}));

@@ -114,6 +114,7 @@ import {
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { useConfirm } from "@/components/ui/confirm";
 import { usePrompt } from "@/components/ui/prompt";
+import { useFolderPicker } from "@/components/folder-picker";
 import { createHtmlTemplate } from "@/lib/create-html";
 import { createDocTemplate } from "@/lib/create-doc";
 import { createMarkdownTemplate } from "@/lib/create-markdown";
@@ -203,6 +204,7 @@ export default function DrivePage() {
   const toast = useToast();
   const confirm = useConfirm();
   const prompt = usePrompt();
+  const pickFolder = useFolderPicker();
   const searchParams = useSearchParams();
   const currentFolderId = searchParams.get("folder") || "";
 
@@ -782,22 +784,26 @@ export default function DrivePage() {
   }
 
   async function moveFile(file: FileItem) {
-    const target = await prompt({
+    // Replaced the legacy "paste a folder ID" prompt with the visual
+    // folder browser. The picker starts at the file's current folder
+    // (or root) so the user can confirm-in-place if they only opened
+    // it to check, and disables the Confirm button if they navigate
+    // back to where the file already lives.
+    const result = await pickFolder({
       title: `Move "${file.name}"`,
       description:
-        "Paste a folder ID from its URL, or leave blank to move to the root.",
-      label: "Target folder ID",
-      defaultValue: file.folderId || "",
-      placeholder: "Leave empty for root",
-      confirmLabel: "Move",
+        "Choose a destination folder. Browse the tree, search, or create a new sub-folder inline.",
+      confirmLabel: "Move here",
+      currentFolderId: file.folderId ?? null,
+      startAtFolderId: file.folderId ?? null,
     });
-    if (target === null) return;
+    if (result === null) return;
     try {
       await api(`/v1/files/${file.id}`, {
         method: "PATCH",
-        body: JSON.stringify({ folderId: target.trim() || null }),
+        body: JSON.stringify({ folderId: result.folderId }),
       });
-      toast.show("success", "File moved");
+      toast.show("success", `Moved to ${result.folderName}`);
       await load();
     } catch (e: any) {
       toast.show("error", e.message);
@@ -1592,20 +1598,19 @@ export default function DrivePage() {
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  onClick={load}
-                  aria-label="Refresh"
-                  className="h-9 w-9"
-                >
-                  <RefreshCw className="h-4 w-4" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>Refresh</TooltipContent>
-            </Tooltip>
+            {/* Labelled Refresh button — paired text + icon to match
+                the rest of the toolbar (New folder, Upload, etc.) so
+                the action is immediately recognisable instead of
+                hiding behind a hover-only tooltip. */}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={load}
+              className="h-9"
+            >
+              <RefreshCw className="h-4 w-4" />
+              Refresh
+            </Button>
             <Button
               variant="outline"
               size="sm"

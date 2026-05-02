@@ -100,6 +100,19 @@ func InjectAcroForm(pdfBytes []byte, widgets []Widget) ([]byte, error) {
 			"checkbox", "radio", "dropdown",
 			"signature-field", "button":
 			fields = append(fields, w)
+		case "comb":
+			// AcroForm /Comb is fundamentally equal-pitch — the PDF
+			// spec divides the field's /Rect into MaxLen equal cells
+			// regardless of any per-cell hint we could attach. So if
+			// the designer set variable per-cell widths, fall through
+			// to the static renderer (which respects cellWidths) and
+			// skip the AcroForm field entirely. Equal-pitch combs
+			// still take the AcroForm path and get a real interactive
+			// field.
+			if hasVariableCellWidths(w.Props) {
+				continue
+			}
+			fields = append(fields, w)
 		}
 	}
 	if len(fields) == 0 {
@@ -277,6 +290,25 @@ func buildWidgetAnnot(xrt *model.XRefTable, wd Widget) (*types.IndirectRef, erro
 		if maxLen := intProp(props, "acroMaxLen"); maxLen > 0 {
 			d["MaxLen"] = types.Integer(maxLen)
 		}
+		if aa := buildWidgetAA(props); aa != nil {
+			d["AA"] = aa
+		}
+
+	case "comb":
+		// Character-grid widget — injected as a /Tx field with /MaxLen
+		// equal to the cell count and the /Ff Comb flag set (handled in
+		// buildFieldFlags). PDF readers that respect /Comb will then
+		// distribute one character per cell automatically. /MaxLen is
+		// also enforced as the input cap.
+		d["FT"] = types.Name("Tx")
+		d["T"] = types.StringLiteral(safeFieldName(wd.DataKey))
+		d["V"] = types.StringLiteral("")
+		d["DV"] = types.StringLiteral("")
+		cells := intProp(props, "cells")
+		if cells <= 0 {
+			cells = 10
+		}
+		d["MaxLen"] = types.Integer(cells)
 		if aa := buildWidgetAA(props); aa != nil {
 			d["AA"] = aa
 		}
@@ -489,6 +521,11 @@ func buildFieldFlags(widgetType string, props map[string]interface{}) int {
 		flags |= afMultiline
 	}
 	if widgetType == "text" && boolProp(props, "acroComb", false) {
+		flags |= afComb
+	}
+	// Native comb widget always sets the /Ff Comb flag — the whole
+	// point of the type is one-character-per-cell rendering.
+	if widgetType == "comb" {
 		flags |= afComb
 	}
 	if widgetType == "dropdown" {
@@ -868,4 +905,20 @@ func safeFieldName(s string) string {
 		return "field"
 	}
 	return s
+}
+
+// hasVariableCellWidths reports whether a comb widget has a per-cell
+// width array. We treat the array as authoritative regardless of the
+// values inside — if the designer pushed widths, the AcroForm path
+// can't honour them, so the widget should fall through to static.
+func hasVariableCellWidths(props map[string]interface{}) bool {
+	v, ok := props["cellWidths"]
+	if !ok {
+		return false
+	}
+	arr, ok := v.([]interface{})
+	if !ok {
+		return false
+	}
+	return len(arr) >= 2
 }

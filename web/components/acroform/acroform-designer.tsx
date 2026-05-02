@@ -6,7 +6,7 @@
 //   • sectioned, bulk-editable, live-preview mapping rows (right)
 //   • auto-map dialog, schema export, field inspector
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 // useDebouncedValue — trailing-edge debounce. We only care about the
 // final value after the user stops typing, so leading-edge behavior
@@ -193,6 +193,44 @@ export function AcroFormDesigner({
   const [statusFilter, setStatusFilter] = useState<"all" | "unmapped" | "errors">("all");
   const debouncedSearch = useDebouncedValue(searchQuery, 150);
 
+  // Page-aware mapping panel controls. At 500+ pages with hundreds of
+  // fields the flat (or even section-grouped) list is unusable. Two
+  // controls fix this:
+  //   • groupBy = "page" turns each PDF page into its own collapsible
+  //     section, mirroring how users actually think about long forms.
+  //   • onlyCurrentPage narrows the panel to whatever page the PDF
+  //     viewer is currently looking at — so scrolling the PDF
+  //     scrolls the mapping list with it.
+  // Defaults: when there are >1 pages the page-grouped view is the
+  // friendlier default; otherwise we keep the legacy section view.
+  const [groupBy, setGroupBy] = useState<"section" | "page" | "none">("section");
+  const [onlyCurrentPage, setOnlyCurrentPage] = useState<boolean>(false);
+  // Currently-visible top page in the PDF preview, fed back from
+  // PdfPreview's IntersectionObserver. Drives the "current page only"
+  // filter and the contextual page-jump button on the mapping panel.
+  const [currentPage, setCurrentPage] = useState<number>(1);
+  // PDF download progress (0..1, or null while no progress events seen
+  // yet / once the load is complete). Surfaced as a thin progress bar
+  // above the mapping list so the user has feedback during the long
+  // initial fetch of a 500-page PDF.
+  const [pdfProgress, setPdfProgress] = useState<number | null>(null);
+
+  // Auto-pick a sensible default group mode once we know how many pages
+  // the field set spans. > 5 pages → "page" is more navigable than the
+  // section view, especially since most templates haven't bothered to
+  // assign sections. Runs once on mount; the user can flip it any time.
+  const initialGroupRef = useRef(false);
+  useEffect(() => {
+    if (initialGroupRef.current) return;
+    if (tpl.fields.length === 0) return;
+    initialGroupRef.current = true;
+    let maxPage = 0;
+    for (const f of tpl.fields) {
+      if (f.page > maxPage) maxPage = f.page;
+    }
+    if (maxPage > 5) setGroupBy("page");
+  }, [tpl.fields]);
+
   // Tier C — structure edit mode.
   // Fields state can drift from tpl.fields when patches are queued locally:
   // the overlay shows `localFields` while a Save roundtrips; the server then
@@ -320,10 +358,61 @@ export function AcroFormDesigner({
   }, [history]);
 
   const rowRefs = useRef<Record<string, HTMLDivElement | null>>({});
-  const allDataKeys = useMemo(
-    () => Object.values(mappings).map((m) => m.dataKey).filter(Boolean),
-    [mappings]
+  // allDataKeys feeds every row's TransformEditor autocomplete. Without
+  // content-stability the array identity flips on every keystroke,
+  // which would defeat React.memo on MappingRow at exactly the field
+  // counts where memoization matters most. We stabilise it via a join-
+  // key compare: same string ⇒ same array reference.
+  const allDataKeysRef = useRef<string[]>([]);
+  const allDataKeysJoinedRef = useRef<string>("");
+  const allDataKeys = useMemo(() => {
+    const next = Object.values(mappings)
+      .map((m) => m.dataKey)
+      .filter(Boolean) as string[];
+    const joined = next.join("\u0001");
+    if (joined === allDataKeysJoinedRef.current) return allDataKeysRef.current;
+    allDataKeysJoinedRef.current = joined;
+    allDataKeysRef.current = next;
+    return next;
+  }, [mappings]);
+
+  // Identity-stable callbacks for MappingRow. The list re-renders on
+  // every keystroke (search, mapping edits, validation), so passing
+  // fresh closures per row would defeat React.memo on MappingRow at
+  // exactly the field counts where memoization matters most.
+  //
+  // We pin each handler to the "latest ref" pattern: a ref holds the
+  // most recent implementation, the exposed callback reads through the
+  // ref. The exposed callback never changes identity, but always calls
+  // the freshest logic. Effectively free per render — just a ref write.
+  const selectFieldRef = useRef<(name: string, source?: "pdf" | "list") => void>(
+    () => {}
   );
+  const updateMappingRef = useRef<(name: string, patch: Partial<AcroMapping>) => void>(
+    () => {}
+  );
+  const toggleMultiSelectRef = useRef<(name: string) => void>(() => {});
+  const startPlaceFieldRef = useRef<(name: string) => void>(() => {});
+  const openInspectorRef = useRef<(field: AcroFormField) => void>(() => {});
+
+  const stableOnSelect = useCallback((name: string) => {
+    selectFieldRef.current(name, "list");
+  }, []);
+  const stableOnChange = useCallback(
+    (name: string, patch: Partial<AcroMapping>) => {
+      updateMappingRef.current(name, patch);
+    },
+    []
+  );
+  const stableOnToggleMulti = useCallback((name: string) => {
+    toggleMultiSelectRef.current(name);
+  }, []);
+  const stableOnPlace = useCallback((name: string) => {
+    startPlaceFieldRef.current(name);
+  }, []);
+  const stableOnOpenInspector = useCallback((field: AcroFormField) => {
+    openInspectorRef.current(field);
+  }, []);
 
   // Pre-index fields by their page number. The overlay was previously
   // doing `fields.filter(f => f.page === pageNum)` for every rendered
@@ -390,6 +479,7 @@ export function AcroFormDesigner({
     };
     const q = debouncedSearch.trim().toLowerCase();
     const matches = (f: AcroFormField) => {
+      if (onlyCurrentPage && f.page !== currentPage) return false;
       if (q) {
         const m = mappings[f.name];
         const hay = [
@@ -414,13 +504,32 @@ export function AcroFormDesigner({
     const filtered = localFields.filter(matches);
     filtered.sort(readingOrder);
     const m = new Map<string, AcroFormField[]>();
+    // Group key strategy. "page" → "Page N" headers; "section" → user
+    // section labels; "none" → a single ungrouped bucket so the list
+    // is just a flat sorted view (handy when filtering tightly).
     for (const f of filtered) {
-      const section = mappings[f.name]?.section || "";
-      if (!m.has(section)) m.set(section, []);
-      m.get(section)!.push(f);
+      let key: string;
+      if (groupBy === "page") {
+        key = `Page ${f.page}`;
+      } else if (groupBy === "none") {
+        key = "";
+      } else {
+        key = mappings[f.name]?.section || "";
+      }
+      if (!m.has(key)) m.set(key, []);
+      m.get(key)!.push(f);
     }
     return m;
-  }, [localFields, mappings, debouncedSearch, statusFilter, errorsByField]);
+  }, [
+    localFields,
+    mappings,
+    debouncedSearch,
+    statusFilter,
+    errorsByField,
+    groupBy,
+    onlyCurrentPage,
+    currentPage,
+  ]);
 
   // Total number of rows that will render after filtering. Used to decide
   // whether to auto-collapse sections (at huge field counts, expanded
@@ -781,6 +890,16 @@ export function AcroFormDesigner({
     setEditMode("draw");
     setSelectedField(name);
   }
+
+  // Refresh the latest-ref handlers on every render. Cheap (5 ref
+  // writes) and pays for itself by letting the MappingRow list memoize
+  // — without this, every re-render hands MappingRow new closure
+  // identities and re-renders all rows even when nothing changed.
+  selectFieldRef.current = selectField;
+  updateMappingRef.current = updateMapping;
+  toggleMultiSelectRef.current = toggleMultiSelect;
+  startPlaceFieldRef.current = startPlaceField;
+  openInspectorRef.current = setInspectorField;
 
   // Cancel placement — leaves the field rect-less and drops back to
   // select mode.
@@ -1324,6 +1443,16 @@ export function AcroFormDesigner({
         <section className="flex-1 border-r">
           <PdfPreview
             url={localPreviewUrl}
+            onCurrentPageChange={setCurrentPage}
+            onLoadProgress={(loaded, total) => {
+              if (total > 0) setPdfProgress(Math.min(1, loaded / total));
+              else setPdfProgress(null);
+              if (total > 0 && loaded >= total) {
+                // Drop the bar once the load completes — keeping it
+                // pinned at 100% just adds noise.
+                setPdfProgress(null);
+              }
+            }}
             overlayForPage={(rp) => (
               <FieldOverlay
                 page={rp}
@@ -1435,6 +1564,63 @@ export function AcroFormDesigner({
                 ))}
               </div>
             </div>
+            {/* Group-by + page-aware filters. The page filter is the
+                heaviest hitter at 500-page docs — it caps the visible
+                row count to one page's fields no matter how many
+                thousand fields the doc has. */}
+            <div className="mt-2 flex items-center gap-2 text-[10px]">
+              <div className="flex items-center gap-0.5 rounded-md border p-0.5">
+                <span className="px-1 uppercase tracking-wide text-muted-foreground">
+                  Group
+                </span>
+                {(
+                  [
+                    ["section", "Section"],
+                    ["page", "Page"],
+                    ["none", "None"],
+                  ] as const
+                ).map(([key, label]) => (
+                  <button
+                    key={key}
+                    type="button"
+                    onClick={() => setGroupBy(key)}
+                    className={cn(
+                      "rounded px-1.5 py-0.5",
+                      groupBy === key
+                        ? "bg-muted font-semibold text-foreground"
+                        : "text-muted-foreground hover:text-foreground"
+                    )}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <label
+                className="flex cursor-pointer items-center gap-1 rounded-md border px-1.5 py-1"
+                title="Only show fields on the page currently visible in the PDF preview"
+              >
+                <input
+                  type="checkbox"
+                  className="h-3 w-3 accent-primary"
+                  checked={onlyCurrentPage}
+                  onChange={(e) => setOnlyCurrentPage(e.target.checked)}
+                />
+                <span className="text-muted-foreground">
+                  Page {currentPage} only
+                </span>
+              </label>
+            </div>
+            {pdfProgress !== null && (
+              <div
+                className="mt-2 h-1 w-full overflow-hidden rounded-full bg-muted"
+                aria-label="PDF download progress"
+              >
+                <div
+                  className="h-full bg-primary transition-[width] duration-150"
+                  style={{ width: `${Math.round(pdfProgress * 100)}%` }}
+                />
+              </div>
+            )}
           </div>
 
           {localFields.length === 0 ? (
@@ -1477,16 +1663,14 @@ export function AcroFormDesigner({
                               mapping={m}
                               selected={selectedField === f.name}
                               multiSelected={multiSelected.has(f.name)}
-                              onToggleMultiSelect={() => toggleMultiSelect(f.name)}
+                              onToggleMultiSelect={stableOnToggleMulti}
                               allFieldDataKeys={allDataKeys}
                               sampleData={sampleData}
                               errors={errorsByField[f.name]}
-                              onSelect={() => selectField(f.name, "list")}
-                              onChange={(patch) => updateMapping(f.name, patch)}
-                              onOpenInspector={() => setInspectorField(f)}
-                              onPlace={
-                                !f.rect ? () => startPlaceField(f.name) : undefined
-                              }
+                              onSelect={stableOnSelect}
+                              onChange={stableOnChange}
+                              onOpenInspector={stableOnOpenInspector}
+                              onPlace={!f.rect ? stableOnPlace : undefined}
                             />
                           );
                         })}

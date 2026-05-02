@@ -40,7 +40,29 @@ type Props = {
   templateName?: string;           // used for download filenames
   usedKeys: string[];              // all widget dataKeys in the template
   selectedDataKey?: string;        // highlight when it matches
+  /**
+   * Label of the currently-selected widget (best human-readable name —
+   * the designer falls back to dataKey, then type, then "Untitled").
+   * Drives the "Bind to: <label>" status bar so users always know what
+   * a key click will mutate. Undefined when nothing is selected.
+   */
+  selectedWidgetLabel?: string;
+  /**
+   * `dataKey -> [widgetIds]` lookup. Powers two affordances:
+   *   1. Each leaf key shows a small "•N" badge indicating how many
+   *      widgets bind to it (catches accidental duplicate bindings).
+   *   2. When no widget is selected, clicking a key with bindings
+   *      jump-selects the widget instead of yelling "select first".
+   */
+  bindingsByKey?: Record<string, string[]>;
   onBind: (path: string) => void;  // click a leaf → bind to selected widget
+  /**
+   * Reverse-navigation hook. Called when the user clicks a leaf key
+   * with no widget selected and the key has at least one binding —
+   * the designer selects the first bound widget and scrolls it into
+   * view. Falls back to no-op when omitted (legacy behavior).
+   */
+  onSelectByKey?: (path: string) => void;
   onEditSample: () => void;        // "Edit sample" opens textarea elsewhere
   onSyncSample: () => void;        // add missing widget keys into the sample
   onExportFull: () => void;        // export complete template config
@@ -51,7 +73,10 @@ export function SchemaPanel({
   templateName = "schema",
   usedKeys,
   selectedDataKey,
+  selectedWidgetLabel,
+  bindingsByKey,
   onBind,
+  onSelectByKey,
   onEditSample,
   onSyncSample,
   onExportFull,
@@ -147,6 +172,41 @@ export function SchemaPanel({
           </DropdownMenu>
         </div>
       </div>
+      {/* Selection status bar. Without this users couldn't tell whether
+          clicking a key would bind (widget selected) or just toast at
+          them ("select a widget first"). The bar reflects the live
+          selection so the action is predictable. */}
+      <div
+        className={
+          "mx-3 mb-2 rounded-md border px-2 py-1.5 text-[11px] " +
+          (selectedWidgetLabel
+            ? "border-primary/30 bg-primary/5 text-foreground"
+            : "border-dashed border-muted-foreground/30 bg-muted/30 text-muted-foreground")
+        }
+      >
+        {selectedWidgetLabel ? (
+          <>
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-primary/80">
+              Bind to:
+            </span>{" "}
+            <span className="font-medium">{selectedWidgetLabel}</span>
+            <div className="mt-0.5 text-[10px] text-muted-foreground">
+              Click any key below to set this widget&apos;s data binding.
+            </div>
+          </>
+        ) : (
+          <>
+            <span className="font-medium">No widget selected.</span>
+            <div className="mt-0.5 text-[10px]">
+              Select a widget on the canvas first — or click a key with a
+              <span className="mx-0.5 inline-block rounded bg-muted px-1 font-mono text-[9px]">
+                •N
+              </span>
+              badge to jump to its bound widget.
+            </div>
+          </>
+        )}
+      </div>
       <div className="px-3 pb-2">
         <div className="relative">
           <Search className="pointer-events-none absolute left-2 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground" />
@@ -209,7 +269,10 @@ export function SchemaPanel({
                 depth={0}
                 query={query.toLowerCase()}
                 selectedDataKey={selectedDataKey}
+                bindingsByKey={bindingsByKey}
+                hasSelection={!!selectedWidgetLabel}
                 onBind={onBind}
+                onSelectByKey={onSelectByKey}
               />
             ))}
             {tree.children?.length === 0 && (
@@ -229,13 +292,19 @@ function TreeNode({
   depth,
   query,
   selectedDataKey,
+  bindingsByKey,
+  hasSelection,
   onBind,
+  onSelectByKey,
 }: {
   node: SchemaNode;
   depth: number;
   query: string;
   selectedDataKey?: string;
+  bindingsByKey?: Record<string, string[]>;
+  hasSelection: boolean;
   onBind: (path: string) => void;
+  onSelectByKey?: (path: string) => void;
 }) {
   const [open, setOpen] = useState(depth < 2);
   const hasChildren = !!node.children && node.children.length > 0;
@@ -249,6 +318,23 @@ function TreeNode({
 
   const label = node.path.split(".").pop() || "root";
   const Icon = iconFor(node.kind);
+  const bindCount = bindingsByKey?.[node.path]?.length ?? 0;
+  // Decide what a click does. Two modes:
+  //   - widget selected → bind it to this key (existing behavior)
+  //   - nothing selected but key has bindings → reverse-jump to the
+  //     first widget bound to this key. Avoids the "select a widget
+  //     first" toast trap when the user is exploring.
+  const handleClick = () => {
+    if (hasSelection) {
+      onBind(node.path);
+    } else if (bindCount > 0 && onSelectByKey) {
+      onSelectByKey(node.path);
+    } else {
+      // No selection AND no binding to jump to → fall back to the
+      // existing onBind path so the parent can show its toast.
+      onBind(node.path);
+    }
+  };
 
   return (
     <li style={{ paddingLeft: depth * 10 }}>
@@ -276,12 +362,33 @@ function TreeNode({
         <Icon className="h-3 w-3 shrink-0 text-muted-foreground" />
         <button
           type="button"
-          onClick={() => onBind(node.path)}
+          onClick={handleClick}
           className="min-w-0 flex-1 truncate text-left font-mono"
-          title={node.path}
+          title={
+            hasSelection
+              ? `Bind selected widget to "${node.path}"`
+              : bindCount > 0
+                ? `Jump to widget bound to "${node.path}" (${bindCount} binding${bindCount === 1 ? "" : "s"})`
+                : node.path
+          }
         >
           {label}
         </button>
+        {/* Bind-count badge — only on leaves, only when ≥1 widget binds.
+            Tinted amber when >1 to flag duplicate bindings (often a bug). */}
+        {bindCount > 0 && !hasChildren && (
+          <span
+            className={cn(
+              "rounded px-1 text-[9px] font-semibold tabular-nums",
+              bindCount > 1
+                ? "bg-amber-100 text-amber-800"
+                : "bg-primary/15 text-primary"
+            )}
+            title={`${bindCount} widget${bindCount === 1 ? "" : "s"} bound to this key`}
+          >
+            ·{bindCount}
+          </span>
+        )}
         {node.kind !== "object" && node.kind !== "array" && (
           <span className="max-w-[120px] truncate text-[10px] text-muted-foreground">
             {formatSample(node.sample)}
@@ -297,7 +404,10 @@ function TreeNode({
               depth={depth + 1}
               query={query}
               selectedDataKey={selectedDataKey}
+              bindingsByKey={bindingsByKey}
+              hasSelection={hasSelection}
               onBind={onBind}
+              onSelectByKey={onSelectByKey}
             />
           ))}
         </ul>

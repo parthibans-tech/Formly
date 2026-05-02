@@ -95,6 +95,34 @@ type outputDoc struct {
 	FlattenDefault *bool `json:"flattenDefault,omitempty"`
 }
 
+// decorationsDoc surfaces the watermark / header / footer config so the
+// API guide can show integrators what's going to appear on every
+// rendered PDF before they hit /generate. We echo the literal text
+// (with placeholders intact) — there are no secrets in decorations,
+// and seeing "DRAFT" in the doc is the whole point. The placeholder
+// list is deduped across every text slot so the UI can flag
+// "you'll need these data keys for the watermark/footer to render".
+type decorationsDoc struct {
+	Watermark    *decorationsWatermarkDoc    `json:"watermark,omitempty"`
+	Header       *decorationsHeaderFooterDoc `json:"header,omitempty"`
+	Footer       *decorationsHeaderFooterDoc `json:"footer,omitempty"`
+	Placeholders []string                    `json:"placeholders,omitempty"`
+}
+
+type decorationsWatermarkDoc struct {
+	Text     string `json:"text,omitempty"`
+	Position string `json:"position,omitempty"`
+	Pages    string `json:"pages,omitempty"`
+}
+
+type decorationsHeaderFooterDoc struct {
+	Left            string `json:"left,omitempty"`
+	Center          string `json:"center,omitempty"`
+	Right           string `json:"right,omitempty"`
+	Pages           string `json:"pages,omitempty"`
+	ShowOnFirstPage *bool  `json:"showOnFirstPage,omitempty"`
+}
+
 // securityDoc surfaces the *shape* of security policy without leaking
 // passwords. Integrators need to know "this template enforces a print-
 // only PDF" without the API guide doubling as a credential dump.
@@ -108,6 +136,40 @@ type securityDoc struct {
 	Permissions map[string]bool `json:"permissions,omitempty"`
 }
 
+// deliveryDoc surfaces the post-render fan-out (auto-email + auto
+// share-link) so integrators see, before they call /generate, what
+// extra side-effects a successful render will trigger. We never echo
+// the share password — same logic as securityDoc, integrators don't
+// need a credential roundtrip just to render the API guide.
+type deliveryDoc struct {
+	Email *deliveryEmailDoc `json:"email,omitempty"`
+	Share *deliveryShareDoc `json:"share,omitempty"`
+	// Placeholders is the deduped list of {{key}}s referenced anywhere
+	// in the email recipients / subject / body. Same UX as outputDoc
+	// — integrators see the data keys they need to send for the
+	// auto-email step to resolve cleanly.
+	Placeholders []string `json:"placeholders,omitempty"`
+}
+
+type deliveryEmailDoc struct {
+	To                  []string `json:"to,omitempty"`
+	CC                  []string `json:"cc,omitempty"`
+	BCC                 []string `json:"bcc,omitempty"`
+	Subject             string   `json:"subject,omitempty"`
+	HasBody             bool     `json:"hasBody"`
+	AttachPDF           bool     `json:"attachPDF"`
+	IncludeDownloadLink bool     `json:"includeDownloadLink,omitempty"`
+	IncludeShareLink    bool     `json:"includeShareLink,omitempty"`
+}
+
+type deliveryShareDoc struct {
+	Role            string `json:"role,omitempty"`
+	ExpiresIn       int    `json:"expiresIn,omitempty"`       // seconds; 0 = never
+	PasswordProtect bool   `json:"passwordProtected,omitempty"`
+	OneTime         bool   `json:"oneTime,omitempty"`
+	DownloadLimit   int    `json:"downloadLimit,omitempty"`
+}
+
 // SchemaResp is the full payload for /v1/templates/:id/schema.
 type SchemaResp struct {
 	TemplateID   string                 `json:"templateId"`
@@ -119,6 +181,8 @@ type SchemaResp struct {
 	Example      map[string]interface{} `json:"example"`    // a filled-in example payload
 	Output       *outputDoc             `json:"output,omitempty"`
 	Security     *securityDoc           `json:"security,omitempty"`
+	Decorations  *decorationsDoc        `json:"decorations,omitempty"`
+	Delivery     *deliveryDoc           `json:"delivery,omitempty"`
 	Notes        []string               `json:"notes,omitempty"`
 }
 
@@ -156,6 +220,48 @@ func (h *Handler) Schema(w http.ResponseWriter, r *http.Request) {
 			Encryption    string                 `json:"encryption"`
 			Permissions   map[string]interface{} `json:"permissions"`
 		} `json:"security"`
+		Decorations *struct {
+			Watermark *struct {
+				Text     string `json:"text"`
+				Position string `json:"position"`
+				Pages    string `json:"pages"`
+			} `json:"watermark"`
+			Header *struct {
+				Left            string `json:"left"`
+				Center          string `json:"center"`
+				Right           string `json:"right"`
+				Pages           string `json:"pages"`
+				ShowOnFirstPage *bool  `json:"showOnFirstPage"`
+			} `json:"header"`
+			Footer *struct {
+				Left            string `json:"left"`
+				Center          string `json:"center"`
+				Right           string `json:"right"`
+				Pages           string `json:"pages"`
+				ShowOnFirstPage *bool  `json:"showOnFirstPage"`
+			} `json:"footer"`
+		} `json:"decorations"`
+		Delivery *struct {
+			Email *struct {
+				Enabled             bool     `json:"enabled"`
+				To                  []string `json:"to"`
+				CC                  []string `json:"cc"`
+				BCC                 []string `json:"bcc"`
+				Subject             string   `json:"subject"`
+				Body                string   `json:"body"`
+				AttachPDF           *bool    `json:"attachPDF"`
+				IncludeDownloadLink bool     `json:"includeDownloadLink"`
+				IncludeShareLink    bool     `json:"includeShareLink"`
+			} `json:"email"`
+			Share *struct {
+				Enabled       bool   `json:"enabled"`
+				Role          string `json:"role"`
+				ExpiresIn     int    `json:"expiresIn"`
+				Password      string `json:"password"`
+				OneTime       bool   `json:"oneTime"`
+				DownloadLimit int    `json:"downloadLimit"`
+			} `json:"share"`
+		} `json:"delivery"`
 	}
 	_ = json.Unmarshal(cfgRaw, &cfg)
 
@@ -226,6 +332,129 @@ func (h *Handler) Schema(w http.ResponseWriter, r *http.Request) {
 		notes = append(notes, "This template outputs an encrypted PDF — recipients will be prompted for a password to open or to bypass the permission restrictions.")
 	}
 
+	// Decorations: surface watermark / header / footer text so the API
+	// guide can show what's stamped on every render. Placeholders inside
+	// decoration text are deduped so the integrator sees a single
+	// "you'll need these data keys" line — same UX as outputDoc.
+	var decDoc *decorationsDoc
+	if cfg.Decorations != nil {
+		var allText []string
+		var hasContent bool
+		dd := &decorationsDoc{}
+		if cfg.Decorations.Watermark != nil && strings.TrimSpace(cfg.Decorations.Watermark.Text) != "" {
+			dd.Watermark = &decorationsWatermarkDoc{
+				Text:     cfg.Decorations.Watermark.Text,
+				Position: cfg.Decorations.Watermark.Position,
+				Pages:    cfg.Decorations.Watermark.Pages,
+			}
+			allText = append(allText, cfg.Decorations.Watermark.Text)
+			hasContent = true
+		}
+		if cfg.Decorations.Header != nil {
+			h := cfg.Decorations.Header
+			if strings.TrimSpace(h.Left) != "" || strings.TrimSpace(h.Center) != "" || strings.TrimSpace(h.Right) != "" {
+				dd.Header = &decorationsHeaderFooterDoc{
+					Left:            h.Left,
+					Center:          h.Center,
+					Right:           h.Right,
+					Pages:           h.Pages,
+					ShowOnFirstPage: h.ShowOnFirstPage,
+				}
+				allText = append(allText, h.Left, h.Center, h.Right)
+				hasContent = true
+			}
+		}
+		if cfg.Decorations.Footer != nil {
+			f := cfg.Decorations.Footer
+			if strings.TrimSpace(f.Left) != "" || strings.TrimSpace(f.Center) != "" || strings.TrimSpace(f.Right) != "" {
+				dd.Footer = &decorationsHeaderFooterDoc{
+					Left:            f.Left,
+					Center:          f.Center,
+					Right:           f.Right,
+					Pages:           f.Pages,
+					ShowOnFirstPage: f.ShowOnFirstPage,
+				}
+				allText = append(allText, f.Left, f.Center, f.Right)
+				hasContent = true
+			}
+		}
+		if hasContent {
+			// Strip the four built-in placeholders ({{page}}, {{pages}},
+			// {{generatedAt}}, {{date}}) — those resolve from server state,
+			// not the request, so listing them as "data keys you must
+			// send" would mislead integrators.
+			rawKeys := extractPlaceholders(allText...)
+			builtin := map[string]bool{"page": true, "pages": true, "generatedAt": true, "date": true}
+			for _, k := range rawKeys {
+				if !builtin[k] {
+					dd.Placeholders = append(dd.Placeholders, k)
+				}
+			}
+			decDoc = dd
+			notes = append(notes, "Every rendered PDF carries a watermark, header, or footer applied server-side. Decoration text supports `{{key}}` from your `data` payload, plus `{{page}}`, `{{pages}}`, `{{generatedAt}}`, and `{{date}}` built-ins.")
+		}
+	}
+
+	// Delivery: surface auto-email + auto-share-link policy. We strip
+	// the share password (parallel to securityDoc) and dedupe placeholders
+	// across email recipient + subject + body so the integrator sees a
+	// single "you'll need these data keys" line. The share section is
+	// surfaced with `passwordProtected: true` (boolean) rather than the
+	// raw password string.
+	var delDoc *deliveryDoc
+	if cfg.Delivery != nil {
+		dd := &deliveryDoc{}
+		var allText []string
+		var hasContent bool
+		if cfg.Delivery.Email != nil && cfg.Delivery.Email.Enabled {
+			e := cfg.Delivery.Email
+			attach := true
+			if e.AttachPDF != nil {
+				attach = *e.AttachPDF
+			}
+			dd.Email = &deliveryEmailDoc{
+				To:                  e.To,
+				CC:                  e.CC,
+				BCC:                 e.BCC,
+				Subject:             e.Subject,
+				HasBody:             strings.TrimSpace(e.Body) != "",
+				AttachPDF:           attach,
+				IncludeDownloadLink: e.IncludeDownloadLink,
+				IncludeShareLink:    e.IncludeShareLink,
+			}
+			allText = append(allText, e.Subject, e.Body)
+			allText = append(allText, e.To...)
+			allText = append(allText, e.CC...)
+			allText = append(allText, e.BCC...)
+			hasContent = true
+		}
+		if cfg.Delivery.Share != nil && cfg.Delivery.Share.Enabled {
+			s := cfg.Delivery.Share
+			role := s.Role
+			if role == "" {
+				role = "viewer"
+			}
+			dd.Share = &deliveryShareDoc{
+				Role:            role,
+				ExpiresIn:       s.ExpiresIn,
+				PasswordProtect: strings.TrimSpace(s.Password) != "",
+				OneTime:         s.OneTime,
+				DownloadLimit:   s.DownloadLimit,
+			}
+			hasContent = true
+		}
+		if hasContent {
+			dd.Placeholders = extractPlaceholders(allText...)
+			delDoc = dd
+			if dd.Email != nil {
+				notes = append(notes, "Every successful render auto-emails the configured recipients. Recipient/subject/body fields support `{{key}}` placeholders from your `data` payload — unresolved placeholders in recipients drop those addresses rather than mailing the literal braces.")
+			}
+			if dd.Share != nil {
+				notes = append(notes, "Every successful render mints a public share link (`shareUrl`/`shareId` returned in the response and webhook payload) honouring the configured expiry/password/one-time policy.")
+			}
+		}
+	}
+
 	resp := SchemaResp{
 		TemplateID:   id,
 		TemplateName: name,
@@ -242,9 +471,11 @@ func (h *Handler) Schema(w http.ResponseWriter, r *http.Request) {
 		Fields:     fields,
 		JSONSchema: jsonSchema,
 		Example:    example,
-		Output:     outDoc,
-		Security:   secDoc,
-		Notes:      notes,
+		Output:      outDoc,
+		Security:    secDoc,
+		Decorations: decDoc,
+		Delivery:    delDoc,
+		Notes:       notes,
 	}
 	writeJSON(w, 200, resp)
 }

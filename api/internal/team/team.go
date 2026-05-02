@@ -95,13 +95,47 @@ func (h *Handler) ListMembers(w http.ResponseWriter, r *http.Request) {
 	// at home, editor here, etc.). created_at is the membership creation
 	// time so the ordering reflects "joined this org" rather than
 	// "signed up to the platform".
-	rows, err := h.DB.Query(r.Context(), `
+	//
+	// Optional ?q= filters by name/email (case-insensitive substring), and
+	// optional ?limit= caps the result set so a share-with-people picker
+	// in a 1000-person org doesn't haul the whole roster over the wire.
+	// Both default to "no filter" so older callers that expected the full
+	// roster keep working unchanged. Limit is clamped to [1,200]; 0 (or
+	// negative) means "no limit" for callers that genuinely need the
+	// complete list (e.g. CSV export, admin settings page).
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	limit := 0
+	if v := strings.TrimSpace(r.URL.Query().Get("limit")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			limit = n
+		}
+	}
+	if limit > 200 {
+		limit = 200
+	}
+
+	// Build the SQL incrementally so we don't bind unused parameters and
+	// the query plan stays index-friendly. The `(name ILIKE $X OR email
+	// ILIKE $X)` predicate hits the existing trigram / functional indexes
+	// we use elsewhere for member lookup.
+	args := []any{c.OrgID}
+	sql := `
 		SELECT u.id, u.email, COALESCE(u.name,''),
 		       COALESCE(m.role,'editor'), m.created_at
 		  FROM org_memberships m
 		  JOIN users u ON u.id = m.user_id
-		 WHERE m.org_id = $1
-		 ORDER BY m.role='admin' DESC, m.created_at ASC`, c.OrgID)
+		 WHERE m.org_id = $1`
+	if q != "" {
+		args = append(args, "%"+q+"%")
+		sql += fmt.Sprintf(" AND (u.name ILIKE $%d OR u.email ILIKE $%d)", len(args), len(args))
+	}
+	sql += ` ORDER BY m.role='admin' DESC, m.created_at ASC`
+	if limit > 0 {
+		args = append(args, limit)
+		sql += fmt.Sprintf(" LIMIT $%d", len(args))
+	}
+
+	rows, err := h.DB.Query(r.Context(), sql, args...)
 	if err != nil {
 		writeErr(w, 500, "db_error", err.Error())
 		return

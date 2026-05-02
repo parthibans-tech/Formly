@@ -78,13 +78,17 @@ export function MarqueeSelect({
   );
 
   const onMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    const root = rootRef.current;
+    if (!root) return;
+    const rect = root.getBoundingClientRect();
+    const nextX = e.clientX - rect.left;
+    const nextY = e.clientY - rect.top;
     setDragBox((d) => {
       if (!d) return d;
-      const rect = e.currentTarget.getBoundingClientRect();
       return {
         ...d,
-        curX: e.clientX - rect.left,
-        curY: e.clientY - rect.top,
+        curX: nextX,
+        curY: nextY,
       };
     });
   }, []);

@@ -31,7 +31,9 @@ import {
   Folder,
   KeyRound,
   Lock,
+  Send,
   Shield,
+  Stamp,
   Terminal,
 } from "lucide-react";
 import { API_URL, api } from "@/lib/api";
@@ -79,6 +81,69 @@ export type SecurityDoc = {
   permissions?: Record<string, boolean>;
 };
 
+// DecorationsDoc mirrors api/internal/templates/schema.go::decorationsDoc.
+// Unlike security, decoration text is non-sensitive (it's literally going
+// to appear on every rendered PDF), so the literal text comes back —
+// that's the whole point of showing the integrator what their renders
+// will look like before they hit /generate.
+export type DecorationsDoc = {
+  watermark?: {
+    text?: string;
+    position?: string;
+    pages?: string;
+  };
+  header?: {
+    left?: string;
+    center?: string;
+    right?: string;
+    pages?: string;
+    showOnFirstPage?: boolean;
+  };
+  footer?: {
+    left?: string;
+    center?: string;
+    right?: string;
+    pages?: string;
+    showOnFirstPage?: boolean;
+  };
+  // placeholders is the deduped list of {{key}} identifiers referenced
+  // in any decoration text — minus the four built-ins (page, pages,
+  // generatedAt, date) which resolve from server state, not the
+  // request. Helps the integrator see exactly which data keys are
+  // load-bearing for their watermark/footer to render correctly.
+  placeholders?: string[];
+};
+
+// DeliveryDoc mirrors api/internal/templates/schema.go::deliveryDoc.
+// We surface the literal recipients/subject/role/etc. so the API guide
+// can show "this template auto-emails alice@example.com on every
+// render" — but the share password is reduced to a boolean
+// passwordProtected flag (same logic as securityDoc — never round-trip
+// a credential just to render docs).
+export type DeliveryDoc = {
+  email?: {
+    to?: string[];
+    cc?: string[];
+    bcc?: string[];
+    subject?: string;
+    hasBody?: boolean;
+    attachPDF?: boolean;
+    includeDownloadLink?: boolean;
+    includeShareLink?: boolean;
+  };
+  share?: {
+    role?: string;
+    expiresIn?: number; // seconds; 0/undefined = never
+    passwordProtected?: boolean;
+    oneTime?: boolean;
+    downloadLimit?: number;
+  };
+  // placeholders is the deduped list of {{key}}s referenced anywhere
+  // in the email recipients / subject / body — same UX as
+  // DecorationsDoc.placeholders.
+  placeholders?: string[];
+};
+
 export type SchemaResp = {
   templateId: string;
   templateName: string;
@@ -94,6 +159,8 @@ export type SchemaResp = {
   example: Record<string, any>;
   output?: OutputDoc;
   security?: SecurityDoc;
+  decorations?: DecorationsDoc;
+  delivery?: DeliveryDoc;
   notes?: string[];
 };
 
@@ -573,14 +640,254 @@ export function ApiGuide({ templateId, refreshKey = 0, compact = false }: Props)
         </section>
       )}
 
+      {/* --- Decorations (watermark / header / footer) -------------- */}
+      {schema.decorations &&
+        (schema.decorations.watermark ||
+          schema.decorations.header ||
+          schema.decorations.footer) && (
+          <section className="space-y-3">
+            <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+              {schema.security?.enabled ? "8" : "7"}. Decorations
+            </h3>
+            <div className="space-y-3 rounded-lg border bg-muted/30 p-4 text-sm">
+              <div className="flex items-start gap-3">
+                <Stamp className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+                <div className="w-full space-y-3">
+                  <p className="text-xs text-muted-foreground">
+                    Every rendered PDF carries the watermark, header, or
+                    footer text below — applied server-side before any
+                    encryption, so recipients can&rsquo;t edit them out.
+                    Text supports{" "}
+                    <code className="font-mono">{`{{key}}`}</code> from
+                    your <code className="font-mono">data</code>, plus
+                    four built-ins:{" "}
+                    <code className="font-mono">{`{{page}}`}</code>,{" "}
+                    <code className="font-mono">{`{{pages}}`}</code>,{" "}
+                    <code className="font-mono">{`{{generatedAt}}`}</code>
+                    , and <code className="font-mono">{`{{date}}`}</code>.
+                  </p>
+                  {schema.decorations.watermark && (
+                    <div className="rounded-md border bg-background/60 p-3 text-xs">
+                      <div className="mb-1 font-medium">Watermark</div>
+                      <div>
+                        Text:{" "}
+                        <code className="font-mono">
+                          {schema.decorations.watermark.text}
+                        </code>
+                      </div>
+                      {schema.decorations.watermark.position && (
+                        <div className="text-muted-foreground">
+                          Position:{" "}
+                          <code className="font-mono">
+                            {schema.decorations.watermark.position}
+                          </code>
+                        </div>
+                      )}
+                      {schema.decorations.watermark.pages && (
+                        <div className="text-muted-foreground">
+                          Pages:{" "}
+                          <code className="font-mono">
+                            {schema.decorations.watermark.pages}
+                          </code>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {schema.decorations.header && (
+                    <DecorationBandCard
+                      title="Header"
+                      band={schema.decorations.header}
+                    />
+                  )}
+                  {schema.decorations.footer && (
+                    <DecorationBandCard
+                      title="Footer"
+                      band={schema.decorations.footer}
+                    />
+                  )}
+                  {schema.decorations.placeholders &&
+                    schema.decorations.placeholders.length > 0 && (
+                      <div className="text-xs text-muted-foreground">
+                        Required keys for clean resolution:{" "}
+                        {schema.decorations.placeholders.map((p, i) => (
+                          <span key={p}>
+                            {i > 0 && ", "}
+                            <code className="font-mono">{p}</code>
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  <p className="pt-1 text-xs text-muted-foreground">
+                    Decorations are a template-level policy — they
+                    can&rsquo;t be overridden from the request body.
+                    Update them in the template designer&rsquo;s
+                    Decorations panel.
+                  </p>
+                </div>
+              </div>
+            </div>
+          </section>
+        )}
+
+      {/* --- Delivery (auto-email + auto-share-link) ---------------- */}
+      {schema.delivery && (schema.delivery.email || schema.delivery.share) && (
+        <section className="space-y-3">
+          <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+            {deliveryHeading(schema)}
+          </h3>
+          <div className="space-y-3 rounded-lg border bg-muted/30 p-4 text-sm">
+            <div className="flex items-start gap-3">
+              <Send className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+              <div className="w-full space-y-3">
+                <p className="text-xs text-muted-foreground">
+                  Every successful render fans out to the channels
+                  configured below. Failures are recorded on the
+                  <code className="font-mono"> generate.completed</code>{" "}
+                  event payload (
+                  <code className="font-mono">emailError</code>,{" "}
+                  <code className="font-mono">shareError</code>) but
+                  don&rsquo;t fail the render itself — the PDF is in
+                  Drive either way.
+                </p>
+
+                {schema.delivery.email && (
+                  <div className="rounded-md border bg-background/60 p-3 text-xs">
+                    <div className="mb-1 flex items-center gap-1.5 font-medium">
+                      <Send className="h-3 w-3" /> Auto-email
+                    </div>
+                    {schema.delivery.email.to &&
+                      schema.delivery.email.to.length > 0 && (
+                        <div>
+                          To:{" "}
+                          {schema.delivery.email.to.map((t, i) => (
+                            <span key={t}>
+                              {i > 0 && ", "}
+                              <code className="font-mono">{t}</code>
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    {schema.delivery.email.cc &&
+                      schema.delivery.email.cc.length > 0 && (
+                        <div className="text-muted-foreground">
+                          CC:{" "}
+                          {schema.delivery.email.cc.map((t, i) => (
+                            <span key={t}>
+                              {i > 0 && ", "}
+                              <code className="font-mono">{t}</code>
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    {schema.delivery.email.subject && (
+                      <div className="text-muted-foreground">
+                        Subject:{" "}
+                        <code className="font-mono">
+                          {schema.delivery.email.subject}
+                        </code>
+                      </div>
+                    )}
+                    <div className="mt-1 flex flex-wrap gap-1.5 text-[10px] text-muted-foreground">
+                      {schema.delivery.email.attachPDF && (
+                        <span className="rounded border bg-muted/40 px-1.5 py-0.5">
+                          PDF attached
+                        </span>
+                      )}
+                      {schema.delivery.email.includeDownloadLink && (
+                        <span className="rounded border bg-muted/40 px-1.5 py-0.5">
+                          24h download link
+                        </span>
+                      )}
+                      {schema.delivery.email.includeShareLink && (
+                        <span className="rounded border bg-muted/40 px-1.5 py-0.5">
+                          share link
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {schema.delivery.share && (
+                  <div className="rounded-md border bg-background/60 p-3 text-xs">
+                    <div className="mb-1 font-medium">Auto share-link</div>
+                    <div>
+                      Role:{" "}
+                      <code className="font-mono">
+                        {schema.delivery.share.role || "viewer"}
+                      </code>
+                    </div>
+                    {schema.delivery.share.expiresIn ? (
+                      <div className="text-muted-foreground">
+                        Expires after{" "}
+                        {Math.round(
+                          schema.delivery.share.expiresIn / 86400,
+                        )}{" "}
+                        day(s)
+                      </div>
+                    ) : (
+                      <div className="text-muted-foreground">
+                        No expiry
+                      </div>
+                    )}
+                    <div className="mt-1 flex flex-wrap gap-1.5 text-[10px] text-muted-foreground">
+                      {schema.delivery.share.passwordProtected && (
+                        <span className="rounded border bg-muted/40 px-1.5 py-0.5">
+                          password-protected
+                        </span>
+                      )}
+                      {schema.delivery.share.oneTime && (
+                        <span className="rounded border bg-muted/40 px-1.5 py-0.5">
+                          one-time
+                        </span>
+                      )}
+                      {schema.delivery.share.downloadLimit ? (
+                        <span className="rounded border bg-muted/40 px-1.5 py-0.5">
+                          {schema.delivery.share.downloadLimit} download
+                          {schema.delivery.share.downloadLimit === 1 ? "" : "s"}{" "}
+                          max
+                        </span>
+                      ) : null}
+                    </div>
+                  </div>
+                )}
+
+                {schema.delivery.placeholders &&
+                  schema.delivery.placeholders.length > 0 && (
+                    <div className="text-xs text-muted-foreground">
+                      Required keys for clean recipient/subject/body
+                      resolution:{" "}
+                      {schema.delivery.placeholders.map((p, i) => (
+                        <span key={p}>
+                          {i > 0 && ", "}
+                          <code className="font-mono">{p}</code>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+
+                <p className="pt-1 text-xs text-muted-foreground">
+                  The <code className="font-mono">generate.completed</code>{" "}
+                  webhook payload is enriched with{" "}
+                  <code className="font-mono">downloadUrl</code> (24h
+                  presigned),{" "}
+                  <code className="font-mono">shareId</code>/
+                  <code className="font-mono">shareUrl</code> when a
+                  share is minted, and{" "}
+                  <code className="font-mono">emailSendId</code> when
+                  the auto-email is sent. The same fields come back in
+                  the synchronous <code className="font-mono">/generate</code>{" "}
+                  response.
+                </p>
+              </div>
+            </div>
+          </div>
+        </section>
+      )}
+
       {/* --- Optional fields + per-mode notes ----------------------- */}
       <section className="space-y-3">
         <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
-          {schema.security?.enabled ||
-          schema.output?.filenameTemplate ||
-          schema.output?.folderPath
-            ? "8. Request options"
-            : "6. Request options"}
+          {requestOptionsHeading(schema)}
         </h3>
         <div className="overflow-hidden rounded-lg border">
           <table className="w-full text-sm">
@@ -668,6 +975,89 @@ export function ApiGuide({ templateId, refreshKey = 0, compact = false }: Props)
 }
 
 // ---- helpers --------------------------------------------------------------
+
+// optionalSectionsBefore counts how many of the optional pre-"Request
+// options" sections are present, so each gets a stable section number
+// without us hard-coding numbers that drift every time a new policy
+// surface lands. Sections 1-5 are always present (intro / endpoint /
+// auth / body / responses); the optional sections below stack onto 5
+// in source order.
+function optionalSectionsBefore(schema: SchemaResp): number {
+  let n = 0;
+  if (schema.output?.filenameTemplate || schema.output?.folderPath) n++;
+  if (schema.security?.enabled) n++;
+  if (
+    schema.decorations &&
+    (schema.decorations.watermark ||
+      schema.decorations.header ||
+      schema.decorations.footer)
+  )
+    n++;
+  return n;
+}
+
+// deliveryHeading numbers the Delivery section. Lives between
+// Decorations and Request options.
+function deliveryHeading(schema: SchemaResp): string {
+  return `${5 + optionalSectionsBefore(schema) + 1}. Delivery`;
+}
+
+// requestOptionsHeading picks the section number for "Request options"
+// based on which optional sections (output / security / decorations /
+// delivery) are present above it.
+function requestOptionsHeading(schema: SchemaResp): string {
+  let n = 5 + optionalSectionsBefore(schema);
+  if (schema.delivery && (schema.delivery.email || schema.delivery.share)) {
+    n++;
+  }
+  return `${n + 1}. Request options`;
+}
+
+// DecorationBandCard renders one header or footer band with its three
+// slots side-by-side. Empty slots are dropped so a footer with only a
+// centered page number doesn't show two empty boxes either side.
+function DecorationBandCard({
+  title,
+  band,
+}: {
+  title: string;
+  band: NonNullable<DecorationsDoc["header"]>;
+}) {
+  const cells = [
+    { label: "Left", value: band.left },
+    { label: "Center", value: band.center },
+    { label: "Right", value: band.right },
+  ].filter((c) => c.value && c.value.trim() !== "");
+  return (
+    <div className="rounded-md border bg-background/60 p-3 text-xs">
+      <div className="mb-2 font-medium">{title}</div>
+      {cells.length > 0 ? (
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+          {cells.map((c) => (
+            <div key={c.label}>
+              <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                {c.label}
+              </div>
+              <code className="block font-mono text-[11px]">{c.value}</code>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="text-muted-foreground">(empty)</div>
+      )}
+      {band.pages && (
+        <div className="mt-2 text-muted-foreground">
+          Pages: <code className="font-mono">{band.pages}</code>
+        </div>
+      )}
+      {band.showOnFirstPage === false && (
+        <div className="mt-1 text-muted-foreground">
+          Skipped on first page.
+        </div>
+      )}
+    </div>
+  );
+}
 
 // permissionLabel summarises the granular allow-flags for the security
 // banner. We match the order the designer's checkboxes use so the same

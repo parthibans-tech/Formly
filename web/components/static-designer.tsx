@@ -29,6 +29,8 @@ import {
   AlignVerticalJustifyCenter,
   Bold,
   Check,
+  ChevronLeft,
+  ChevronRight,
   ChevronsDown,
   ChevronsUp,
   Clipboard,
@@ -52,6 +54,7 @@ import {
   Lock,
   LockOpen,
   Maximize2,
+  MessageSquare,
   Minimize2,
   Minus,
   MoreHorizontal,
@@ -62,6 +65,7 @@ import {
   Trash2,
   Underline,
   Undo2,
+  Upload,
 } from "lucide-react";
 import {
   DropdownMenu,
@@ -116,15 +120,25 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { InlineRenameTitle } from "@/components/designer/inline-rename-title";
 import { ApiGuideSheet } from "@/components/api-guide-trigger";
+import { CollabDrawer } from "@/components/collab-drawer";
 import { DocAITools } from "@/components/doc-ai-tools";
 import { Label } from "@/components/ui/label";
 import { TYPOGRAPHY_PRESETS, FONT_FAMILIES } from "@/lib/font-presets";
+import { TransformEditor } from "@/components/acroform/transform-editor";
+import { ValidationRulesEditor } from "@/components/acroform/validation-rules-editor";
+import { ConditionalEditor } from "@/components/acroform/conditional-editor";
+import type {
+  AcroFormField as AcroFormFieldFull,
+  ValidationRule,
+} from "@/components/acroform/types";
+import type { Transform } from "@/lib/acroform-transforms";
 import {
   copyToClipboard,
   downloadFullExport,
   downloadJSON,
   downloadSkeleton,
   downloadTypeScript,
+  pickAndParseFullImport,
   toTypeScript,
 } from "@/lib/schema-export";
 
@@ -149,6 +163,44 @@ type Widget = {
   // safe to round-trip through the API.
   locked?: boolean;
   hidden?: boolean;
+  // When set, this widget is a synthetic representation of an existing
+  // AcroForm /FT field on the underlying PDF. Such widgets are NEVER
+  // persisted to /v1/templates/:id/widgets — on save() they're split
+  // out and written back to /v1/templates/:id/config under .mappings,
+  // preserving the existing acroform API contract. Their geometry is
+  // pinned to the PDF's /Annots rect (locked: true) so the user can
+  // edit binding/transform/validation but not move the box.
+  acroFieldName?: string;
+  // Original PDF /FT type — "Tx" / "Btn" / "Ch" / "Sig". Used by the
+  // properties panel to render the appropriate metadata badge.
+  acroFieldType?: string;
+};
+
+// Minimal AcroForm field shape — duplicated from
+// components/acroform/types.ts to keep this file self-contained
+// (StaticDesigner is now the only designer for both modes; the old
+// acroform-designer is unreachable from the router).
+type AcroFormField = {
+  name: string;
+  type: string;
+  page: number;
+  rect?: { x: number; y: number; w: number; h: number };
+  options?: string[];
+  required?: boolean;
+  multiline?: boolean;
+  readOnly?: boolean;
+  tooltip?: string;
+  maxLen?: number;
+};
+type AcroMapping = {
+  dataKey: string;
+  default?: string;
+  required?: boolean;
+  transform?: any;
+  section?: string;
+  flatten?: boolean;
+  validation?: any;
+  fillWhen?: string;
 };
 
 type Template = {
@@ -157,7 +209,14 @@ type Template = {
   mode: string;
   version: number;
   widgets: Widget[];
-  config?: { pageLayout?: PageLayout; [key: string]: any };
+  config?: {
+    pageLayout?: PageLayout;
+    mappings?: Record<string, AcroMapping>;
+    [key: string]: any;
+  };
+  // Present only for mode="acroform" templates — the /FT fields the
+  // server extracted from the PDF at upload. Absent for static-mode.
+  fields?: AcroFormField[];
 };
 
 type Props = {
@@ -180,6 +239,11 @@ type Props = {
 const PALETTE: { type: Widget["type"]; label: string; defaultW: number; defaultH: number; group?: string }[] = [
   { type: "text", label: "Text", defaultW: 160, defaultH: 18, group: "Text" },
   { type: "multiline", label: "Multiline", defaultW: 200, defaultH: 60, group: "Text" },
+  // Char-grid widget for forms that print one box per character (PAN,
+  // CKYC, account number blocks, date DD/MM/YYYY cells). Renderer
+  // distributes the value across `cells` equal-width columns. Default
+  // 10 cells fits PAN; tweak via the Properties panel.
+  { type: "comb", label: "Char grid", defaultW: 200, defaultH: 18, group: "Text" },
   { type: "date", label: "Date", defaultW: 110, defaultH: 18, group: "Text" },
   { type: "number", label: "Number", defaultW: 90, defaultH: 18, group: "Text" },
   { type: "currency", label: "Currency", defaultW: 120, defaultH: 18, group: "Text" },
@@ -217,7 +281,7 @@ export default function StaticDesigner({
   const toast = useToast();
   // Hydrate persisted locked/hidden flags out of `props.*` so they survive
   // reload (see save() for the mirror side of this tunneling).
-  const initialWidgets: Widget[] = (tpl.widgets || []).map((w) => {
+  const userWidgets: Widget[] = (tpl.widgets || []).map((w) => {
     const p = (w.props || {}) as Record<string, any>;
     const { _locked, _hidden, ...rest } = p;
     return {
@@ -227,6 +291,45 @@ export default function StaticDesigner({
       props: rest,
     };
   });
+  // Synthesize one acro-bound widget per existing /FT field on the
+  // PDF. They're locked (geometry comes from the PDF's /Annots rect
+  // and can't drift), bound to their data key via the existing
+  // mappings config, and round-trip back to /config.mappings on save —
+  // never to /widgets. Putting them at zIndex 0 keeps them under any
+  // user-added overlays so a stamped logo or page number can sit on
+  // top without obscuring the field rectangle.
+  const acroBoundWidgets: Widget[] = (tpl.fields || [])
+    .filter((f) => !!f.rect)
+    .map((f) => {
+      const m = tpl.config?.mappings?.[f.name] || { dataKey: f.name };
+      return {
+        id: `acro:${f.name}`,
+        type: "acroform",
+        page: f.page,
+        x: f.rect!.x,
+        y: f.rect!.y,
+        w: f.rect!.w,
+        h: f.rect!.h,
+        dataKey: m.dataKey || f.name,
+        zIndex: 0,
+        props: {
+          // Tunnel the rich mapping fields through props so the
+          // existing widget-properties panel can edit them with no
+          // schema changes. Save splits them back out to mappings.
+          _acroMapping: m,
+          _acroFieldType: f.type,
+          _acroOptions: f.options,
+          _acroMaxLen: f.maxLen,
+          _acroTooltip: f.tooltip,
+          _acroReadOnly: !!f.readOnly,
+          _acroMultiline: !!f.multiline,
+        },
+        locked: true,
+        acroFieldName: f.name,
+        acroFieldType: f.type,
+      };
+    });
+  const initialWidgets: Widget[] = [...acroBoundWidgets, ...userWidgets];
   const history = useHistory<Widget[]>(initialWidgets);
   const widgets = history.state;
   const setWidgets = history.commit;
@@ -241,6 +344,33 @@ export default function StaticDesigner({
   const [genAsync, setGenAsync] = useState(false);
   const [genBusy, setGenBusy] = useState(false);
   const [genProgress, setGenProgress] = useState<string | null>(null);
+  // Per-render output options (mirror lib/generate.ts GenerateOptions).
+  // saveToDrive defaults to FALSE so an ad-hoc test render doesn't pollute
+  // the file list — authors opt in explicitly when they want to keep the
+  // PDF. Filename / folder live alongside it because they only matter
+  // when persistence is on.
+  const [genSaveToDrive, setGenSaveToDrive] = useState(false);
+  const [genOutputName, setGenOutputName] = useState("");
+  const [genOutputPath, setGenOutputPath] = useState("");
+  const [genFlatten, setGenFlatten] = useState(false);
+  // Security inputs. Empty passwords = no encryption for this render
+  // (we don't send the security block at all when both are blank, so the
+  // template's policy still applies). When either is set we send the
+  // full block — the server treats provided-with-empty-passwords as
+  // "render unprotected even if the template would have encrypted".
+  const [genUserPwd, setGenUserPwd] = useState("");
+  const [genOwnerPwd, setGenOwnerPwd] = useState("");
+  const [genEncryption, setGenEncryption] = useState<"AES-256" | "AES-128">(
+    "AES-256"
+  );
+  const [genPermAll, setGenPermAll] = useState(true);
+  const [genPermPrint, setGenPermPrint] = useState(true);
+  const [genPermCopy, setGenPermCopy] = useState(false);
+  const [genPermModify, setGenPermModify] = useState(false);
+  const [genPermAnnotate, setGenPermAnnotate] = useState(false);
+  // Collapse the security block by default — most renders don't need it,
+  // and the dialog stays scannable.
+  const [genSecurityOpen, setGenSecurityOpen] = useState(false);
   const [batchOpen, setBatchOpen] = useState(false);
   const [layoutOpen, setLayoutOpen] = useState(false);
   const [savingLayout, setSavingLayout] = useState(false);
@@ -268,16 +398,53 @@ export default function StaticDesigner({
   // Zoom is applied on top of SCALE — effective render scale = SCALE * zoom.
   const [zoom, setZoom] = useState(1);
   const [fullscreen, setFullscreen] = useState(false);
+  // Collaboration drawer — Comments, Reviews (request/decide), Share /
+  // external review-links, and live presence. Mirrors the wiring in
+  // markdown-designer.tsx and html-designer.tsx so the PDF designer gets
+  // the same "Request review" entry point. The drawer is purely a
+  // dialog; no canvas state depends on it.
+  const [collabOpen, setCollabOpen] = useState(false);
   const [showRulers, setShowRulers] = useState(true);
   const [showThumbs, setShowThumbs] = useState(true);
+  // Page rendering mode. "continuous" stacks every page top-to-bottom (the
+  // long-standing default — best for scrolling through a multi-page PDF
+  // like a normal document). "paginated" renders one page at a time with
+  // prev/next controls — useful for reviewing form fills or comparing
+  // widget placement against a single page without other pages drifting
+  // through the viewport. The active page in paginated mode is the same
+  // `currentPage` that drives the thumbnail highlight, so jumping from
+  // the Pages panel "just works" in either mode.
+  const [viewMode, setViewMode] = useState<"continuous" | "paginated">(
+    "continuous"
+  );
   // Left rail controls which side panel is visible. Single-panel model
   // gives the canvas more room; clicking the active icon collapses it.
-  type LeftPanel = "widgets" | "pages" | "schema" | "layers" | "groups" | "inspect" | "taborder" | null;
+  // The Schema / Layers / Tab-order panels were three separate rail
+  // buttons originally — same widget list, three lenses on it. Merged
+  // into a single "fields" panel with an internal tabbed sub-nav so the
+  // rail stays scannable and authors can flip between lenses without
+  // losing scroll position. The active sub-tab is its own piece of state
+  // (`fieldsTab`) so it survives panel toggles.
+  type LeftPanel = "widgets" | "pages" | "fields" | "groups" | "inspect" | null;
   const [activePanel, setActivePanel] = useState<LeftPanel>("widgets");
+  type FieldsTab = "schema" | "layers" | "taborder";
+  const [fieldsTab, setFieldsTab] = useState<FieldsTab>("schema");
   // Live preview: when on, widgets render the resolved value from the
   // sample data instead of the dataKey name — like turning on "Preview"
   // mode in Figma.
   const [livePreview, setLivePreview] = useState(false);
+  // Cell-pitch sampling mode for char-grid (comb) widgets. When set, an
+  // overlay over each page captures the next two clicks: first click
+  // anchors the widget's left edge to the left side of the first
+  // printed cell; second click anchors the widget's right edge to the
+  // right side of the last printed cell. Pitch is then derived as
+  // (x2 - x1) / cells. Single-shot — auto-exits after the second click
+  // or on Esc. The widgetId targets a specific widget so the rest of
+  // the canvas keeps working normally.
+  const [sampleMode, setSampleMode] = useState<{
+    widgetId: string;
+    firstPdf: { page: number; x: number } | null;
+  } | null>(null);
   // Sample JSON used by the schema panel and live preview. Initialised
   // from the template config so users can persist it later.
   const [sampleJSON, setSampleJSON] = useState<string>(() => {
@@ -301,6 +468,14 @@ export default function StaticDesigner({
   // Which page the user is "on" — drives the thumbnail highlight and
   // keyboard-insert defaults. Updated as the canvas scrolls.
   const [currentPage, setCurrentPage] = useState(1);
+  // Clamp currentPage when the doc shrinks (e.g. PDF re-rendered with
+  // fewer pages after a layout change). Without this, paginated mode
+  // could end up rendering nothing because the page-filter never matches.
+  useEffect(() => {
+    if (numPages > 0 && currentPage > numPages) setCurrentPage(numPages);
+    if (numPages > 0 && currentPage < 1) setCurrentPage(1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [numPages]);
   // Cursor position in PDF pts for the page under the mouse (drives the
   // pink ruler indicator).
   const [cursorPt, setCursorPt] = useState<{ page: number; x: number; y: number } | null>(
@@ -469,6 +644,18 @@ export default function StaticDesigner({
         startX: number;
         startY: number;
         orig: Widget;
+      }
+    | {
+        // Per-cell boundary drag inside a comb widget. Drags the
+        // boundary between cellIndex and cellIndex+1 — pulls width
+        // from one neighbour into the other so total widget.W stays
+        // constant. Lazy-initialises cellWidths from the current pitch
+        // if the widget is still in equal-pitch mode.
+        kind: "combCell";
+        id: string;
+        cellIndex: number;
+        startX: number;
+        origWidths: number[];
       };
 
   const drag = useRef<DragState | null>(null);
@@ -521,13 +708,71 @@ export default function StaticDesigner({
     window.addEventListener("mouseup", endDrag);
   }
 
+  // Per-cell boundary drag for the comb widget. We snapshot the current
+  // cell-width array (lazy-deriving it from pitch the first time) so the
+  // mousemove can compute deltas off a stable origin instead of chasing
+  // a moving target through React state.
+  function beginCombCellResize(
+    e: React.MouseEvent,
+    w: Widget,
+    cellIndex: number
+  ) {
+    if (w.locked) return;
+    e.stopPropagation();
+    setSelectedIds([w.id]);
+    const cells = Math.max(1, Math.round(Number(w.props?.cells ?? 10)));
+    const existing = w.props?.cellWidths;
+    let origWidths: number[];
+    if (Array.isArray(existing) && existing.length === cells) {
+      origWidths = existing.map((n: unknown) => Number(n) || 0);
+    } else {
+      const pitch = Number(w.props?.cellWidth) || w.w / cells;
+      origWidths = Array.from({ length: cells }, () => pitch);
+    }
+    drag.current = {
+      kind: "combCell",
+      id: w.id,
+      cellIndex,
+      startX: e.clientX,
+      origWidths,
+    };
+    window.addEventListener("mousemove", onDragMove);
+    window.addEventListener("mouseup", endDrag);
+  }
+
   const onDragMove = useCallback(
     (e: MouseEvent) => {
       const d = drag.current;
       if (!d) return;
       const dxPts = (e.clientX - d.startX) / effectiveScale;
-      // Browser Y grows DOWN; PDF Y grows UP. Invert once here so the rest
-      // of the math can stay in PDF-space.
+
+      if (d.kind === "combCell") {
+        // Steal width from the right neighbour and give it to the left
+        // (or vice-versa). Total widget.w stays constant — only the
+        // distribution shifts. Clamp so neither cell collapses below 2pt
+        // (~0.7mm), which keeps a draggable handle visible.
+        const i = d.cellIndex;
+        const min = 2;
+        const maxRight = d.origWidths[i + 1] - min; // upper bound of dx
+        const maxLeft = -(d.origWidths[i] - min); // lower bound of dx
+        const clamped = Math.max(maxLeft, Math.min(maxRight, dxPts));
+        const next = d.origWidths.slice();
+        next[i] = d.origWidths[i] + clamped;
+        next[i + 1] = d.origWidths[i + 1] - clamped;
+        setWidgets(
+          (prev) =>
+            prev.map((w) =>
+              w.id !== d.id
+                ? w
+                : { ...w, props: { ...w.props, cellWidths: next } }
+            ),
+          { coalesce: true }
+        );
+        return;
+      }
+
+      // move/resize both work in PDF Y (which grows UP), so invert
+      // browser dy here. combCell never reads Y at all.
       const dyBrowser = (e.clientY - d.startY) / effectiveScale;
 
       if (d.kind === "move") {
@@ -587,7 +832,35 @@ export default function StaticDesigner({
         };
       }
       setWidgets(
-        (prev) => prev.map((w) => (w.id !== d.id ? w : { ...w, ...next })),
+        (prev) =>
+          prev.map((w) => {
+            if (w.id !== d.id) return w;
+            const merged: Widget = { ...w, ...next };
+            // Comb widgets with per-cell widths: scale the array
+            // proportionally so the visual pattern survives an outer
+            // resize. Without this, dragging the e/w handle would
+            // stretch widget.w but leave cellWidths summing to the old
+            // value, producing dead space (or overflow) on the right.
+            const origCellWidths = (d.orig as Widget).props?.cellWidths;
+            if (
+              w.type === "comb" &&
+              Array.isArray(origCellWidths) &&
+              origCellWidths.length > 0 &&
+              d.orig.w > 0 &&
+              next.w > 0 &&
+              next.w !== d.orig.w
+            ) {
+              // Scale from the drag-start snapshot, not the live widget.
+              // The live widget already has the previous frame's scaled
+              // values; scaling those again would compound each frame.
+              const factor = next.w / d.orig.w;
+              const scaled = (origCellWidths as unknown[]).map(
+                (n) => (Number(n) || 0) * factor
+              );
+              merged.props = { ...w.props, cellWidths: scaled };
+            }
+            return merged;
+          }),
         { coalesce: true }
       );
     },
@@ -796,6 +1069,20 @@ export default function StaticDesigner({
     return s.size;
   }, [widgets]);
 
+  /**
+   * Reverse index: dataKey → widget ids that bind to it. The schema panel
+   * uses this to render the "·N" bind-count badge next to each leaf and
+   * to power reverse-navigation when no widget is selected.
+   */
+  const bindingsByKey = useMemo(() => {
+    const out: Record<string, string[]> = {};
+    for (const w of widgets) {
+      if (!w.dataKey) continue;
+      (out[w.dataKey] ||= []).push(w.id);
+    }
+    return out;
+  }, [widgets]);
+
   // WIDGET RENAME (layers panel) -----------------------------------------
   function renameWidget(id: string, label: string) {
     setWidgets((prev) =>
@@ -945,8 +1232,21 @@ export default function StaticDesigner({
 
   function deleteSelection() {
     if (selectedIds.length === 0) return;
-    setWidgets((prev) => prev.filter((w) => !selectedSet.has(w.id)));
-    setSelectedIds([]);
+    // Acro-bound widgets are projections of real PDF /FT fields —
+    // deleting one in the designer wouldn't change the PDF, it would
+    // just orphan the field. Skip them silently so a Delete keystroke
+    // on a mixed selection still cleans up the user-added overlays.
+    setWidgets((prev) =>
+      prev.filter((w) => !selectedSet.has(w.id) || !!w.acroFieldName)
+    );
+    setSelectedIds((cur) => {
+      // Keep the acro-bound members of the selection visible — the
+      // user still wants the inspector open on them.
+      const stillThere = new Set(
+        widgets.filter((w) => !!w.acroFieldName).map((w) => w.id)
+      );
+      return cur.filter((id) => stillThere.has(id));
+    });
   }
 
   function selectAll() {
@@ -1043,7 +1343,15 @@ export default function StaticDesigner({
     if (readOnly) return;
     setSaving(true);
     try {
-      const payload = widgets.map((w) => ({
+      // Split widgets back into the two persistent stores they came
+      // from: real overlays go to /widgets, acro-bound projections go
+      // back to /config.mappings. Keeping the two stores separate
+      // preserves the existing API contract — old clients that only
+      // read `mappings` continue to work.
+      const realWidgets = widgets.filter((w) => !w.acroFieldName);
+      const acroBound = widgets.filter((w) => !!w.acroFieldName);
+
+      const payload = realWidgets.map((w) => ({
         type: w.type,
         page: w.page,
         x: w.x,
@@ -1066,10 +1374,36 @@ export default function StaticDesigner({
         method: "PUT",
         body: JSON.stringify({ widgets: payload }),
       });
-      // Persist sample data alongside widgets so it survives page refresh.
+      // Persist sample data alongside widgets so it survives page
+      // refresh. For acroform-mode templates we ALSO rebuild
+      // config.mappings from the acro-bound widget set so binding
+      // edits round-trip through the existing acroform fill path.
       try {
         const sampleData = JSON.parse(sampleJSON || "{}");
-        const mergedConfig = { ...currentConfig, sampleData };
+        const mergedConfig: Record<string, any> = {
+          ...currentConfig,
+          sampleData,
+        };
+        if (acroBound.length > 0) {
+          // Each acro-bound widget carries the rich AcroMapping in
+          // props._acroMapping (plus a possibly-edited dataKey at the
+          // top level). Reconstitute the MappingMap by merging the
+          // current dataKey on top of the stored mapping.
+          const mappings: Record<string, any> = {
+            ...(currentConfig?.mappings || {}),
+          };
+          for (const w of acroBound) {
+            const base =
+              (w.props?._acroMapping as Record<string, any>) || {
+                dataKey: w.acroFieldName!,
+              };
+            mappings[w.acroFieldName!] = {
+              ...base,
+              dataKey: w.dataKey || base.dataKey || w.acroFieldName!,
+            };
+          }
+          mergedConfig.mappings = mappings;
+        }
         await api(`/v1/templates/${tpl.id}/config`, {
           method: "PUT",
           body: JSON.stringify({ config: mergedConfig }),
@@ -1085,6 +1419,60 @@ export default function StaticDesigner({
       setSaving(false);
     }
   }, [widgets, tpl.id, toast, readOnly]);
+
+  // Import a full template config JSON, replacing widgets + page layout +
+  // sample data while preserving acroform-bound widgets that belong to
+  // THIS pdf's /Annots. Reused by the More-actions menu and the Sample
+  // dialog's import card so both surfaces share the same flow.
+  const importFullConfig = useCallback(async () => {
+    if (readOnly) return;
+    try {
+      const imported = await pickAndParseFullImport();
+      if (!imported) return; // user cancelled the picker
+      const acroCount = widgets.filter((w) => w.acroFieldName).length;
+      const ok = window.confirm(
+        `Import will replace ${widgets.length - acroCount} user widget(s) and overwrite sample data + page layout. Continue?\n\n` +
+          `Incoming: ${imported.widgets.length} widget(s)` +
+          (imported.sourceMeta.name ? ` from "${imported.sourceMeta.name}"` : "") +
+          `.`
+      );
+      if (!ok) return;
+      // Re-id every imported widget so they never collide with widgets
+      // already in state. Strip acroFieldName too — those bindings are
+      // tied to the CURRENT pdf's /Annots and don't transfer.
+      const reIded: Widget[] = imported.widgets.map((w) => ({
+        id: newId(),
+        type: w.type,
+        page: w.page,
+        x: w.x,
+        y: w.y,
+        w: w.w,
+        h: w.h,
+        dataKey: w.dataKey,
+        zIndex: w.zIndex,
+        props: w.props ?? {},
+        ...(w.locked ? { locked: true } : {}),
+        ...(w.hidden ? { hidden: true } : {}),
+      }));
+      const acroBound = widgets.filter((w) => w.acroFieldName);
+      setWidgets(() => [...acroBound, ...reIded]);
+      setCurrentConfig((prev: Record<string, any>) => ({
+        ...prev,
+        ...imported.config,
+        // Don't let an import wipe mappings for THIS pdf's acroform
+        // fields — they're tied to the document, not the design.
+        mappings: prev?.mappings ?? imported.config?.mappings ?? {},
+      }));
+      setSampleJSON(JSON.stringify(imported.sampleData, null, 2));
+      setSelectedIds([]);
+      toast.show(
+        "success",
+        `Imported ${reIded.length} widget(s) — remember to Save.`
+      );
+    } catch (e: any) {
+      toast.show("error", `Import failed: ${e?.message || e}`);
+    }
+  }, [readOnly, widgets, setWidgets, toast]);
 
   // Debounced autosave — fires AUTOSAVE_MS after the last mutation.
   const firstRender = useRef(true);
@@ -1156,6 +1544,19 @@ export default function StaticDesigner({
       if (!mod && e.key.toLowerCase() === "f") {
         e.preventDefault();
         toggleFullscreen();
+        return;
+      }
+      // PageUp / PageDown navigate pages in paginated mode. In continuous
+      // mode we fall through and let the browser scroll naturally — that's
+      // what users expect from a long, scrolling document.
+      if (!mod && (e.key === "PageUp" || e.key === "PageDown")) {
+        if (viewMode !== "paginated" || numPages <= 1) return;
+        e.preventDefault();
+        if (e.key === "PageUp") {
+          setCurrentPage((p) => Math.max(1, p - 1));
+        } else {
+          setCurrentPage((p) => Math.min(numPages, p + 1));
+        }
         return;
       }
       // Z-order
@@ -1241,6 +1642,12 @@ export default function StaticDesigner({
         }
       }
       if (e.key === "Escape") {
+        // Cancel cell-pitch sampling first if active, otherwise
+        // fall through to clearing the selection.
+        if (sampleMode) {
+          setSampleMode(null);
+          return;
+        }
         setSelectedIds([]);
         return;
       }
@@ -1265,7 +1672,7 @@ export default function StaticDesigner({
       window.removeEventListener("keyup", onKeyUp);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedIds, widgets, history, save, clipboard, zoom]);
+  }, [selectedIds, widgets, history, save, clipboard, zoom, sampleMode, viewMode, numPages]);
 
   // GENERATE / BATCH -----------------------------------------------------
   function openGenerate() {
@@ -1297,9 +1704,50 @@ export default function StaticDesigner({
     setGenProgress(null);
     try {
       const data = JSON.parse(genJSON);
+      // Persist the latest widget state before generating. The backend
+      // pulls widgets from the DB via loadWidgets(), so if the user
+      // added/edited widgets without saving (autosave is off by default)
+      // the overlay would render against stale data — producing PDFs
+      // with values "missing". Always-save right before generate makes
+      // the button do what users expect: render WHAT THEY SEE.
+      // No-op for read-only viewers (save() short-circuits internally).
+      if (!readOnly) {
+        setGenProgress("saving…");
+        await save();
+      }
+      setGenProgress(null);
+      // Build the security block lazily — only send when the user typed
+      // a password. Sending an empty block would tell the server "render
+      // unprotected even if the template would have encrypted", which is
+      // a legitimate but rare ask; the dialog has no way to express it
+      // explicitly today, so we keep behaviour simple and let the
+      // template's policy apply when both fields are blank.
+      const security =
+        genUserPwd || genOwnerPwd
+          ? {
+              userPassword: genUserPwd || undefined,
+              ownerPassword: genOwnerPwd || undefined,
+              encryption: genEncryption,
+              permissions: genPermAll
+                ? { all: true }
+                : {
+                    print: genPermPrint,
+                    copy: genPermCopy,
+                    modify: genPermModify,
+                    annotate: genPermAnnotate,
+                  },
+            }
+          : undefined;
       const result = await runGenerate(tpl.id, {
         data,
         async: genAsync,
+        flatten: genFlatten || undefined,
+        // Server defaults to true for legacy parity, so we ALWAYS send
+        // the explicit value from the dialog — no implicit fallback.
+        saveToDrive: genSaveToDrive,
+        outputName: genOutputName.trim() || undefined,
+        outputPath: genOutputPath.trim() || undefined,
+        security,
         onProgress: setGenProgress,
       });
       setGenResult({
@@ -1325,6 +1773,25 @@ export default function StaticDesigner({
   function updateSelectedProp(key: string, value: any) {
     if (!selected) return;
     updateSelected({ props: { ...selected.props, [key]: value } });
+  }
+
+  // Acro-bound widgets store their full mapping (transform pipeline,
+  // validation, fillWhen, etc.) inside `props._acroMapping`. On save() we
+  // unpack that back into config.mappings — so the rich editor here just
+  // needs to keep that one tunneled object in sync. dataKey is mirrored
+  // out to the top-level widget field too, since the rest of the
+  // designer (schema panel, validation panel, live preview) reads it
+  // from there.
+  function patchAcroMapping(patch: Partial<AcroMapping>) {
+    if (!selected || !selected.acroFieldName) return;
+    const cur =
+      (selected.props?._acroMapping as AcroMapping) ||
+      ({ dataKey: selected.dataKey } as AcroMapping);
+    const merged: AcroMapping = { ...cur, ...patch };
+    const nextProps = { ...selected.props, _acroMapping: merged };
+    const topPatch: Partial<Widget> = { props: nextProps };
+    if (patch.dataKey !== undefined) topPatch.dataKey = patch.dataKey;
+    updateSelected(topPatch);
   }
 
   // Bind the clicked schema path to the currently-selected widget(s). If
@@ -1372,6 +1839,26 @@ export default function StaticDesigner({
       return;
     }
     updateSelected({ dataKey: path });
+    toast.show(
+      "success",
+      `Bound "${widgetLabel(selected)}" → ${path}`
+    );
+  }
+
+  // Reverse-navigation: when the schema tab is open with no widget
+  // selected, clicking a key that already has bindings selects the first
+  // widget bound to it and scrolls it into view. Lets users explore "what
+  // is this key wired to?" without context-switching to the canvas.
+  function selectFirstWidgetForKey(path: string) {
+    const target = widgets.find((w) => w.dataKey === path);
+    if (!target) {
+      toast.show("info", "No widget is bound to that key yet.");
+      return;
+    }
+    setSelectedIds([target.id]);
+    const el = pageRefs.current[target.page || 1];
+    el?.scrollIntoView({ behavior: "smooth", block: "center" });
+    toast.show("success", `Selected "${widgetLabel(target)}"`);
   }
 
   function runBulkRename() {
@@ -1467,6 +1954,16 @@ export default function StaticDesigner({
         run: () => setShowRulers((v) => !v),
       },
       {
+        id: "view:mode",
+        label:
+          viewMode === "continuous"
+            ? "View one page at a time (paginated)"
+            : "View all pages (continuous)",
+        group: "View",
+        run: () =>
+          setViewMode((m) => (m === "continuous" ? "paginated" : "continuous")),
+      },
+      {
         id: "view:thumbs",
         label: showThumbs ? "Hide page thumbnails" : "Show page thumbnails",
         group: "View",
@@ -1491,6 +1988,33 @@ export default function StaticDesigner({
         run: () => setAutoSave((v) => !v),
       },
       {
+        id: "panel:fields:schema",
+        label: "Open Fields → Schema",
+        group: "Panels",
+        run: () => {
+          setActivePanel("fields");
+          setFieldsTab("schema");
+        },
+      },
+      {
+        id: "panel:fields:layers",
+        label: "Open Fields → Layers",
+        group: "Panels",
+        run: () => {
+          setActivePanel("fields");
+          setFieldsTab("layers");
+        },
+      },
+      {
+        id: "panel:fields:taborder",
+        label: "Open Fields → Tab order",
+        group: "Panels",
+        run: () => {
+          setActivePanel("fields");
+          setFieldsTab("taborder");
+        },
+      },
+      {
         id: "data:preview",
         label: livePreview ? "Disable live data preview" : "Enable live data preview",
         group: "Data",
@@ -1503,6 +2027,12 @@ export default function StaticDesigner({
         label: "Export full template config (widgets + layout + data)",
         group: "Data",
         run: () => downloadFullExport(tpl, widgets, currentConfig, sampleJSON),
+      },
+      {
+        id: "data:import:full",
+        label: "Import full template config (JSON)",
+        group: "Data",
+        run: () => importFullConfig(),
       },
       {
         id: "data:export:json",
@@ -1544,7 +2074,13 @@ export default function StaticDesigner({
       },
       { id: "file:save", label: "Save now", hint: `${M}S`, group: "File", run: save },
       { id: "file:generate", label: "Generate PDF", group: "File", run: openGenerate },
-      { id: "file:batch", label: "Batch generate from CSV", group: "File", run: () => setBatchOpen(true) },
+      // Same save-before-render guarantee as single Generate — the
+      // batch runner reads widgets from the DB, not from this React
+      // tree. Without saving first, every CSV row would render against
+      // whatever was last persisted and the user's recent changes
+      // would silently disappear.
+      { id: "file:batch", label: "Batch generate from CSV", group: "File", run: async () => { if (!readOnly) await save(); setBatchOpen(true); } },
+      { id: "view:collab", label: "Open comments & reviews", group: "Share", run: () => setCollabOpen(true) },
       { id: "help:shortcuts", label: "Keyboard shortcuts", hint: "?", group: "Help", run: () => setHelpOpen(true) },
     ];
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1556,6 +2092,8 @@ export default function StaticDesigner({
     autoSave,
     showRulers,
     showThumbs,
+    viewMode,
+    fieldsTab,
     fullscreen,
     zoom,
     livePreview,
@@ -1613,8 +2151,15 @@ export default function StaticDesigner({
     <div
       ref={rootRef}
       className={
+        // h-screen (not min-h-screen) so the root is *exactly* the
+        // viewport height. Without this, a tall PDF stack in
+        // continuous mode grew the page, the window itself became the
+        // scroller, and the canvas's `flex-1 overflow-auto` never had
+        // a constrained height to scroll inside — making the last
+        // page unreachable when adding fields. Fullscreen already
+        // pins via `fixed inset-0` so it gets the same effect.
         "flex flex-col " +
-        (fullscreen ? "fixed inset-0 z-50 bg-background" : "min-h-screen")
+        (fullscreen ? "fixed inset-0 z-50 bg-background" : "h-screen")
       }
     >
       <header className="bg-white border-b px-6 py-3 flex items-center justify-between">
@@ -1694,6 +2239,19 @@ export default function StaticDesigner({
           {/* API integration guide — drawer with endpoint, payload, and
               runnable snippets derived from this template's schema. */}
           <ApiGuideSheet templateId={tpl.id} templateName={tpl.name} />
+          {/* Collaboration — comments, @mentions, request-review, and
+              external review-links. Surfaces the same drawer the
+              markdown / HTML designers expose so PDF authors aren't a
+              second-class citizen for review workflows. */}
+          <button
+            type="button"
+            title="Comments & reviews"
+            onClick={() => setCollabOpen(true)}
+            className="inline-flex items-center gap-1 px-2 py-2 text-sm border rounded hover:bg-gray-50"
+          >
+            <MessageSquare className="h-4 w-4" />
+            <span className="hidden lg:inline">Collaborate</span>
+          </button>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <button
@@ -1704,12 +2262,36 @@ export default function StaticDesigner({
               </button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="w-56">
-              <DropdownMenuItem onClick={() => setBatchOpen(true)}>
+              <DropdownMenuItem
+                onClick={async () => {
+                  // Save before opening batch — see comment on the
+                  // command-palette equivalent for full rationale.
+                  if (!readOnly) await save();
+                  setBatchOpen(true);
+                }}
+              >
                 Batch generate (CSV)
               </DropdownMenuItem>
               <DropdownMenuItem onClick={() => setLayoutOpen(true)}>
                 <Settings2 className="h-4 w-4" /> Page layout
               </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              {/* Import / Export — full template config. The same actions
+                  also live inside the Sample-data dialog's import/export
+                  toolbar; surfacing them here makes them discoverable
+                  from the top-level menu without opening the dialog. */}
+              <DropdownMenuItem
+                onClick={() =>
+                  downloadFullExport(tpl, widgets, currentConfig, sampleJSON)
+                }
+              >
+                <PackageOpen className="h-4 w-4" /> Export config (JSON)
+              </DropdownMenuItem>
+              {!readOnly && (
+                <DropdownMenuItem onClick={() => importFullConfig()}>
+                  <Upload className="h-4 w-4" /> Import config (JSON)
+                </DropdownMenuItem>
+              )}
               <DropdownMenuSeparator />
               <DropdownMenuItem asChild>
                 <Link href={`/templates/${tpl.id}/versions`}>
@@ -1831,20 +2413,14 @@ export default function StaticDesigner({
             }
             badge={numPages || undefined}
           />
+          {/* Fields: merged Data schema / Layers / Tab order. The tab
+              the user picks survives panel toggles via `fieldsTab`. */}
           <RailBtn
             icon={Database}
-            label="Data schema"
-            active={activePanel === "schema"}
+            label="Fields (schema · layers · tab order)"
+            active={activePanel === "fields"}
             onClick={() =>
-              setActivePanel((p) => (p === "schema" ? null : "schema"))
-            }
-          />
-          <RailBtn
-            icon={Layers}
-            label="Layers"
-            active={activePanel === "layers"}
-            onClick={() =>
-              setActivePanel((p) => (p === "layers" ? null : "layers"))
+              setActivePanel((p) => (p === "fields" ? null : "fields"))
             }
             badge={widgets.length || undefined}
           />
@@ -1865,14 +2441,6 @@ export default function StaticDesigner({
               setActivePanel((p) => (p === "inspect" ? null : "inspect"))
             }
             badge={issueCount || undefined}
-          />
-          <RailBtn
-            icon={Hash}
-            label="Tab order"
-            active={activePanel === "taborder"}
-            onClick={() =>
-              setActivePanel((p) => (p === "taborder" ? null : "taborder"))
-            }
           />
           <div className="my-1 h-px w-6 bg-border" />
           <RailBtn
@@ -1950,42 +2518,97 @@ export default function StaticDesigner({
             }}
           />
         )}
-        {activePanel === "schema" && (
-          <aside className="w-64 shrink-0 border-r bg-muted/20">
-            <SchemaPanel
-              sampleJSON={sampleJSON}
-              templateName={tpl.name}
-              usedKeys={widgets.map((w) => w.dataKey).filter(Boolean)}
-              selectedDataKey={selected?.dataKey}
-              onBind={bindSelectedTo}
-              onEditSample={() => setEditSampleOpen(true)}
-              onSyncSample={syncSampleFromWidgets}
-              onExportFull={() => downloadFullExport(tpl, widgets, currentConfig, sampleJSON)}
-            />
-          </aside>
-        )}
-        {activePanel === "layers" && (
-          <aside className="w-56 shrink-0 border-r bg-muted/20">
-            <LayersPanel
-              widgets={widgets as LayerWidget[]}
-              selectedIds={selectedIds}
-              onSelect={setSelectedIds}
-              onReorder={reorderLayer}
-              onToggleLock={(id) => {
-                setWidgets((prev) =>
-                  prev.map((w) => (w.id === id ? { ...w, locked: !w.locked } : w))
-                );
-              }}
-              onToggleHide={(id) => {
-                setWidgets((prev) =>
-                  prev.map((w) => (w.id === id ? { ...w, hidden: !w.hidden } : w))
-                );
-              }}
-              onRename={renameWidget}
-              onSelectGroup={selectGroup}
-              onGroupSelection={groupSelection}
-              onUngroupSelection={ungroupSelection}
-            />
+        {activePanel === "fields" && (
+          <aside className="w-64 shrink-0 border-r bg-muted/20 flex flex-col">
+            {/* Segmented sub-nav. Three lenses on the same widget list:
+                Schema = data-key bindings + sample data, Layers = z-order
+                + lock/hide, Tab order = AcroForm tab traversal. */}
+            <div className="flex items-stretch border-b bg-background text-[11px]">
+              <FieldsTabBtn
+                active={fieldsTab === "schema"}
+                onClick={() => setFieldsTab("schema")}
+                icon={Database}
+                label="Schema"
+              />
+              <FieldsTabBtn
+                active={fieldsTab === "layers"}
+                onClick={() => setFieldsTab("layers")}
+                icon={Layers}
+                label="Layers"
+                badge={widgets.length || undefined}
+              />
+              <FieldsTabBtn
+                active={fieldsTab === "taborder"}
+                onClick={() => setFieldsTab("taborder")}
+                icon={Hash}
+                label="Tab"
+              />
+            </div>
+            <div className="flex-1 min-h-0 overflow-hidden">
+              {fieldsTab === "schema" && (
+                <SchemaPanel
+                  sampleJSON={sampleJSON}
+                  templateName={tpl.name}
+                  usedKeys={widgets.map((w) => w.dataKey).filter(Boolean)}
+                  selectedDataKey={selected?.dataKey}
+                  selectedWidgetLabel={
+                    selected
+                      ? widgetLabel(selected) +
+                        (selectedIds.length > 1
+                          ? ` (+${selectedIds.length - 1} more — only the first will be bound)`
+                          : "")
+                      : undefined
+                  }
+                  bindingsByKey={bindingsByKey}
+                  onBind={bindSelectedTo}
+                  onSelectByKey={selectFirstWidgetForKey}
+                  onEditSample={() => setEditSampleOpen(true)}
+                  onSyncSample={syncSampleFromWidgets}
+                  onExportFull={() => downloadFullExport(tpl, widgets, currentConfig, sampleJSON)}
+                />
+              )}
+              {fieldsTab === "layers" && (
+                <LayersPanel
+                  widgets={widgets as LayerWidget[]}
+                  selectedIds={selectedIds}
+                  onSelect={setSelectedIds}
+                  onReorder={reorderLayer}
+                  onToggleLock={(id) => {
+                    setWidgets((prev) =>
+                      prev.map((w) => (w.id === id ? { ...w, locked: !w.locked } : w))
+                    );
+                  }}
+                  onToggleHide={(id) => {
+                    setWidgets((prev) =>
+                      prev.map((w) => (w.id === id ? { ...w, hidden: !w.hidden } : w))
+                    );
+                  }}
+                  onRename={renameWidget}
+                  onSelectGroup={selectGroup}
+                  onGroupSelection={groupSelection}
+                  onUngroupSelection={ungroupSelection}
+                />
+              )}
+              {fieldsTab === "taborder" && (
+                <TabOrderPanel
+                  widgets={widgets as TabWidget[]}
+                  selectedIds={selectedIds}
+                  onSelect={(id) => setSelectedIds([id])}
+                  onReorder={(orderedIds) => {
+                    setWidgets((prev) =>
+                      prev.map((w) => {
+                        const idx = orderedIds.indexOf(w.id);
+                        if (idx === -1) return w;
+                        return {
+                          ...w,
+                          props: { ...w.props, acroTabOrder: idx + 1 },
+                        };
+                      })
+                    );
+                  }}
+                />
+              )}
+            </div>
           </aside>
         )}
         {activePanel === "groups" && (
@@ -2017,33 +2640,18 @@ export default function StaticDesigner({
             />
           </aside>
         )}
-        {activePanel === "taborder" && (
-          <aside className="w-56 shrink-0 border-r bg-muted/20">
-            <TabOrderPanel
-              widgets={widgets as TabWidget[]}
-              selectedIds={selectedIds}
-              onSelect={(id) => setSelectedIds([id])}
-              onReorder={(orderedIds) => {
-                setWidgets((prev) =>
-                  prev.map((w) => {
-                    const idx = orderedIds.indexOf(w.id);
-                    if (idx === -1) return w;
-                    return {
-                      ...w,
-                      props: { ...w.props, acroTabOrder: idx + 1 },
-                    };
-                  })
-                );
-              }}
-            />
-          </aside>
-        )}
 
         {/* Canvas */}
         <section
           ref={canvasRef}
           className={
-            "flex-1 overflow-auto bg-gray-200 min-h-0 " +
+            // min-w-0 is critical: without it, a flex item's
+            // implicit min-width: auto refuses to shrink below the
+            // PDF's intrinsic rendered width (SCALE * pageWidth ≈
+            // 918px for letter), so the whole designer overflows
+            // horizontally instead of letting overflow-auto here
+            // produce an internal scrollbar.
+            "flex-1 min-w-0 overflow-auto bg-gray-200 min-h-0 " +
             (showRulers ? "pl-10 pt-10 pr-6 pb-6 " : "p-6 ") +
             (spaceHeld ? "cursor-grab" : "")
           }
@@ -2062,13 +2670,43 @@ export default function StaticDesigner({
             }
           }}
         >
+          {/* Sticky banner for cell-pitch sampling — anchored to the
+              top of the canvas so users can read the next instruction
+              even after they've scrolled the PDF. */}
+          {sampleMode && (
+            <div className="sticky top-0 z-40 -mx-6 -mt-10 mb-4 border-b border-blue-200 bg-blue-50 px-6 py-2 text-sm text-blue-900 shadow-sm">
+              <div className="flex items-center justify-between gap-4">
+                <span>
+                  <span className="font-semibold">Sampling cell pitch:</span>{" "}
+                  {sampleMode.firstPdf
+                    ? "Now click the RIGHT edge of the LAST printed cell."
+                    : "Click the LEFT edge of the FIRST printed cell."}
+                </span>
+                <button
+                  onClick={() => setSampleMode(null)}
+                  className="text-xs underline hover:no-underline"
+                >
+                  Cancel (Esc)
+                </button>
+              </div>
+            </div>
+          )}
           <Document
             file={previewUrl}
             onLoadSuccess={({ numPages }) => setNumPages(numPages)}
             loading={<div className="text-gray-500">Loading PDF…</div>}
             error={<div className="text-red-600">Failed to load PDF</div>}
           >
-            {Array.from({ length: numPages }, (_, i) => i + 1).map((pageNum) => {
+            {Array.from({ length: numPages }, (_, i) => i + 1)
+              // Paginated mode: render only the active page. We still let
+              // react-pdf's <Document> mount normally so onLoadSuccess fires
+              // with the real numPages — switching modes never loses the
+              // page count or has to refetch the PDF.
+              .filter(
+                (pageNum) =>
+                  viewMode === "continuous" || pageNum === currentPage
+              )
+              .map((pageNum) => {
               const pageD = pageDims[pageNum];
               const pageWpx = pageD ? pageD.w * effectiveScale : 0;
               const pageHpx = pageD ? pageD.h * effectiveScale : 0;
@@ -2183,6 +2821,78 @@ export default function StaticDesigner({
                       }}
                     />
                   )}
+                  {/* Cell-pitch sampling overlay — captures the next two
+                      clicks when the user is calibrating a comb widget
+                      against a printed grid. Sits ABOVE the widget
+                      overlay so it intercepts clicks even on top of
+                      existing widgets. Only rendered while sampling. */}
+                  {sampleMode && (
+                    <div
+                      className="absolute inset-0 z-30 cursor-crosshair"
+                      style={{ background: "rgba(59,130,246,0.04)" }}
+                      title="Click to mark cell edge — Esc to cancel"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        const rect = pageRefs.current[pageNum]?.getBoundingClientRect();
+                        const info = pageInfo(pageNum);
+                        if (!rect || !info) return;
+                        const bx = e.clientX - rect.left;
+                        const by = e.clientY - rect.top;
+                        const pdf = browserToPdf({ x: bx, y: by, w: 0, h: 0 }, info);
+                        if (!sampleMode.firstPdf) {
+                          // First click — anchor the LEFT edge.
+                          setSampleMode({
+                            ...sampleMode,
+                            firstPdf: { page: pageNum, x: pdf.x },
+                          });
+                          return;
+                        }
+                        // Second click — anchor the RIGHT edge and
+                        // derive pitch + reposition the widget.
+                        const target = widgets.find(
+                          (w) => w.id === sampleMode.widgetId,
+                        );
+                        if (!target) {
+                          setSampleMode(null);
+                          return;
+                        }
+                        const x1 = sampleMode.firstPdf.x;
+                        const x2 = pdf.x;
+                        const xLeft = Math.min(x1, x2);
+                        const xRight = Math.max(x1, x2);
+                        const totalW = xRight - xLeft;
+                        const cells = Math.max(
+                          1,
+                          Math.round(Number(target.props?.cells ?? 10)),
+                        );
+                        const pitch = totalW / cells;
+                        // Apply: move widget X to the sampled left edge,
+                        // resize to span the full grid, lock the pitch
+                        // so future cell-count edits scale W proportionally.
+                        setWidgets((prev) =>
+                          prev.map((w) =>
+                            w.id === target.id
+                              ? {
+                                  ...w,
+                                  x: xLeft,
+                                  w: totalW,
+                                  page: sampleMode.firstPdf!.page,
+                                  props: {
+                                    ...(w.props || {}),
+                                    cellWidth: pitch,
+                                  },
+                                }
+                              : w,
+                          ),
+                        );
+                        toast.show(
+                          "success",
+                          `Sampled pitch ${pitch.toFixed(2)}pt across ${cells} cell${cells === 1 ? "" : "s"}`,
+                        );
+                        setSampleMode(null);
+                      }}
+                    />
+                  )}
                   {/* Widget overlay — marker div absorbs background clicks
                       so canvas onClick doesn't misfire while marquee-ing. */}
                   <div className="absolute inset-0" data-widget-bg="1">
@@ -2250,13 +2960,21 @@ export default function StaticDesigner({
                             }}
                             className={
                               "absolute border text-xs overflow-hidden " +
-                              (w.locked ? "cursor-not-allowed " : "cursor-move ") +
+                              (w.locked ? "cursor-pointer " : "cursor-move ") +
                               (w.hidden || !showIfResult
                                 ? "bg-muted/40 opacity-50 border-dashed "
+                                : w.acroFieldName
+                                ? "bg-amber-50/40 border-dashed "
                                 : showPreview
                                 ? "bg-white/90 "
                                 : "bg-blue-100/40 ") +
-                              (keyMissing
+                              (w.acroFieldName
+                                ? isPrimary
+                                  ? "border-amber-600 ring-2 ring-amber-300"
+                                  : isSel
+                                  ? "border-amber-500 ring-1 ring-amber-200"
+                                  : "border-amber-500"
+                                : keyMissing
                                 ? "border-amber-500 ring-1 ring-amber-300"
                                 : isPrimary
                                 ? "border-blue-600 ring-2 ring-blue-300"
@@ -2266,7 +2984,10 @@ export default function StaticDesigner({
                             }
                             style={{ left: b.x, top: b.y, width: b.w, height: b.h }}
                             title={
-                              (w.locked ? "(Locked) " : "") +
+                              (w.acroFieldName
+                                ? `AcroForm /${w.acroFieldType || "FT"} field "${w.acroFieldName}" — `
+                                : "") +
+                              (w.locked && !w.acroFieldName ? "(Locked) " : "") +
                               (w.hidden ? "(Hidden) " : "") +
                               (keyMissing ? "(Key missing from sample) " : "") +
                               (!showIfResult ? "(Hidden by showIf) " : "") +
@@ -2284,15 +3005,61 @@ export default function StaticDesigner({
                                   : "font-mono text-[10px] text-blue-900")
                               }
                             >
-                              {w.locked ? "🔒 " : ""}
+                              {w.acroFieldName ? "▦ " : w.locked ? "🔒 " : ""}
                               {w.hidden ? "👁 " : ""}
                               {keyMissing ? "⚠ " : ""}
                               {w.type === "radio" ? "◉ " : ""}
                               {w.type === "dropdown" ? "▾ " : ""}
                               {w.type === "signature-field" ? "✎ " : ""}
                               {w.type === "button" ? "▶ " : ""}
+                              {w.type === "comb" ? "▦ " : ""}
                               {showPreview ? displayValue : w.dataKey}
                             </span>
+                            {isPrimary && !w.locked && w.type === "comb" && (() => {
+                              // Per-cell boundary drag handles. We render
+                              // N-1 thin vertical strips at the cumulative
+                              // cell positions; the renderer reads the same
+                              // cellWidths array we mutate here. Equal-pitch
+                              // mode is just "no cellWidths set yet" — we
+                              // synthesize a flat array on first drag.
+                              const cells = Math.max(
+                                1,
+                                Math.round(Number(w.props?.cells ?? 10))
+                              );
+                              const widths: number[] =
+                                Array.isArray(w.props?.cellWidths) &&
+                                w.props.cellWidths.length === cells
+                                  ? w.props.cellWidths.map(
+                                      (n: unknown) => Number(n) || 0
+                                    )
+                                  : Array.from({ length: cells }, () => {
+                                      const pitch = Number(w.props?.cellWidth);
+                                      return pitch > 0 ? pitch : w.w / cells;
+                                    });
+                              const handles: React.ReactNode[] = [];
+                              let acc = 0;
+                              for (let i = 0; i < cells - 1; i++) {
+                                acc += widths[i];
+                                handles.push(
+                                  <div
+                                    key={`cb-${i}`}
+                                    onMouseDown={(e) =>
+                                      beginCombCellResize(e, w, i)
+                                    }
+                                    className="absolute bg-blue-500/60 hover:bg-blue-700 cursor-col-resize"
+                                    style={{
+                                      left: acc * effectiveScale - 2,
+                                      top: 0,
+                                      width: 4,
+                                      height: b.h,
+                                      zIndex: 5,
+                                    }}
+                                    title={`Drag to resize cells ${i + 1} ↔ ${i + 2}`}
+                                  />
+                                );
+                              }
+                              return <>{handles}</>;
+                            })()}
                             {isPrimary && !w.locked && (
                               <>
                                 {(
@@ -2334,7 +3101,7 @@ export default function StaticDesigner({
         </section>
 
         {/* Properties */}
-        <aside className="w-80 bg-white border-l overflow-y-auto">
+        <aside className="w-80 shrink-0 bg-white border-l overflow-y-auto">
           <div className="p-4 border-b">
             <h2 className="font-semibold">Properties</h2>
             <p className="text-xs text-gray-500 mt-1">
@@ -2346,6 +3113,23 @@ export default function StaticDesigner({
             </p>
           </div>
           {selected && selectedIds.length === 1 ? (
+            selected.acroFieldName ? (
+              // ACRO-BOUND WIDGET — synthesises the AcroForm Designer's
+              // rich mapping editor inside this same Properties panel so
+              // the user gets the full transform-pipeline / validation /
+              // conditional UI without context-switching to a separate
+              // designer. Geometry inputs are intentionally omitted: the
+              // rect comes from the PDF's /Annots and shouldn't drift.
+              <AcroBoundProps
+                selected={selected}
+                widgets={widgets}
+                tpl={tpl}
+                sample={sample}
+                sampleKeys={sampleKeys}
+                patchAcroMapping={patchAcroMapping}
+                updateSelected={updateSelected}
+              />
+            ) : (
             <div className="p-4 space-y-3 text-sm">
               <Field label="Data key">
                 <input
@@ -2500,6 +3284,173 @@ export default function StaticDesigner({
                     )}
                   </div>
                 )}
+
+              {/* ---- Char-grid (comb) only: cells + pitch + cell-outline ---- */}
+              {selected.type === "comb" && (() => {
+                const cells = Math.max(
+                  1,
+                  Math.round(Number(selected.props?.cells ?? 10)),
+                );
+                // Two pitch sources: explicit `cellWidth` (fixed-pitch
+                // mode — survives W resize) or derived from W/cells.
+                // The input below shows whichever is authoritative.
+                const explicitPitch = Number(selected.props?.cellWidth) || 0;
+                const derivedPitch = selected.w / cells;
+                const pitch = explicitPitch > 0 ? explicitPitch : derivedPitch;
+                return (
+                  <div className="space-y-2 rounded-md border p-2">
+                    <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                      Char grid
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <Field label="Cells">
+                        <NumInput
+                          value={cells}
+                          onChange={(v) => {
+                            const next = Math.max(1, Math.round(v));
+                            // If the user has set an explicit cell pitch,
+                            // grow/shrink W to keep the grid aligned to
+                            // that pitch instead of squishing each cell.
+                            if (explicitPitch > 0) {
+                              updateSelected({
+                                w: next * explicitPitch,
+                                props: {
+                                  ...selected.props,
+                                  cells: next,
+                                },
+                              });
+                            } else {
+                              updateSelectedProp("cells", next);
+                            }
+                          }}
+                        />
+                      </Field>
+                      <Field label="Cell width (pt)">
+                        <NumInput
+                          value={pitch}
+                          step={0.1}
+                          onChange={(v) => {
+                            // Setting cell width locks pitch + recomputes
+                            // total W. Set to 0 to clear (revert to
+                            // W/cells derivation).
+                            const cw = v > 0 ? v : 0;
+                            updateSelected({
+                              w: cw > 0 ? cw * cells : selected.w,
+                              props: {
+                                ...selected.props,
+                                cellWidth: cw,
+                              },
+                            });
+                          }}
+                        />
+                      </Field>
+                    </div>
+                    <Field label="Cell offset X (pt)">
+                      <NumInput
+                        value={Number(selected.props?.cellOffsetX ?? 0)}
+                        step={0.1}
+                        onChange={(v) =>
+                          updateSelectedProp("cellOffsetX", v)
+                        }
+                      />
+                    </Field>
+                    <label className="flex items-center gap-2 text-xs">
+                      <input
+                        type="checkbox"
+                        checked={!!selected.props?.drawCells}
+                        onChange={(e) =>
+                          updateSelectedProp("drawCells", e.target.checked)
+                        }
+                      />
+                      Draw cell outlines
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (sampleMode?.widgetId === selected.id) {
+                          setSampleMode(null);
+                        } else {
+                          setSampleMode({
+                            widgetId: selected.id,
+                            firstPdf: null,
+                          });
+                        }
+                      }}
+                      className={
+                        "w-full rounded border px-2 py-1.5 text-xs font-medium transition-colors " +
+                        (sampleMode?.widgetId === selected.id
+                          ? "border-blue-500 bg-blue-50 text-blue-700"
+                          : "hover:bg-muted/60")
+                      }
+                    >
+                      {sampleMode?.widgetId === selected.id
+                        ? "✕ Cancel sampling (Esc)"
+                        : "📐 Sample pitch from canvas"}
+                    </button>
+                    {(() => {
+                      // Per-cell mode is implicit: presence of a
+                      // cellWidths array of the right length means the
+                      // user has dragged at least one boundary. Surface
+                      // the mode + offer a reset back to equal pitch.
+                      const cw = selected.props?.cellWidths;
+                      const perCell =
+                        Array.isArray(cw) && cw.length === cells;
+                      if (!perCell) {
+                        return (
+                          <p className="text-[11px] text-muted-foreground italic">
+                            Equal pitch — drag the blue vertical bars
+                            between cells on the canvas to make widths
+                            individually adjustable.
+                          </p>
+                        );
+                      }
+                      const widths = (cw as unknown[]).map(
+                        (n) => Number(n) || 0,
+                      );
+                      const minW = Math.min(...widths);
+                      const maxW = Math.max(...widths);
+                      return (
+                        <div className="space-y-1">
+                          <p className="text-[11px] text-muted-foreground">
+                            <em>Per-cell widths</em> active —{" "}
+                            {widths.length} cells from {minW.toFixed(1)}pt
+                            to {maxW.toFixed(1)}pt.
+                          </p>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const rest = { ...selected.props };
+                              delete (rest as Record<string, unknown>)
+                                .cellWidths;
+                              updateSelected({ props: rest });
+                            }}
+                            className="w-full rounded border px-2 py-1.5 text-xs hover:bg-muted/60"
+                          >
+                            ↺ Reset to equal pitch
+                          </button>
+                        </div>
+                      );
+                    })()}
+                    <p className="text-[11px] text-muted-foreground">
+                      To match a printed grid: drag the widget so its
+                      left edge sits on the first printed cell, set{" "}
+                      <span className="font-semibold">Cells</span> to
+                      the number of printed boxes, then type the printed
+                      cell pitch into{" "}
+                      <span className="font-semibold">Cell width</span>{" "}
+                      (W auto-adjusts). Use{" "}
+                      <span className="font-semibold">Cell offset X</span>{" "}
+                      to nudge characters left/right inside their cell
+                      if the printed boxes aren't perfectly even.
+                      {explicitPitch > 0 ? (
+                        <> Currently <em>fixed-pitch</em> at {explicitPitch.toFixed(2)}pt.</>
+                      ) : (
+                        <> Currently <em>auto-fit</em> at ≈ {derivedPitch.toFixed(2)}pt per cell.</>
+                      )}
+                    </p>
+                  </div>
+                );
+              })()}
 
               {/* ---- Box style: background, border, padding, opacity ---- */}
               {selected.type !== "checkbox" &&
@@ -2939,6 +3890,7 @@ export default function StaticDesigner({
                 </button>
               </div>
             </div>
+            )
           ) : selectedIds.length > 1 ? (
             <div className="p-4 text-xs text-gray-600 space-y-3">
               <p>
@@ -2987,6 +3939,77 @@ export default function StaticDesigner({
         </div>
         <div className="flex items-center gap-3">
           <span className="hidden sm:inline">{savedHint}</span>
+          {/* View-mode toggle. Continuous = stack-all (legacy default,
+              best for scrolling a multi-page doc). Paginated = one page
+              at a time with prev/next controls — narrower viewport,
+              easier review of a single page. */}
+          <div className="flex items-center gap-0.5 rounded border bg-background">
+            <button
+              onClick={() => setViewMode("continuous")}
+              title="Show all pages (continuous scroll)"
+              className={
+                "px-2 py-0.5 text-[11px] " +
+                (viewMode === "continuous"
+                  ? "bg-primary/10 text-primary"
+                  : "hover:bg-muted")
+              }
+            >
+              All
+            </button>
+            <button
+              onClick={() => setViewMode("paginated")}
+              title="Show one page at a time"
+              className={
+                "border-l px-2 py-0.5 text-[11px] " +
+                (viewMode === "paginated"
+                  ? "bg-primary/10 text-primary"
+                  : "hover:bg-muted")
+              }
+            >
+              Page
+            </button>
+          </div>
+          {/* Page navigator — only meaningful in paginated mode. We
+              still render it disabled in continuous mode would just be
+              noise, so hide it entirely there. PageUp/PageDown shortcuts
+              cover keyboard nav. */}
+          {viewMode === "paginated" && numPages > 0 && (
+            <div className="flex items-center gap-0.5 rounded border bg-background">
+              <button
+                onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                disabled={currentPage <= 1}
+                title="Previous page (PageUp)"
+                className="px-1.5 py-0.5 hover:bg-muted disabled:opacity-40"
+              >
+                <ChevronLeft className="h-3 w-3" />
+              </button>
+              <input
+                type="number"
+                min={1}
+                max={numPages}
+                value={currentPage}
+                onChange={(e) => {
+                  const n = parseInt(e.target.value, 10);
+                  if (!Number.isFinite(n)) return;
+                  setCurrentPage(Math.max(1, Math.min(numPages, n)));
+                }}
+                className="w-10 bg-transparent px-1 py-0.5 text-center text-[11px] tabular-nums outline-none"
+              />
+              <span className="pr-1 text-[11px] tabular-nums text-muted-foreground">
+                / {numPages}
+              </span>
+              <button
+                onClick={() =>
+                  setCurrentPage((p) => Math.min(numPages, p + 1))
+                }
+                disabled={currentPage >= numPages}
+                title="Next page (PageDown)"
+                className="border-l px-1.5 py-0.5 hover:bg-muted disabled:opacity-40"
+              >
+                <ChevronRight className="h-3 w-3" />
+              </button>
+            </div>
+          )}
           {/* Zoom cluster lives in the status bar — canvas-local controls
               don't belong in the global header. */}
           <div className="flex items-center gap-0.5 rounded border bg-background">
@@ -3044,6 +4067,11 @@ export default function StaticDesigner({
               </button>
             </div>
             <div className="p-5 space-y-3 overflow-y-auto">
+              <p className="text-xs text-muted-foreground">
+                Edit the values below and click Generate. The latest
+                widget changes are saved automatically before rendering,
+                so the PDF reflects what you see on the canvas.
+              </p>
               <textarea
                 className="w-full font-mono text-xs border rounded p-3 h-64"
                 value={genJSON}
@@ -3057,6 +4085,194 @@ export default function StaticDesigner({
                 />
                 Run asynchronously (via worker queue)
               </label>
+
+              {/* Output options — what to do with the rendered PDF.
+                  Save-to-Drive defaults OFF so a quick test render stays
+                  ephemeral. When OFF the response carries only a 10-min
+                  presigned download URL; no Drive row, no clutter.
+                  When ON the filename + folder inputs become live so the
+                  user can override the template's defaults per render. */}
+              <div className="rounded-md border bg-muted/30 p-3 space-y-2">
+                <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  Output
+                </div>
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={genSaveToDrive}
+                    onChange={(e) => setGenSaveToDrive(e.target.checked)}
+                  />
+                  Save to Drive
+                  <span className="text-[11px] text-muted-foreground">
+                    (off = ephemeral 10-min download URL, no file row)
+                  </span>
+                </label>
+                {genSaveToDrive && (
+                  <div className="grid grid-cols-2 gap-2 pt-1">
+                    <label className="space-y-1 text-xs">
+                      <span className="text-muted-foreground">
+                        Filename (overrides template)
+                      </span>
+                      <input
+                        type="text"
+                        value={genOutputName}
+                        onChange={(e) => setGenOutputName(e.target.value)}
+                        placeholder="Invoice-{{invoiceNumber}}.pdf"
+                        className="w-full rounded border px-2 py-1 text-xs font-mono"
+                      />
+                    </label>
+                    <label className="space-y-1 text-xs">
+                      <span className="text-muted-foreground">
+                        Folder path (logical)
+                      </span>
+                      <input
+                        type="text"
+                        value={genOutputPath}
+                        onChange={(e) => setGenOutputPath(e.target.value)}
+                        placeholder="clients/{{customer}}/2025"
+                        className="w-full rounded border px-2 py-1 text-xs font-mono"
+                      />
+                    </label>
+                  </div>
+                )}
+                <label className="flex items-center gap-2 text-sm pt-1">
+                  <input
+                    type="checkbox"
+                    checked={genFlatten}
+                    onChange={(e) => setGenFlatten(e.target.checked)}
+                  />
+                  Flatten form fields (AcroForm only)
+                  <span className="text-[11px] text-muted-foreground">
+                    bakes values into static content
+                  </span>
+                </label>
+              </div>
+
+              {/* Security — collapsed by default. When opened, the user
+                  can encrypt this single render with a password +
+                  permissions, overriding the template's security policy.
+                  Sending an empty block is intentional: it lets users
+                  render unprotected even when the template normally
+                  encrypts. We DON'T expose that today (both fields blank
+                  → omit the block entirely so template policy applies). */}
+              <div className="rounded-md border bg-muted/30 p-3 space-y-2">
+                <button
+                  type="button"
+                  onClick={() => setGenSecurityOpen((v) => !v)}
+                  className="flex w-full items-center justify-between text-[10px] font-semibold uppercase tracking-wider text-muted-foreground"
+                >
+                  <span>Security {(genUserPwd || genOwnerPwd) && "• ON"}</span>
+                  <span>{genSecurityOpen ? "▴" : "▾"}</span>
+                </button>
+                {genSecurityOpen && (
+                  <div className="space-y-2">
+                    <p className="text-[11px] text-muted-foreground">
+                      Set a password to encrypt this render. Leave both
+                      blank to use the template&apos;s default security
+                      policy.
+                    </p>
+                    <div className="grid grid-cols-2 gap-2">
+                      <label className="space-y-1 text-xs">
+                        <span className="text-muted-foreground">
+                          User password (open)
+                        </span>
+                        <input
+                          type="password"
+                          value={genUserPwd}
+                          onChange={(e) => setGenUserPwd(e.target.value)}
+                          autoComplete="new-password"
+                          className="w-full rounded border px-2 py-1 text-xs"
+                        />
+                      </label>
+                      <label className="space-y-1 text-xs">
+                        <span className="text-muted-foreground">
+                          Owner password (permissions)
+                        </span>
+                        <input
+                          type="password"
+                          value={genOwnerPwd}
+                          onChange={(e) => setGenOwnerPwd(e.target.value)}
+                          autoComplete="new-password"
+                          className="w-full rounded border px-2 py-1 text-xs"
+                        />
+                      </label>
+                    </div>
+                    <label className="space-y-1 text-xs block">
+                      <span className="text-muted-foreground">Encryption</span>
+                      <select
+                        value={genEncryption}
+                        onChange={(e) =>
+                          setGenEncryption(
+                            e.target.value as "AES-128" | "AES-256",
+                          )
+                        }
+                        className="w-full rounded border px-2 py-1 text-xs"
+                      >
+                        <option value="AES-256">AES-256 (recommended)</option>
+                        <option value="AES-128">AES-128</option>
+                      </select>
+                    </label>
+                    <div className="space-y-1">
+                      <div className="text-xs text-muted-foreground">
+                        Permissions
+                      </div>
+                      <label className="flex items-center gap-2 text-xs">
+                        <input
+                          type="checkbox"
+                          checked={genPermAll}
+                          onChange={(e) => setGenPermAll(e.target.checked)}
+                        />
+                        Grant all (overrides individual flags)
+                      </label>
+                      {!genPermAll && (
+                        <div className="grid grid-cols-2 gap-1 pl-5">
+                          <label className="flex items-center gap-2 text-xs">
+                            <input
+                              type="checkbox"
+                              checked={genPermPrint}
+                              onChange={(e) =>
+                                setGenPermPrint(e.target.checked)
+                              }
+                            />
+                            Print
+                          </label>
+                          <label className="flex items-center gap-2 text-xs">
+                            <input
+                              type="checkbox"
+                              checked={genPermCopy}
+                              onChange={(e) =>
+                                setGenPermCopy(e.target.checked)
+                              }
+                            />
+                            Copy text
+                          </label>
+                          <label className="flex items-center gap-2 text-xs">
+                            <input
+                              type="checkbox"
+                              checked={genPermModify}
+                              onChange={(e) =>
+                                setGenPermModify(e.target.checked)
+                              }
+                            />
+                            Modify
+                          </label>
+                          <label className="flex items-center gap-2 text-xs">
+                            <input
+                              type="checkbox"
+                              checked={genPermAnnotate}
+                              onChange={(e) =>
+                                setGenPermAnnotate(e.target.checked)
+                              }
+                            />
+                            Annotate
+                          </label>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+
               {genProgress && <div className="text-sm text-gray-600">Job: {genProgress}</div>}
             </div>
             <div className="px-5 py-3 border-t flex items-center justify-end gap-2">
@@ -3072,7 +4288,11 @@ export default function StaticDesigner({
                 disabled={genBusy}
                 className="px-4 py-1.5 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
               >
-                {genBusy ? "Generating…" : "Generate & download"}
+                {genBusy
+                  ? "Generating…"
+                  : genSaveToDrive
+                  ? "Generate & save to Drive"
+                  : "Generate (download only)"}
               </button>
             </div>
           </div>
@@ -3090,6 +4310,13 @@ export default function StaticDesigner({
 
       <BatchDialog open={batchOpen} onOpenChange={setBatchOpen} templateId={tpl.id} />
 
+      <CollabDrawer
+        open={collabOpen}
+        onOpenChange={setCollabOpen}
+        templateId={tpl.id}
+        templateName={tpl.name}
+      />
+
       <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} commands={commands} />
       <ShortcutHelp
         open={helpOpen}
@@ -3101,6 +4328,7 @@ export default function StaticDesigner({
           { keys: "?", label: "Show this help", group: "General" },
           { keys: `${M}+ / ${M}- / ${M}0`, label: "Zoom in / out / reset", group: "View" },
           { keys: "Space + drag", label: "Pan canvas", group: "View" },
+          { keys: "PageUp / PageDown", label: "Previous / next page (paginated mode)", group: "View" },
           { keys: `${M}Z / ${M}⇧Z`, label: "Undo / redo", group: "Edit" },
           { keys: `${M}C / ${M}V`, label: "Copy / paste", group: "Edit" },
           { keys: `${M}D`, label: "Duplicate selection", group: "Edit" },
@@ -3139,6 +4367,32 @@ export default function StaticDesigner({
             value={sampleJSON}
             onChange={(e) => setSampleJSON(e.target.value)}
           />
+
+          {/* Import toolbar — replace widgets+layout+sample from a JSON
+              file produced by the matching Export → Full config button.
+              Hidden when readOnly (viewers shouldn't be able to mutate). */}
+          {!readOnly && (
+            <div className="rounded-md border bg-muted/30 p-3">
+              <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                Import
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1.5 text-xs"
+                onClick={() => importFullConfig()}
+              >
+                <Upload className="h-3.5 w-3.5" />
+                Import full config (JSON)
+              </Button>
+              <p className="mt-2 text-[10px] text-muted-foreground">
+                Replaces the current widgets, page layout, and sample data
+                with those from a previously-exported template config file.
+                AcroForm field bindings on the underlying PDF are preserved.
+                Click <strong>Save</strong> after importing to persist.
+              </p>
+            </div>
+          )}
 
           {/* Export toolbar */}
           <div className="rounded-md border bg-muted/30 p-3">
@@ -3443,6 +4697,45 @@ function RailBtn({
   );
 }
 
+// Sub-tab button for the unified Fields panel (Schema / Layers / Tab order).
+// Three of these sit side-by-side under the panel header. Active tab shows
+// a bottom underline + tinted background; inactive tabs hover-darken.
+function FieldsTabBtn({
+  icon: Icon,
+  label,
+  active,
+  badge,
+  onClick,
+}: {
+  icon: React.ComponentType<{ className?: string }>;
+  label: string;
+  active?: boolean;
+  badge?: number;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={
+        "relative flex flex-1 items-center justify-center gap-1 px-2 py-2 transition-colors " +
+        (active
+          ? "bg-muted/50 font-medium text-foreground border-b-2 border-primary"
+          : "text-muted-foreground hover:bg-muted/40 hover:text-foreground border-b-2 border-transparent")
+      }
+    >
+      <Icon className="h-3.5 w-3.5" />
+      <span>{label}</span>
+      {badge !== undefined && badge > 0 && (
+        <span className="ml-0.5 rounded-full bg-muted px-1 text-[9px] tabular-nums text-muted-foreground">
+          {badge}
+        </span>
+      )}
+    </button>
+  );
+}
+
 function AlignBtn({
   children,
   label,
@@ -3502,6 +4795,16 @@ function defaultProps(type: string): Record<string, any> {
       };
     case "multiline":
       return { ...textBase, fontSize: 11 };
+    case "comb":
+      // Char-grid: 10 cells, centred per cell, monospace by default so
+      // the seeded look matches printed PAN-style boxes out of the gate.
+      return {
+        ...textBase,
+        fontFamily: "Courier",
+        align: "C",
+        cells: 10,
+        drawCells: false,
+      };
     case "qr":
       return {};
     case "barcode":
@@ -3549,6 +4852,18 @@ function makeWidget(
 
 function newId() {
   return `w_${Date.now().toString(36)}_${Math.floor(Math.random() * 1e4)}`;
+}
+
+// Best human-readable name for a widget. Mirrors how the layers panel
+// labels rows: explicit `_label` wins, then dataKey, then acro field
+// name, then the widget type, then a generic fallback.
+function widgetLabel(w: Widget): string {
+  const lbl = (w.props?._label as string | undefined)?.trim();
+  if (lbl) return lbl;
+  if (w.dataKey) return w.dataKey;
+  if (w.acroFieldName) return w.acroFieldName;
+  if (w.type) return w.type;
+  return "Untitled";
 }
 
 function maybeSnap(v: number, on: boolean) {
@@ -3686,4 +5001,193 @@ function formatRelative(d: Date): string {
   if (sec < 60) return `${sec}s ago`;
   if (sec < 3600) return `${Math.floor(sec / 60)}m ago`;
   return d.toLocaleTimeString();
+}
+
+// Properties panel body for an acro-bound widget — i.e. a synthetic
+// widget that represents a /FT field already on the source PDF. Renders
+// the same rich mapping editor the standalone AcroForm Designer used
+// (transform pipeline, validation rules, conditional fill) so users
+// don't lose any capability when they edit AcroForm templates inside
+// the Static Designer surface. All edits flow through `patchAcroMapping`,
+// which keeps `props._acroMapping` in sync — and `save()` later splits
+// that back out into `config.mappings` (preserving the AcroForm API
+// contract — no schema migration).
+function AcroBoundProps({
+  selected,
+  widgets,
+  tpl,
+  sample,
+  sampleKeys,
+  patchAcroMapping,
+  updateSelected,
+}: {
+  selected: Widget;
+  widgets: Widget[];
+  tpl: Template;
+  sample: Record<string, any>;
+  sampleKeys: Set<string>;
+  patchAcroMapping: (patch: Partial<AcroMapping>) => void;
+  updateSelected: (patch: Partial<Widget>) => void;
+}) {
+  const mapping: AcroMapping =
+    (selected.props?._acroMapping as AcroMapping) ||
+    ({ dataKey: selected.dataKey } as AcroMapping);
+
+  // Reconstruct an AcroFormField shape from the tunneled props for
+  // ValidationRulesEditor (which uses field.maxLen / field.type / etc.
+  // to seed sensible defaults like type=boolean for checkboxes).
+  const acroField: AcroFormFieldFull = {
+    name: selected.acroFieldName!,
+    type: selected.acroFieldType || "Tx",
+    page: selected.page,
+    rect: { x: selected.x, y: selected.y, w: selected.w, h: selected.h },
+    options: selected.props?._acroOptions as string[] | undefined,
+    maxLen: selected.props?._acroMaxLen as number | undefined,
+    tooltip: selected.props?._acroTooltip as string | undefined,
+    readOnly: !!selected.props?._acroReadOnly,
+    multiline: !!selected.props?._acroMultiline,
+    required: !!mapping.required,
+  };
+
+  // Auto-complete suggestions for transform/conditional editors. Pulls
+  // from every other widget's dataKey + every existing acro mapping.
+  const allFieldDataKeys: string[] = (() => {
+    const set = new Set<string>();
+    for (const w of widgets) {
+      if (w.id !== selected.id && w.dataKey) set.add(w.dataKey);
+    }
+    const cfgMappings = (tpl.config?.mappings || {}) as Record<
+      string,
+      AcroMapping
+    >;
+    for (const m of Object.values(cfgMappings)) {
+      if (m?.dataKey) set.add(m.dataKey);
+    }
+    for (const k of sampleKeys) set.add(k);
+    return Array.from(set).sort();
+  })();
+
+  return (
+    <div className="p-4 space-y-3 text-sm">
+      {/* Field metadata header — read-only since these come from the PDF */}
+      <div className="rounded-md border border-amber-300 bg-amber-50 p-2 text-xs">
+        <div className="flex items-center justify-between">
+          <span className="font-mono font-semibold text-amber-900">
+            ▦ {selected.acroFieldName}
+          </span>
+          <span className="rounded bg-amber-200 px-1.5 py-0.5 font-mono text-[10px] text-amber-900">
+            {selected.acroFieldType || "Tx"}
+          </span>
+        </div>
+        <p className="mt-1 text-[11px] text-amber-800">
+          AcroForm field from the source PDF. Geometry is locked; binding
+          and behaviour are editable below.
+        </p>
+        {acroField.tooltip && (
+          <p className="mt-1 text-[11px] italic text-amber-700">
+            Tooltip: {acroField.tooltip}
+          </p>
+        )}
+      </div>
+
+      <Field label="Data key">
+        <input
+          className="w-full border rounded px-2 py-1 font-mono text-sm"
+          value={mapping.dataKey || ""}
+          onChange={(e) => patchAcroMapping({ dataKey: e.target.value })}
+        />
+      </Field>
+
+      <Field label="Default value">
+        <input
+          className="w-full border rounded px-2 py-1 text-sm"
+          value={mapping.default || ""}
+          onChange={(e) =>
+            patchAcroMapping({ default: e.target.value || undefined })
+          }
+          placeholder="(none)"
+        />
+      </Field>
+
+      <Field label="Section">
+        <input
+          className="w-full border rounded px-2 py-1 text-sm"
+          value={mapping.section || ""}
+          onChange={(e) =>
+            patchAcroMapping({ section: e.target.value || undefined })
+          }
+          placeholder="(ungrouped)"
+        />
+      </Field>
+
+      <div className="flex items-center gap-4 text-xs">
+        <label className="flex items-center gap-1.5">
+          <input
+            type="checkbox"
+            checked={!!mapping.required}
+            onChange={(e) =>
+              patchAcroMapping({ required: e.target.checked || undefined })
+            }
+          />
+          Required
+        </label>
+        <label className="flex items-center gap-1.5">
+          <input
+            type="checkbox"
+            checked={!!mapping.flatten}
+            onChange={(e) =>
+              patchAcroMapping({ flatten: e.target.checked || undefined })
+            }
+          />
+          Flatten
+        </label>
+      </div>
+
+      {/* Transform pipeline */}
+      <div className="space-y-1.5 rounded-md border p-2">
+        <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+          Transform
+        </div>
+        <TransformEditor
+          value={mapping.transform as Transform | Transform[] | string | undefined}
+          allFieldDataKeys={allFieldDataKeys}
+          onChange={(t) => patchAcroMapping({ transform: t })}
+        />
+      </div>
+
+      {/* Validation rule */}
+      <div className="space-y-1.5 rounded-md border p-2">
+        <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+          Validation
+        </div>
+        <ValidationRulesEditor
+          value={mapping.validation as ValidationRule | undefined}
+          field={acroField}
+          onChange={(rule) => patchAcroMapping({ validation: rule })}
+        />
+      </div>
+
+      {/* Conditional fill */}
+      <ConditionalEditor
+        value={mapping.fillWhen}
+        allFieldDataKeys={allFieldDataKeys}
+        sampleData={sample}
+        onChange={(expr) => patchAcroMapping({ fillWhen: expr })}
+      />
+
+      {/* Lock toggle — the field is locked by default (geometry pinned to
+          PDF /Annots), but we expose unlock-for-data-bind via the existing
+          locked flag so power users can still nudge a tooltip etc. */}
+      <div className="flex items-center justify-between rounded-md border p-2 text-xs">
+        <span className="text-muted-foreground">Geometry locked</span>
+        <button
+          type="button"
+          className="rounded border px-2 py-0.5 text-xs hover:bg-muted/60"
+          onClick={() => updateSelected({ locked: !selected.locked })}
+        >
+          {selected.locked ? "Unlock" : "Lock"}
+        </button>
+      </div>
+    </div>
+  );
 }

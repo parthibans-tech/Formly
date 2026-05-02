@@ -105,6 +105,143 @@ export function downloadFullExport(
 }
 
 // ---------------------------------------------------------------------------
+// Import — counterpart to buildFullExport.
+// Validates a parsed JSON blob against the FullTemplateExport contract and
+// returns the three pieces a designer needs to overwrite local state:
+//   • widgets       — fresh array (caller decides how to merge / replace)
+//   • config        — page layout + custom fonts
+//   • sampleData    — raw object, ready to JSON.stringify back into the
+//                     sample textarea
+// Throws with a human-readable message on schema mismatch so the caller
+// can surface it via toast.show("error", e.message).
+// ---------------------------------------------------------------------------
+
+export interface ImportedTemplate {
+  widgets: ExportableWidget[];
+  config: Record<string, any>;
+  sampleData: Record<string, any>;
+  /** Original template metadata from the export — useful for warnings. */
+  sourceMeta: {
+    id?: string;
+    name?: string;
+    mode?: string;
+    version?: number;
+    exportedAt?: string;
+  };
+}
+
+export function parseFullImport(raw: string): ImportedTemplate {
+  let parsed: any;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    throw new Error("File is not valid JSON");
+  }
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error("Expected a JSON object at the root");
+  }
+  // We accept three shapes:
+  //   1. Full export (has _version + widgets[])
+  //   2. Bare widgets array
+  //   3. { widgets: [...] } loose wrapper
+  // This makes the import forgiving — users sometimes paste in just the
+  // widgets array from a snippet, which is fine.
+  let widgets: any;
+  let config: any = {};
+  let sampleData: any = {};
+  let sourceMeta: ImportedTemplate["sourceMeta"] = {};
+
+  if (Array.isArray(parsed)) {
+    widgets = parsed;
+  } else if (Array.isArray(parsed.widgets)) {
+    widgets = parsed.widgets;
+    config = parsed.config && typeof parsed.config === "object" ? parsed.config : {};
+    sampleData =
+      parsed.sampleData && typeof parsed.sampleData === "object"
+        ? parsed.sampleData
+        : {};
+    if (parsed.template && typeof parsed.template === "object") {
+      sourceMeta = {
+        id: parsed.template.id,
+        name: parsed.template.name,
+        mode: parsed.template.mode,
+        version: parsed.template.version,
+      };
+    }
+    if (typeof parsed._exportedAt === "string") {
+      sourceMeta.exportedAt = parsed._exportedAt;
+    }
+  } else {
+    throw new Error("Missing `widgets` array — not a template export");
+  }
+
+  // Per-widget shape check. We don't validate every prop type, but the
+  // skeleton fields must be present and numeric, otherwise the designer
+  // will throw later when computing positions.
+  if (!Array.isArray(widgets)) {
+    throw new Error("`widgets` is not an array");
+  }
+  const cleaned: ExportableWidget[] = widgets.map((w, i) => {
+    if (!w || typeof w !== "object") {
+      throw new Error(`Widget #${i} is not an object`);
+    }
+    const required = ["type", "page", "x", "y", "w", "h"] as const;
+    for (const k of required) {
+      if (typeof (w as any)[k] !== (k === "type" ? "string" : "number")) {
+        throw new Error(`Widget #${i} missing or invalid \`${k}\``);
+      }
+    }
+    return {
+      id: typeof w.id === "string" ? w.id : undefined,
+      type: w.type,
+      page: w.page,
+      x: w.x,
+      y: w.y,
+      w: w.w,
+      h: w.h,
+      dataKey: typeof w.dataKey === "string" ? w.dataKey : "",
+      zIndex: typeof w.zIndex === "number" ? w.zIndex : 0,
+      props: w.props && typeof w.props === "object" ? w.props : {},
+      ...(w.locked ? { locked: true } : {}),
+      ...(w.hidden ? { hidden: true } : {}),
+    };
+  });
+
+  return { widgets: cleaned, config, sampleData, sourceMeta };
+}
+
+/**
+ * Browser file-picker helper. Opens a `<input type="file" accept=".json">`
+ * dialog, reads the chosen file as text, parses+validates it via
+ * `parseFullImport`, and resolves with the result. Resolves to `null` if
+ * the user cancels the dialog.
+ */
+export function pickAndParseFullImport(): Promise<ImportedTemplate | null> {
+  return new Promise((resolve, reject) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "application/json,.json";
+    input.onchange = async () => {
+      const file = input.files?.[0];
+      if (!file) {
+        resolve(null);
+        return;
+      }
+      try {
+        const text = await file.text();
+        resolve(parseFullImport(text));
+      } catch (e) {
+        reject(e);
+      }
+    };
+    // If the user dismisses the dialog without picking, no event fires —
+    // we never resolve. That's fine: the caller's await just hangs until
+    // the next interaction, and there's nothing to clean up.
+    input.click();
+  });
+}
+
+// ---------------------------------------------------------------------------
 // 1. Download sample JSON
 // ---------------------------------------------------------------------------
 

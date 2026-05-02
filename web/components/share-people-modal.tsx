@@ -17,10 +17,11 @@
  * both file rows and folder rows. Nothing renders unless `open` is
  * true, so it's cheap to leave mounted.
  */
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Check,
   ChevronDown,
+  Loader2,
   Plus,
   Search,
   Trash2,
@@ -92,11 +93,28 @@ export function SharePeopleModal({
   onOpenChange: (v: boolean) => void;
 }) {
   const toast = useToast();
+  // Server-paginated lazy search. `members` / `groups` are NOT the org's
+  // full roster — they're whatever the latest /v1/team/members?q= and
+  // /v1/groups?q= responses returned, capped at SEARCH_LIMIT. With a
+  // 1000-person workspace we'd otherwise haul the whole roster down on
+  // every modal open just to filter five rows in JS.
   const [members, setMembers] = useState<Member[]>([]);
   const [groups, setGroups] = useState<Group[]>([]);
   const [shares, setShares] = useState<Share[]>([]);
+  // `loading` covers the initial open (shares + first page); `searching`
+  // is the per-keystroke debounced refetch so the spinner only shows on
+  // the search row, not the whole list.
   const [loading, setLoading] = useState(false);
+  const [searching, setSearching] = useState(false);
   const [query, setQuery] = useState("");
+  // Cap whatever the server returns at this many rows in the picker. The
+  // backend will respect the same limit and we surface a "refine search"
+  // hint to the user when we hit it.
+  const SEARCH_LIMIT = 25;
+  // Initial open: show the first page of members (no query). Treat this
+  // as a "recent / first 25" view so the user immediately sees who's
+  // around without having to type, but doesn't drown in 800 names.
+  const INITIAL_LIMIT = 25;
   // Role is picked once per invite; switch it and every principal you
   // add next takes that role. Keeps the UI small for the common case
   // of "share to three people as viewers".
@@ -116,9 +134,45 @@ export function SharePeopleModal({
   );
   const [creating, setCreating] = useState(false);
 
+  // Initial open — fetch shares + a small "first page" of people /
+  // groups so the picker isn't blank. Subsequent keystrokes go through
+  // the debounced search effect below; this one runs only when the modal
+  // (re)opens or switches target resource, and it deliberately uses an
+  // empty query so the user sees a sample without having to type first.
   useEffect(() => {
     if (!open) return;
-    void loadAll();
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      // Reset query each time we (re)open so a stale search from the
+      // last invocation doesn't bleed into the new resource.
+      setQuery("");
+      try {
+        const [m, g, s] = await Promise.all([
+          api<{ members: Member[] }>(
+            `/v1/team/members?limit=${INITIAL_LIMIT}`
+          ),
+          api<{ groups: Group[] }>(`/v1/groups?limit=${INITIAL_LIMIT}`),
+          api<{ shares: Share[] }>(
+            `/v1/${resourceType}s/${resourceId}/access`
+          ),
+        ]);
+        if (cancelled) return;
+        setMembers(m.members);
+        setGroups(g.groups);
+        setShares(s.shares);
+      } catch (e: any) {
+        if (cancelled) return;
+        toast.show("error", "Couldn't load sharing info", {
+          description: e.message,
+        });
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, resourceId, resourceType]);
 
@@ -130,27 +184,44 @@ export function SharePeopleModal({
     setNewGroupMembers(new Set());
   }, [open, resourceId, resourceType]);
 
-  async function loadAll() {
-    setLoading(true);
-    try {
-      const [m, g, s] = await Promise.all([
-        api<{ members: Member[] }>("/v1/team/members"),
-        api<{ groups: Group[] }>("/v1/groups"),
-        api<{ shares: Share[] }>(
-          `/v1/${resourceType}s/${resourceId}/access`
-        ),
-      ]);
-      setMembers(m.members);
-      setGroups(g.groups);
-      setShares(s.shares);
-    } catch (e: any) {
-      toast.show("error", "Couldn't load sharing info", {
-        description: e.message,
-      });
-    } finally {
-      setLoading(false);
-    }
-  }
+  // Debounced server-side search. Re-runs whenever the query changes
+  // *after* the initial open. We track the latest request token in a ref
+  // so a slow response from a stale keystroke can't overwrite the result
+  // of a fresh one (the classic "type fast, results jump" race).
+  const searchSeq = useRef(0);
+  useEffect(() => {
+    if (!open) return;
+    const q = query.trim();
+    // Empty query falls back to the same "first page" the initial open
+    // used — but we still want the effect to run when the user clears
+    // the search so the previous matches don't linger.
+    const handle = setTimeout(async () => {
+      const seq = ++searchSeq.current;
+      setSearching(true);
+      try {
+        const params = new URLSearchParams();
+        if (q) params.set("q", q);
+        params.set("limit", String(q ? SEARCH_LIMIT : INITIAL_LIMIT));
+        const [m, g] = await Promise.all([
+          api<{ members: Member[] }>(`/v1/team/members?${params}`),
+          api<{ groups: Group[] }>(`/v1/groups?${params}`),
+        ]);
+        // Guard against an out-of-order resolve clobbering a fresher
+        // search — only the most recently dispatched request gets to
+        // commit its results.
+        if (seq !== searchSeq.current) return;
+        setMembers(m.members);
+        setGroups(g.groups);
+      } catch (e: any) {
+        if (seq !== searchSeq.current) return;
+        toast.show("error", "Search failed", { description: e.message });
+      } finally {
+        if (seq === searchSeq.current) setSearching(false);
+      }
+    }, 200);
+    return () => clearTimeout(handle);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query, open]);
 
   // Principals already granted — keep the list visible but the "Invite"
   // button becomes a "Change role" inline control.
@@ -163,17 +234,19 @@ export function SharePeopleModal({
     [shares]
   );
 
-  const q = query.trim().toLowerCase();
-  const filteredMembers = members.filter(
-    (m) =>
-      !m.isSelf &&
-      (!q ||
-        m.email.toLowerCase().includes(q) ||
-        (m.name || "").toLowerCase().includes(q))
-  );
-  const filteredGroups = groups.filter(
-    (g) => !q || g.name.toLowerCase().includes(q)
-  );
+  // Server already applied the `q` filter; we just hide the caller from
+  // the picker so they don't share with themselves. We deliberately
+  // *don't* re-filter members or groups by query here — that would
+  // create a confusing "the row I just saw vanished" if the server's
+  // case-folding diverged from JS's (it won't today, but contracts beat
+  // luck). The server is the source of truth for matches; we render
+  // exactly what it returned.
+  const filteredMembers = members.filter((m) => !m.isSelf);
+  const filteredGroups = groups;
+  const hitMemberCap =
+    filteredMembers.length >= (query.trim() ? SEARCH_LIMIT : INITIAL_LIMIT);
+  const hitGroupCap =
+    filteredGroups.length >= (query.trim() ? SEARCH_LIMIT : INITIAL_LIMIT);
 
   async function grant(principal: { userId?: string; groupId?: string }) {
     const key = principal.userId || principal.groupId || "";
@@ -184,7 +257,13 @@ export function SharePeopleModal({
         body: JSON.stringify({ ...principal, role }),
       });
       toast.show("success", "Access granted");
-      await loadAll();
+      // Only the shares list changed; refetch it alone instead of
+      // reloading members + groups (which the lazy-search effect now
+      // owns and which would discard the user's current search results).
+      const s = await api<{ shares: Share[] }>(
+        `/v1/${resourceType}s/${resourceId}/access`
+      );
+      setShares(s.shares);
     } catch (e: any) {
       toast.show("error", "Couldn't share", { description: e.message });
     } finally {
@@ -242,11 +321,24 @@ export function SharePeopleModal({
         body: JSON.stringify({ groupId, role }),
       });
 
-      // 4. Reset, refresh, and report.
+      // 4. Reset, refresh, and report. Pull shares (the new group
+      //    share row) and groups (so the new group is searchable
+      //    immediately) — members can't have changed.
       setCreatorOpen(false);
       setNewGroupName("");
       setNewGroupMembers(new Set());
-      await loadAll();
+      const q = query.trim();
+      const groupParams = new URLSearchParams();
+      if (q) groupParams.set("q", q);
+      groupParams.set("limit", String(q ? SEARCH_LIMIT : INITIAL_LIMIT));
+      const [s, g] = await Promise.all([
+        api<{ shares: Share[] }>(
+          `/v1/${resourceType}s/${resourceId}/access`
+        ),
+        api<{ groups: Group[] }>(`/v1/groups?${groupParams}`),
+      ]);
+      setShares(s.shares);
+      setGroups(g.groups);
 
       if (failedMemberAdds > 0) {
         toast.show(
@@ -308,8 +400,14 @@ export function SharePeopleModal({
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder="Search people or groups…"
-                className="pl-8"
+                className="pl-8 pr-8"
               />
+              {/* Right-aligned spinner — only while a debounced search
+                  is in flight. Sits inside the input so the layout
+                  doesn't reflow when it appears/disappears. */}
+              {searching && (
+                <Loader2 className="pointer-events-none absolute right-2.5 top-2.5 h-3.5 w-3.5 animate-spin text-muted-foreground" />
+              )}
             </div>
             <Select value={role} onValueChange={(v) => setRole(v as Role)}>
               <SelectTrigger className="w-[110px]">
@@ -548,7 +646,19 @@ export function SharePeopleModal({
                 )}
                 {filteredMembers.length === 0 && filteredGroups.length === 0 && (
                   <div className="p-6 text-center text-xs text-muted-foreground">
-                    No matches
+                    {query.trim()
+                      ? `No matches for “${query.trim()}”`
+                      : "Type to search teammates or groups"}
+                  </div>
+                )}
+                {/* Cap-hit footer — when we ran into SEARCH_LIMIT/INITIAL_LIMIT
+                    on either list, prompt the user to narrow their query so
+                    they don't assume the result set is exhaustive. */}
+                {(hitMemberCap || hitGroupCap) && (
+                  <div className="border-t bg-muted/20 px-3 py-1.5 text-center text-[11px] text-muted-foreground">
+                    {query.trim()
+                      ? `Showing the first ${SEARCH_LIMIT}. Refine your search to narrow further.`
+                      : `Showing the first ${INITIAL_LIMIT}. Type to search the full workspace.`}
                   </div>
                 )}
               </>

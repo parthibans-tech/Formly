@@ -632,6 +632,22 @@ type generateReq struct {
 	// integrators routing per-tenant or per-customer output trees
 	// without baking the path into the template config.
 	OutputPath string `json:"outputPath,omitempty"`
+
+	// SaveToDrive controls whether the rendered PDF lands in the user's
+	// Drive (files table + storage). Pointer so we distinguish "unset"
+	// (nil → defaults to true to preserve legacy integrator behaviour —
+	// the API has always saved) from "explicit false" (skip persistence,
+	// return only an ephemeral presigned download URL). The web designer
+	// sends `false` for ad-hoc test renders so authors can iterate
+	// without polluting their file list.
+	SaveToDrive *bool `json:"saveToDrive,omitempty"`
+
+	// Security overrides the template-level config_json.security block
+	// for this single render. Mirrors the generate.SecurityOverride
+	// shape. Omit to use the template's policy. Pass an empty
+	// `{ "userPassword":"", "ownerPassword":"" }` to render unprotected
+	// even when the template would normally encrypt.
+	Security *generate.SecurityOverride `json:"security,omitempty"`
 }
 
 type generateResp struct {
@@ -686,15 +702,43 @@ func (h *Handler) Generate(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 503, "queue_unavailable", "async dispatch disabled (no queue client)")
 			return
 		}
+		// Ephemeral + async is a paradox: ephemeral means "don't persist
+		// — return a 10-minute presigned URL", but async means "come
+		// back later via job polling for the result". The job record
+		// has no place to stash the ephemeral URL today (would need a
+		// schema column), so reject the combo with a clear hint instead
+		// of silently saving to Drive (the legacy bug) or silently
+		// dropping the output. Sync renders cover the use case.
+		if req.SaveToDrive != nil && !*req.SaveToDrive {
+			writeErr(w, 400, "incompatible_options",
+				"saveToDrive=false is only supported for sync renders (drop async=true to use ephemeral output)")
+			return
+		}
 		jobID, err := jobs.Create(r.Context(), h.DB, c.OrgID, c.UserID, id, "single", 1)
 		if err != nil {
 			writeErr(w, 500, "db_error", err.Error())
 			return
 		}
+		// Re-marshal the security override so it rides along inside the
+		// queue payload as raw JSON. Avoids leaking the generate package
+		// type through queue's API surface; the worker decodes back into
+		// generate.SecurityOverride before calling RunOptions.Security.
+		var secRaw json.RawMessage
+		if req.Security != nil {
+			b, mErr := json.Marshal(req.Security)
+			if mErr == nil {
+				secRaw = b
+			}
+		}
 		task, err := queue.NewGenerateOne(queue.GenerateOnePayload{
 			JobID: jobID, OrgID: c.OrgID, UserID: c.UserID, TemplateID: id,
 			Data: req.Data, Flatten: req.Flatten,
 			OutputName: req.OutputName, OutputPath: req.OutputPath,
+			// Without these, async renders ignored the dialog's
+			// "Save to Drive" toggle and the per-call password fields —
+			// every async PDF unconditionally landed in Drive in cleartext.
+			SaveToDrive: req.SaveToDrive,
+			Security:    secRaw,
 		})
 		if err != nil {
 			writeErr(w, 500, "enqueue", err.Error())
@@ -708,13 +752,14 @@ func (h *Handler) Generate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Sync path: delegate to the shared Runner. Per-call output naming
-	// overrides ride along via RunWithOpts; security is template-level
-	// only (intentionally not overridable from the request body).
+	// Sync path: delegate to the shared Runner. Per-call output naming,
+	// flatten, security, and persist toggle ride along via RunWithOpts.
 	res, err := h.Runner.RunWithOpts(r.Context(), c.OrgID, c.UserID, id, req.Data, &generate.RunOptions{
 		OutputName: req.OutputName,
 		OutputPath: req.OutputPath,
 		Flatten:    req.Flatten,
+		Persist:    req.SaveToDrive,
+		Security:   req.Security,
 	})
 	if err != nil {
 		// Validation failures are a 422 with a structured `fields` list so
@@ -730,9 +775,20 @@ func (h *Handler) Generate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "fill_failed", err.Error())
 		return
 	}
-	// Non-preview Generate persists the rendered file to Drive and
-	// returns a download-disposition URL so the browser saves it —
-	// that's what "Generate" has always meant on this endpoint.
+	// Ephemeral path: when SaveToDrive=false the runner already
+	// uploaded to a temp blob and produced a presigned download URL —
+	// no files row was created, so we forward that URL straight to the
+	// client and OutputFileID is empty (the browser uses the URL alone
+	// and shows no "open in Drive" affordance).
+	if res.OutputFileID == "" {
+		writeJSON(w, 200, generateResp{OutputName: res.OutputName, DownloadURL: res.DownloadURL, Bytes: res.Bytes})
+		return
+	}
+
+	// Persisted path: re-presign for short-lived browser download. The
+	// long-lived URL on res.DownloadURL goes to webhooks; the response
+	// to a direct API call gets a shorter TTL since the client is sitting
+	// right in front of the browser anyway.
 	url, err := h.Storage.PresignGet(r.Context(), res.OutputKey, "application/pdf", res.OutputName, 10*time.Minute)
 	if err != nil {
 		writeErr(w, 500, "presign", err.Error())

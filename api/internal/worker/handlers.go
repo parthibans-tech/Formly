@@ -241,10 +241,26 @@ func (h *Handlers) generateOne(ctx context.Context, t *asynq.Task) error {
 	h.Log.Info("job started", "kind", "one", "job", p.JobID)
 	_ = jobs.MarkRunning(ctx, h.DB, p.JobID)
 
+	// Re-hydrate the security override (queue carries it as raw JSON
+	// to keep the queue package free of a generate dep). A decode
+	// failure here is non-fatal — falling back to the template's
+	// configured security is safer than refusing to render the job
+	// over a malformed override.
+	var sec *generate.SecurityOverride
+	if len(p.Security) > 0 {
+		var v generate.SecurityOverride
+		if err := json.Unmarshal(p.Security, &v); err == nil {
+			sec = &v
+		}
+	}
 	res, err := h.Runner.RunWithOpts(ctx, p.OrgID, p.UserID, p.TemplateID, p.Data, &generate.RunOptions{
 		OutputName: p.OutputName,
 		OutputPath: p.OutputPath,
 		Flatten:    p.Flatten,
+		// Honour the caller's "Save to Drive" choice. nil → legacy
+		// default of true (persist), &false → ephemeral.
+		Persist:  p.SaveToDrive,
+		Security: sec,
 	})
 	if err != nil {
 		_ = jobs.MarkFailed(ctx, h.DB, p.JobID, err.Error())

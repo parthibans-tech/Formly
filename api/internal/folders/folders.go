@@ -87,51 +87,87 @@ func (h *Handler) EnsurePath(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "invalid_body", err.Error())
 		return
 	}
-	segs := splitFolderPath(req.Path)
-	var current *string
-	if req.ParentID != nil && *req.ParentID != "" {
-		var ok bool
-		_ = h.DB.QueryRow(r.Context(),
-			`SELECT EXISTS(SELECT 1 FROM folders WHERE id=$1 AND org_id=$2)`, *req.ParentID, c.OrgID,
-		).Scan(&ok)
-		if !ok {
-			writeErr(w, 400, "bad_parent", "parent folder not found")
+	folderID, err := EnsurePath(r.Context(), h.DB, c.OrgID, c.UserID, req.Path, req.ParentID)
+	if err != nil {
+		// EnsurePath returns ErrBadParent when the supplied parent isn't
+		// in the caller's org — surface that as 400, everything else as 500.
+		if errors.Is(err, ErrBadParent) {
+			writeErr(w, 400, "bad_parent", err.Error())
 			return
 		}
-		current = req.ParentID
+		writeErr(w, 500, "db_error", err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"folderId": folderID})
+}
+
+// ErrBadParent is returned by EnsurePath when the supplied parentID
+// doesn't exist in the caller's org. Callers that surface this to HTTP
+// should map it to 400; internal callers (the generate runner) treat it
+// as a configuration error and bail out of the render.
+var ErrBadParent = errors.New("parent folder not found")
+
+// EnsurePath walks `path` segment-by-segment, finding or creating each
+// folder under `parentID` (or root when parentID is nil/empty), and
+// returns the leaf folder id. Idempotent — existing segments are reused
+// by name. Path may use either "/" or "\" as separator; empty segments
+// (leading / trailing / repeated separators) are skipped.
+//
+// Returns (nil, nil) when the resolved path has zero segments AND no
+// parent was supplied — i.e. the caller wanted "root", which we represent
+// as a NULL folder_id on files.
+//
+// Used by the HTTP EnsurePath handler and by the generate runner to
+// route output PDFs into a Drive folder hierarchy on save. Pulling the
+// logic out of the handler avoids duplicating the find-or-create loop
+// in two places — they would inevitably drift.
+func EnsurePath(
+	ctx context.Context,
+	db *pgxpool.Pool,
+	orgID, userID, path string,
+	parentID *string,
+) (*string, error) {
+	segs := splitFolderPath(path)
+	var current *string
+	if parentID != nil && *parentID != "" {
+		var ok bool
+		_ = db.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM folders WHERE id=$1 AND org_id=$2)`, *parentID, orgID,
+		).Scan(&ok)
+		if !ok {
+			return nil, ErrBadParent
+		}
+		current = parentID
 	}
 	if len(segs) == 0 {
-		writeJSON(w, 200, map[string]any{"folderId": current})
-		return
+		return current, nil
 	}
 	for _, name := range segs {
 		var id string
 		var err error
 		if current == nil {
-			err = h.DB.QueryRow(r.Context(),
+			err = db.QueryRow(ctx,
 				`SELECT id FROM folders WHERE org_id=$1 AND parent_id IS NULL AND name=$2 LIMIT 1`,
-				c.OrgID, name).Scan(&id)
+				orgID, name).Scan(&id)
 		} else {
-			err = h.DB.QueryRow(r.Context(),
+			err = db.QueryRow(ctx,
 				`SELECT id FROM folders WHERE org_id=$1 AND parent_id=$2 AND name=$3 LIMIT 1`,
-				c.OrgID, *current, name).Scan(&id)
+				orgID, *current, name).Scan(&id)
 		}
 		if errors.Is(err, pgx.ErrNoRows) {
-			if err = h.DB.QueryRow(r.Context(),
+			if err = db.QueryRow(ctx,
 				`INSERT INTO folders (org_id, parent_id, name, owner_id) VALUES ($1,$2,$3,$4) RETURNING id`,
-				c.OrgID, current, name, c.UserID,
+				orgID, current, name, userID,
 			).Scan(&id); err != nil {
-				writeErr(w, 500, "db_error", err.Error())
-				return
+				return nil, err
 			}
 		} else if err != nil {
-			writeErr(w, 500, "db_error", err.Error())
-			return
+			return nil, err
 		}
 		next := id
 		current = &next
 	}
-	writeJSON(w, 200, map[string]any{"folderId": current})
+	return current, nil
 }
 
 func splitFolderPath(p string) []string {

@@ -314,7 +314,14 @@ export default function DesignerPage() {
     );
   }
 
-  if (tpl.mode === "static" && previewUrl) {
+  // Static and acroform modes share one designer surface — the static
+  // PDF designer. AcroForm-mode templates surface their existing /FT
+  // fields as a layer of locked "acro-bound" widgets, so users get the
+  // full static palette (text, image, signature, QR, repeat, etc.) on
+  // top of their PDF without losing the form fields. Save splits the
+  // widget array back into /widgets (real overlays) and /config.mappings
+  // (acro-bound), so the existing API contract is unchanged.
+  if ((tpl.mode === "static" || tpl.mode === "acroform") && previewUrl) {
     return (
       <StaticDesigner
         tpl={{
@@ -324,6 +331,7 @@ export default function DesignerPage() {
           version: tpl.version,
           widgets: tpl.widgets || [],
           config: tpl.config || {},
+          fields: (tpl.fields as any) || [],
         }}
         previewUrl={previewUrl}
         fileId={tpl.fileId}

@@ -93,6 +93,49 @@ func Fill(pdfBytes []byte, widgets []Widget, data map[string]interface{}, l *lay
 	return out, nil
 }
 
+// Overlay stamps widget values onto the supplied PDF as an overlay layer
+// only — no AcroForm injection. Use this when the source PDF already
+// has its own AcroForm fields (e.g. an acroform-mode template that has
+// extra static widgets layered on top): acroform.Fill runs first to
+// fill the form fields, then Overlay composites the static widgets on
+// top of that result so both layers coexist.
+//
+// Distinct from Fill() because Fill() also calls InjectAcroForm to
+// turn widget types like signature-field/dropdown/button into real
+// PDF form fields. For acroform-mode composition that step would be
+// wrong twice over — the source already has its own form fields, and
+// the overlaid widgets aren't intended to become PDF fields, just
+// stamped graphics.
+func Overlay(pdfBytes []byte, widgets []Widget, data map[string]interface{}, l *layout.Layout) ([]byte, error) {
+	if len(widgets) == 0 {
+		// Nothing to stamp — return the input unchanged so the caller
+		// doesn't pay for an unnecessary pdfcpu round-trip.
+		return pdfBytes, nil
+	}
+	pageDims, err := pageDimensions(pdfBytes)
+	if err != nil {
+		return nil, fmt.Errorf("probe pages: %w", err)
+	}
+	if len(pageDims) == 0 {
+		return nil, fmt.Errorf("source pdf has no pages")
+	}
+	overlayBytes, err := buildOverlay(pageDims, widgets, data)
+	if err != nil {
+		return nil, fmt.Errorf("build overlay: %w", err)
+	}
+	out, err := stampOverlay(pdfBytes, overlayBytes)
+	if err != nil {
+		return nil, err
+	}
+	if l != nil && l.Watermark.Enabled && l.Watermark.Text != "" {
+		out, err = stampTextWatermark(out, l.Watermark)
+		if err != nil {
+			return nil, fmt.Errorf("watermark: %w", err)
+		}
+	}
+	return out, nil
+}
+
 // stampTextWatermark adds a text watermark to every page using pdfcpu.
 func stampTextWatermark(src []byte, w layout.Watermark) ([]byte, error) {
 	srcPath, err := writeTemp("df-wm-src-*.pdf", src)
@@ -264,6 +307,75 @@ func drawWidget(pdf *fpdf.Fpdf, wd Widget, p pageDim, pageNum, totalPages int, d
 		drawTextBox()
 		pdf.SetXY(wd.X+padding, topY+padding)
 		pdf.MultiCell(wd.W-2*padding, fontSize*lineHeight, value, "", stringProp(props, "align", "L"), false)
+	case "comb":
+		// Character-grid widget — distributes the value across N
+		// equal-width cells so character N always lands inside box N.
+		// Designed for forms like bank PAN/CKYC blocks where the source
+		// PDF prints one box per character. The widget's W is divided
+		// into `cells` columns; each character is centred (by default)
+		// inside its column.
+		//
+		// Props:
+		//   cells       int     — number of columns (default 10)
+		//   drawCells   bool    — also draw box outlines, useful when
+		//                         the underlying PDF has no boxes
+		//   align       "L"|"C"|"R" — within-cell alignment (default "C")
+		//   padding     float   — top/bottom padding inside each cell
+		//
+		// Inherits all typography props (font family/size/style/color).
+		// Truncates silently when value length > cells; right-pads with
+		// spaces when shorter so trailing cells stay visually empty.
+		cells := intProp(props, "cells")
+		if cells <= 0 {
+			cells = 10
+		}
+		drawTextBox() // background/border for the whole strip
+		drawCells := boolProp(props, "drawCells", false)
+		cellAlign := stringProp(props, "align", "C")
+		// Cell-width resolution priority:
+		//   1. `cellWidths` array — per-cell widths (variable pitch).
+		//      Set by the designer when the user drags individual cell
+		//      boundaries. Length must equal `cells`; otherwise it's
+		//      treated as malformed and we fall through to (2)/(3).
+		//   2. `cellWidth` scalar — fixed pitch (every cell same size).
+		//   3. wd.W / cells — equal divide of the bounding box.
+		cellOffsetX := floatProp(props, "cellOffsetX", 0)
+		widths := floatSliceProp(props, "cellWidths")
+		if len(widths) != cells {
+			cw := floatProp(props, "cellWidth", 0)
+			if cw <= 0 {
+				cw = wd.W / float64(cells)
+			}
+			widths = make([]float64, cells)
+			for i := range widths {
+				widths[i] = cw
+			}
+		}
+		// Pad/truncate value to exactly `cells` characters so each cell
+		// gets exactly one rune (or a space). Iterate over runes — not
+		// bytes — so multi-byte characters land in their own cell.
+		runes := []rune(value)
+		if len(runes) > cells {
+			runes = runes[:cells]
+		}
+		cellX := wd.X
+		for i := 0; i < cells; i++ {
+			cw := widths[i]
+			if drawCells {
+				pdf.SetDrawColor(r, g, b)
+				pdf.SetLineWidth(0.4)
+				pdf.Rect(cellX, topY, cw, wd.H, "D")
+			}
+			var ch string
+			if i < len(runes) {
+				ch = string(runes[i])
+			}
+			if ch != "" {
+				pdf.SetXY(cellX+cellOffsetX, topY+padding)
+				pdf.CellFormat(cw, wd.H-2*padding, ch, "", 0, cellAlign, false, 0, "")
+			}
+			cellX += cw
+		}
 	case "checkbox":
 		checked := truthy(raw)
 		pdf.SetDrawColor(r, g, b)
@@ -706,6 +818,32 @@ func floatProp(p map[string]interface{}, key string, def float64) float64 {
 		}
 	}
 	return def
+}
+
+// floatSliceProp coerces a JSON array of numbers into []float64. Returns
+// nil for missing keys or malformed entries — callers should treat nil
+// as "not set" and fall back to scalar/equal-divide logic.
+func floatSliceProp(p map[string]interface{}, key string) []float64 {
+	v, ok := p[key]
+	if !ok {
+		return nil
+	}
+	arr, ok := v.([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]float64, 0, len(arr))
+	for _, e := range arr {
+		switch x := e.(type) {
+		case float64:
+			out = append(out, x)
+		case int:
+			out = append(out, float64(x))
+		default:
+			return nil // malformed — bail rather than partial-fill
+		}
+	}
+	return out
 }
 
 func stringProp(p map[string]interface{}, key, def string) string {

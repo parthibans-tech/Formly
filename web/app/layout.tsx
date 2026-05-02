@@ -5,6 +5,7 @@ import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ConfirmProvider } from "@/components/ui/confirm";
 import { PromptProvider } from "@/components/ui/prompt";
+import { FolderPickerProvider } from "@/components/folder-picker";
 import { VaultUnlockProvider } from "@/components/vault-unlock";
 import { RUMCollector } from "@/components/rum-collector";
 import { siteUrl } from "@/lib/site";
@@ -76,10 +77,12 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <TooltipProvider delayDuration={150}>
           <ConfirmProvider>
             <PromptProvider>
-              <VaultUnlockProvider>
-                <ToastProvider>{children}</ToastProvider>
-              </VaultUnlockProvider>
-              <Toaster />
+              <FolderPickerProvider>
+                <VaultUnlockProvider>
+                  <ToastProvider>{children}</ToastProvider>
+                </VaultUnlockProvider>
+                <Toaster />
+              </FolderPickerProvider>
             </PromptProvider>
           </ConfirmProvider>
         </TooltipProvider>

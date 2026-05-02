@@ -12,11 +12,14 @@ import (
 
 	"github.com/docforge/api/internal/compute"
 	"github.com/docforge/api/internal/events"
+	"github.com/docforge/api/internal/folders"
 	"github.com/docforge/api/internal/generate/acroform"
+	"github.com/docforge/api/internal/generate/delivery"
 	gdoc "github.com/docforge/api/internal/generate/doc"
 	ghtml "github.com/docforge/api/internal/generate/html"
 	gmarkdown "github.com/docforge/api/internal/generate/markdown"
 	"github.com/docforge/api/internal/generate/pathtpl"
+	"github.com/docforge/api/internal/generate/pdfdecor"
 	"github.com/docforge/api/internal/generate/pdfencrypt"
 	gstatic "github.com/docforge/api/internal/generate/static"
 	"github.com/docforge/api/internal/i18n"
@@ -29,6 +32,15 @@ import (
 type Runner struct {
 	DB      *pgxpool.Pool
 	Storage *storage.Client
+
+	// ShareCreator and Mailer are optional. When nil, the
+	// post-render delivery fan-out (auto-share-link / auto-email)
+	// is silently skipped — the rest of the pipeline still runs,
+	// so legacy callers and tests that construct a Runner with
+	// just DB + Storage continue to work. cmd/api wires the real
+	// adapters at boot.
+	ShareCreator delivery.ShareCreator
+	Mailer       delivery.EmailSender
 }
 
 type Result struct {
@@ -36,6 +48,21 @@ type Result struct {
 	OutputKey    string
 	OutputName   string
 	Bytes        int
+
+	// DownloadURL is a long-lived (24h) presigned URL for the
+	// output file. Always populated by RunWithOpts so webhook
+	// payloads / API responses can hand the integrator something
+	// they can act on without a second round-trip. May be empty
+	// when the underlying presign call failed (the render itself
+	// is still considered successful — the URL is best-effort).
+	DownloadURL string
+
+	// ShareID / ShareURL / EmailSendID are populated when the
+	// template's delivery config asked for an auto-share-link or
+	// auto-email and that step succeeded. Empty otherwise.
+	ShareID     string
+	ShareURL    string
+	EmailSendID string
 }
 
 // RunOptions carries per-call overrides for output naming/placement and
@@ -79,6 +106,49 @@ type RunOptions struct {
 	// (&false). When nil, render() consults outputConfig.FlattenDefault;
 	// when that's also unset, the legacy behaviour (don't flatten) wins.
 	Flatten *bool
+
+	// Persist controls whether the rendered PDF lands in Drive.
+	// Pointer so callers can distinguish "default" (nil → save to Drive,
+	// preserving legacy behaviour for unmodified callers) from explicit
+	// false (don't save — return a short-lived presigned URL instead and
+	// skip the files row entirely). The web designer's Generate dialog
+	// sends &false unless the user ticks "Save to Drive", so a routine
+	// "test render" doesn't pollute the file list.
+	Persist *bool
+
+	// Security overrides config.security for this single render. Pointer
+	// so the request body can distinguish "not provided" (nil → use the
+	// template's security block, if any) from "explicit empty" (provided
+	// but with no passwords, which means "render unprotected even if the
+	// template would have encrypted").
+	//
+	// Permitted because the integrator already has render rights, and
+	// per-call passwords are a common requirement (e.g. "encrypt with
+	// the customer's email-derived password"). The per-call shape mirrors
+	// config_json.security so the same JSON can be saved or sent inline.
+	Security *SecurityOverride
+}
+
+// SecurityOverride is the per-call shape of config_json.security.
+// Mirrors securityConfig but exported so HTTP handlers / callers can
+// build it without reaching into internal/generate.
+type SecurityOverride struct {
+	OwnerPassword string                 `json:"ownerPassword"`
+	UserPassword  string                 `json:"userPassword"`
+	Encryption    string                 `json:"encryption"`
+	Permissions   map[string]interface{} `json:"permissions"`
+}
+
+func (s *SecurityOverride) toSecurityConfig() securityConfig {
+	if s == nil {
+		return securityConfig{}
+	}
+	return securityConfig{
+		OwnerPassword: s.OwnerPassword,
+		UserPassword:  s.UserPassword,
+		Encryption:    s.Encryption,
+		Permissions:   s.Permissions,
+	}
 }
 
 // outputConfig is the parsed shape of config_json.output. Kept private —
@@ -156,7 +226,17 @@ type renderResult struct {
 // Security (passwords / permissions) IS applied here so both Run and
 // RunPreview produce identically-protected bytes — a previewed PDF
 // shows the same lock prompt the integrator's end users will see.
-func (r *Runner) render(ctx context.Context, orgID, templateID string, data map[string]interface{}, flatten *bool) (renderResult, error) {
+// renderOverrides bundles per-call inputs that influence render() itself
+// (as opposed to RunOptions inputs that only affect persistence).
+// Security is here because it's applied INSIDE render so previews see the
+// same encrypted bytes the saved file would have.
+type renderOverrides struct {
+	flatten  *bool
+	security *SecurityOverride
+}
+
+func (r *Runner) render(ctx context.Context, orgID, templateID string, data map[string]interface{}, ov renderOverrides) (renderResult, error) {
+	flatten := ov.flatten
 	var (
 		mode, storageKey, tplName string
 		cfgRaw                    []byte
@@ -224,6 +304,26 @@ func (r *Runner) render(ctx context.Context, orgID, templateID string, data map[
 		if err != nil {
 			return renderResult{}, fmt.Errorf("acroform fill: %w", err)
 		}
+		// Compose pass — the unified designer lets users stamp static
+		// overlays (text, image, signature, QR, page-number, etc.) on
+		// top of an AcroForm template. Those overlays live in the
+		// template_widgets table just like static-mode templates;
+		// here we run them through the overlay-only path AFTER the
+		// AcroForm fields are filled. Order matters: filling first
+		// keeps the form-field annotations intact, stamping last keeps
+		// fonts/resources properly migrated by pdfcpu's
+		// AddWatermarksFile (same rationale as static.Fill's own
+		// inject-then-stamp ordering).
+		widgets, err := loadWidgets(ctx, r.DB, templateID)
+		if err != nil {
+			return renderResult{}, fmt.Errorf("load widgets: %w", err)
+		}
+		if len(widgets) > 0 {
+			output, err = gstatic.Overlay(output, widgets, data, pageLayout)
+			if err != nil {
+				return renderResult{}, fmt.Errorf("acroform overlay compose: %w", err)
+			}
+		}
 	case "static":
 		widgets, err := loadWidgets(ctx, r.DB, templateID)
 		if err != nil {
@@ -254,12 +354,35 @@ func (r *Runner) render(ctx context.Context, orgID, templateID string, data map[
 		return renderResult{}, fmt.Errorf("unsupported mode %q", mode)
 	}
 
-	// Apply PDF security if the template config asked for it. Done here
-	// (not in Run) so previews see the same locked output integrators'
-	// end users will see — surprises like "preview opens fine but the
-	// downloaded PDF prompts for a password" are exactly the kind of
-	// bug that erodes trust in the playground.
-	if sec, ok := parseSecurityConfig(cfgRaw); ok && sec.IsEnabled() {
+	// Apply decorations (watermarks, headers, footers) BEFORE encryption
+	// — pdfcpu refuses to stamp an encrypted PDF, and re-encrypting after
+	// stamping would force pdfdecor to know the password. Decorations
+	// also live in render() (not Run) so previews show the same
+	// watermark/footer the integrator's end users will see.
+	if dec, ok := parseDecorationsConfig(cfgRaw); ok && dec.IsEnabled() {
+		decorated, err := pdfdecor.Apply(output, dec, data)
+		if err != nil {
+			return renderResult{}, fmt.Errorf("apply decorations: %w", err)
+		}
+		output = decorated
+	}
+
+	// Apply PDF security. Per-call override (from RunOptions.Security)
+	// wins over the template's config_json.security block. The override
+	// is treated as authoritative even when its passwords are empty —
+	// "explicit empty" means the integrator wants this one render
+	// unprotected, e.g. a sample/test render of a normally-encrypted
+	// template. Done here (not in Run) so previews see the same locked
+	// output integrators' end users will see.
+	var sec securityConfig
+	var hasSec bool
+	if ov.security != nil {
+		sec = ov.security.toSecurityConfig()
+		hasSec = true
+	} else {
+		sec, hasSec = parseSecurityConfig(cfgRaw)
+	}
+	if hasSec && sec.IsEnabled() {
 		encOpts, err := sec.toOptions()
 		if err != nil {
 			return renderResult{}, fmt.Errorf("security config: %w", err)
@@ -294,6 +417,36 @@ func (s securityConfig) IsEnabled() bool {
 	return s.OwnerPassword != "" || s.UserPassword != ""
 }
 
+// parseDeliveryConfig pulls the `delivery` block from config_json.
+// Returns (cfg, true) when the block is present. The caller still
+// needs to check IsEnabled to know whether anything besides the
+// canonical download URL will be produced.
+func parseDeliveryConfig(cfgRaw []byte) (delivery.Config, bool) {
+	var wrap struct {
+		Delivery *delivery.Config `json:"delivery"`
+	}
+	if err := json.Unmarshal(cfgRaw, &wrap); err != nil || wrap.Delivery == nil {
+		return delivery.Config{}, false
+	}
+	return *wrap.Delivery, true
+}
+
+// parseDecorationsConfig pulls the `decorations` block from config_json.
+// Returns (cfg, true) only when the block is present in the source — an
+// empty `decorations: {}` is treated as "block exists but no content",
+// which lets pdfdecor.IsEnabled short-circuit without us double-checking
+// here. Mirrors parseSecurityConfig so future post-processing blocks can
+// follow the same pattern.
+func parseDecorationsConfig(cfgRaw []byte) (pdfdecor.Config, bool) {
+	var wrap struct {
+		Decorations *pdfdecor.Config `json:"decorations"`
+	}
+	if err := json.Unmarshal(cfgRaw, &wrap); err != nil || wrap.Decorations == nil {
+		return pdfdecor.Config{}, false
+	}
+	return *wrap.Decorations, true
+}
+
 // RenderInline returns the rendered bytes WITHOUT persisting them to
 // the files table or uploading to storage. Used by merge-recipes when
 // a template component participates in a stitched output: the template
@@ -307,7 +460,7 @@ func (r *Runner) RenderInline(ctx context.Context, orgID, templateID string, dat
 	// Wrap into *bool because mergerecipes always carries an explicit
 	// per-component flatten flag (sourced from the recipe row), so the
 	// template's flattenDefault should NOT override it.
-	res, err := r.render(ctx, orgID, templateID, data, &flatten)
+	res, err := r.render(ctx, orgID, templateID, data, renderOverrides{flatten: &flatten})
 	if err != nil {
 		return nil, "", err
 	}
@@ -343,10 +496,12 @@ func (r *Runner) Run(ctx context.Context, orgID, userID, templateID string, data
 // render without baking it into the template config.
 func (r *Runner) RunWithOpts(ctx context.Context, orgID, userID, templateID string, data map[string]interface{}, opts *RunOptions) (*Result, error) {
 	var flatten *bool
+	var sec *SecurityOverride
 	if opts != nil {
 		flatten = opts.Flatten
+		sec = opts.Security
 	}
-	res, err := r.render(ctx, orgID, templateID, data, flatten)
+	res, err := r.render(ctx, orgID, templateID, data, renderOverrides{flatten: flatten, security: sec})
 	if err != nil {
 		return nil, err
 	}
@@ -370,11 +525,62 @@ func (r *Runner) RunWithOpts(ctx context.Context, orgID, userID, templateID stri
 	}
 	folder := pathtpl.ResolvePath(folderTpl, data)
 
+	// Persist switch: when explicitly false, skip the files-row + Drive
+	// upload entirely and short-circuit with a temp blob + presigned URL.
+	// Used by the designer's "Generate without saving" flow so authors
+	// can sanity-check a render without polluting Drive. Delivery fan-out
+	// (auto-share / auto-email) is also skipped — there's no persisted
+	// file to share, and an ephemeral blob expiring in minutes isn't a
+	// useful share target.
+	if opts != nil && opts.Persist != nil && !*opts.Persist {
+		key := fmt.Sprintf("orgs/%s/ephemeral/%s/%s/%s.pdf",
+			orgID, userID, templateID, time.Now().Format("20060102-150405.000"))
+		if err := r.Storage.PutBytes(ctx, key, "application/pdf", output); err != nil {
+			return nil, fmt.Errorf("upload ephemeral output: %w", err)
+		}
+		url, err := r.Storage.PresignGet(ctx, key, "application/pdf", outName, 10*time.Minute)
+		if err != nil {
+			return nil, fmt.Errorf("presign ephemeral output: %w", err)
+		}
+		return &Result{
+			OutputFileID: "", // intentionally empty — no Drive row exists
+			OutputKey:    key,
+			OutputName:   outName,
+			Bytes:        len(output),
+			DownloadURL:  url,
+		}, nil
+	}
+
+	// Resolve the user-facing Drive folder. The `folder` string above
+	// is what pathtpl produced from the template — it's used both for
+	// storage-key organisation (MinIO key path, harmless) AND, here,
+	// for finding-or-creating the matching folder hierarchy in the
+	// Drive UI. Without this step, the file row's folder_id stays NULL
+	// and the user sees the PDF at root even though they asked for
+	// "clients/test/" — which was the surprise we're fixing.
+	//
+	// Idempotent: if "clients/test" already exists in the user's Drive,
+	// EnsurePath reuses it; otherwise it walks the path and creates
+	// missing segments. Errors here are non-fatal — we'd rather still
+	// produce the PDF (with folder_id=NULL) than fail the whole render
+	// because of a folder hiccup, so we log via the event payload below
+	// instead of returning early.
+	var driveFolderID *string
+	var folderErr error
+	if folder != "" {
+		driveFolderID, folderErr = folders.EnsurePath(ctx, r.DB, orgID, userID, folder, nil)
+		if folderErr != nil {
+			// Don't fail the render — fall back to root and surface the
+			// error in the event payload so subscribers can react.
+			driveFolderID = nil
+		}
+	}
+
 	var outFileID string
 	err = r.DB.QueryRow(ctx,
-		`INSERT INTO files (org_id, owner_id, name, mime, size, storage_key, status)
-		 VALUES ($1,$2,$3,'application/pdf',$4,'','active') RETURNING id`,
-		orgID, userID, outName, len(output),
+		`INSERT INTO files (org_id, owner_id, name, mime, size, storage_key, status, folder_id)
+		 VALUES ($1,$2,$3,'application/pdf',$4,'','active',$5) RETURNING id`,
+		orgID, userID, outName, len(output), driveFolderID,
 	).Scan(&outFileID)
 	if err != nil {
 		return nil, fmt.Errorf("create file row: %w", err)
@@ -399,16 +605,81 @@ func (r *Runner) RunWithOpts(ctx context.Context, orgID, userID, templateID stri
 		return nil, fmt.Errorf("upload output: %w", err)
 	}
 
-	events.Publish(ctx, events.GenerateCompleted, orgID, map[string]interface{}{
+	// Post-upload fan-out: produce the canonical 24h presigned
+	// download URL, and (when the template opts in via config_json
+	// .delivery) mint a share link + auto-email the recipients.
+	// Failures inside Apply are best-effort — they're folded into
+	// the event payload so subscribers can react, but they don't
+	// fail the render itself. A successful render with a failed
+	// email is still "the PDF exists" from the integrator's POV.
+	delCfg, _ := parseDeliveryConfig(cfgRaw)
+	delRes, _ := delivery.Apply(ctx, delCfg, delivery.Deps{
+		Presign: r.Storage,
+		Share:   r.ShareCreator,
+		Mail:    r.Mailer,
+	}, delivery.Args{
+		OrgID:        orgID,
+		UserID:       userID,
+		TemplateID:   templateID,
+		TemplateName: tplName,
+		OutputFileID: outFileID,
+		OutputKey:    outKey,
+		OutputName:   outName,
+		OutputBytes:  output,
+		Data:         data,
+	})
+
+	// Enriched event payload. Webhook subscribers receive `data`
+	// (the original request payload) so they can correlate a render
+	// with whatever business object kicked it off, plus
+	// `downloadUrl` so the consumer can fetch the PDF without
+	// having to re-authenticate to the API. `shareUrl` /
+	// `emailSendId` are present only when the template opted in.
+	payload := map[string]interface{}{
 		"templateId":   templateID,
 		"templateName": tplName,
 		"outputFileId": outFileID,
 		"outputName":   outName,
 		"outputFolder": folder,
 		"bytes":        len(output),
-	})
+		"data":         data,
+	}
+	if driveFolderID != nil {
+		payload["driveFolderId"] = *driveFolderID
+	}
+	if folderErr != nil {
+		// Surfaced rather than swallowed — webhook subscribers should
+		// know the PDF landed at root, not under the requested path.
+		payload["folderError"] = folderErr.Error()
+	}
+	if delRes.DownloadURL != "" {
+		payload["downloadUrl"] = delRes.DownloadURL
+	}
+	if delRes.ShareID != "" {
+		payload["shareId"] = delRes.ShareID
+		payload["shareUrl"] = delRes.ShareURL
+	}
+	if delRes.EmailSendID != "" {
+		payload["emailSendId"] = delRes.EmailSendID
+	}
+	if delRes.ShareError != nil {
+		payload["shareError"] = delRes.ShareError.Error()
+	}
+	if delRes.EmailError != nil {
+		payload["emailError"] = delRes.EmailError.Error()
+	}
+	events.Publish(ctx, events.GenerateCompleted, orgID, payload)
 
-	return &Result{OutputFileID: outFileID, OutputKey: outKey, OutputName: outName, Bytes: len(output)}, nil
+	return &Result{
+		OutputFileID: outFileID,
+		OutputKey:    outKey,
+		OutputName:   outName,
+		Bytes:        len(output),
+		DownloadURL:  delRes.DownloadURL,
+		ShareID:      delRes.ShareID,
+		ShareURL:     delRes.ShareURL,
+		EmailSendID:  delRes.EmailSendID,
+	}, nil
 }
 
 // parseOutputConfig pulls config_json.output. Returns the zero value
@@ -444,7 +715,7 @@ type PreviewResult struct {
 // objects in MinIO — so a user can click Run 50 times without leaving
 // any footprint besides the latest preview.
 func (r *Runner) RunPreview(ctx context.Context, orgID, userID, templateID string, data map[string]interface{}, flatten *bool) (*PreviewResult, error) {
-	res, err := r.render(ctx, orgID, templateID, data, flatten)
+	res, err := r.render(ctx, orgID, templateID, data, renderOverrides{flatten: flatten})
 	if err != nil {
 		return nil, err
 	}

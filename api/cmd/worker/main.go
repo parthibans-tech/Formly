@@ -11,14 +11,18 @@ import (
 	"github.com/docforge/api/internal/ai"
 	"github.com/docforge/api/internal/autotag"
 	"github.com/docforge/api/internal/db"
+	"github.com/docforge/api/internal/email"
 	"github.com/docforge/api/internal/embeddings"
 	"github.com/docforge/api/internal/generate"
+	"github.com/docforge/api/internal/generate/delivery"
+	"github.com/docforge/api/internal/mail"
 	"github.com/docforge/api/internal/mergerecipes"
 	"github.com/docforge/api/internal/metrics"
 	"github.com/docforge/api/internal/pdfmerge"
 	"github.com/docforge/api/internal/queue"
 	"github.com/docforge/api/internal/scanner"
 	"github.com/docforge/api/internal/scheduled"
+	"github.com/docforge/api/internal/sharing"
 	"github.com/docforge/api/internal/storage"
 	"github.com/docforge/api/internal/tracing"
 	"github.com/docforge/api/internal/webhooks"
@@ -71,6 +75,17 @@ func main() {
 	metricsReg.StartDBPoolCollector(context.Background(), pool)
 
 	runner := &generate.Runner{DB: pool, Storage: store}
+	// Async renders go through this same Runner, so the post-render
+	// delivery fan-out (auto-share-link + auto-email) needs the same
+	// adapters wired here that the API process wires in cmd/api/main.go.
+	// Without these the worker would silently skip delivery on every
+	// scheduled / queued render — surprising integrators who set
+	// `delivery.email.enabled` and saw it work in the playground but
+	// not in production.
+	workerSharing := sharing.New(pool, store)
+	workerMailer := mail.NewMailer(pool)
+	runner.ShareCreator = workerShareAdapter{h: workerSharing}
+	runner.Mailer = workerMailerAdapter{m: workerMailer}
 	// PDF merge handler shares its lifecycle with the HTTP layer; the
 	// worker only needs the queue-processing methods on it. Queue here
 	// is unused (workers don't enqueue) so we leave it nil.
@@ -219,6 +234,54 @@ func main() {
 		logger.Error("worker stopped", "err", err)
 		os.Exit(1)
 	}
+}
+
+// workerShareAdapter / workerMailerAdapter mirror the adapters in
+// cmd/api/main.go — see the comments there. Duplicated rather than
+// extracted to a shared package because adapters are wiring code
+// (the only place that knows about both sides), and consolidating
+// them would add a tiny package whose only purpose is to glue four
+// types together.
+type workerShareAdapter struct{ h *sharing.Handler }
+
+func (a workerShareAdapter) CreateShareLink(ctx context.Context, opts delivery.ShareCreateOptions) (delivery.ShareCreateResult, error) {
+	res, err := a.h.CreateInternal(ctx, sharing.InternalCreateOptions{
+		OrgID:         opts.OrgID,
+		UserID:        opts.UserID,
+		FileID:        opts.FileID,
+		Role:          opts.Role,
+		ExpiresIn:     opts.ExpiresIn,
+		Password:      opts.Password,
+		OneTime:       opts.OneTime,
+		DownloadLimit: opts.DownloadLimit,
+	})
+	if err != nil {
+		return delivery.ShareCreateResult{}, err
+	}
+	return delivery.ShareCreateResult{ShareID: res.ShareID, Token: res.Token, URL: res.URL}, nil
+}
+
+type workerMailerAdapter struct{ m *mail.Mailer }
+
+func (a workerMailerAdapter) Send(ctx context.Context, opts delivery.EmailSendOptions) (string, error) {
+	return a.m.Send(ctx, mail.SendOptions{
+		OrgID:        opts.OrgID,
+		UserID:       opts.UserID,
+		TemplateID:   opts.TemplateID,
+		OutputFileID: opts.OutputFileID,
+		Kind:         opts.Kind,
+		Source:       opts.Source,
+		Message: email.Message{
+			To:          opts.To,
+			CC:          opts.CC,
+			BCC:         opts.BCC,
+			Subject:     opts.Subject,
+			TextBody:    opts.TextBody,
+			HTMLBody:    opts.HTMLBody,
+			Attachments: opts.Attachments,
+		},
+		Metadata: opts.Metadata,
+	})
 }
 
 // workerAIObserver bridges ai.Observer onto the prometheus AI vectors

@@ -28,6 +28,7 @@ import (
 	"github.com/docforge/api/internal/images"
 	"github.com/docforge/api/internal/embed"
 	"github.com/docforge/api/internal/formlinks"
+	"github.com/docforge/api/internal/generate/delivery"
 	"github.com/docforge/api/internal/jobs"
 	"github.com/docforge/api/internal/mail"
 	"github.com/docforge/api/internal/mfa"
@@ -208,6 +209,13 @@ func main() {
 	// `internal/sharing` stay free of an `internal/mail` import (and
 	// therefore of `internal/email` + `internal/generate`).
 	sh.Mailer = mailerAdapter{m: mh.Mailer}
+	// Wire the post-render delivery fan-out into the template runner.
+	// Both adapters are tiny shims so neither sharing nor mail has to
+	// know about the generate/delivery interfaces — the import direction
+	// stays generate → delivery → (interfaces), with the concrete impls
+	// living here in main.
+	t.Runner.ShareCreator = deliveryShareAdapter{h: sh}
+	t.Runner.Mailer = deliveryMailerAdapter{m: mh.Mailer}
 	sc := scheduled.New(pool, qc)
 	tm := team.New(pool, a)
 	// Same adapter pattern as sharing — gives team invites a path to
@@ -1191,6 +1199,58 @@ func (a mailerAdapter) Send(ctx context.Context, opts sharing.NotifyOptions) (st
 			Subject:  opts.Subject,
 			HTMLBody: opts.HTMLBody,
 			TextBody: opts.TextBody,
+		},
+		Metadata: opts.Metadata,
+	})
+}
+
+// deliveryShareAdapter exposes sharing.Handler.CreateInternal as the
+// delivery.ShareCreator interface so the generate/delivery package
+// doesn't have to import internal/sharing directly.
+type deliveryShareAdapter struct{ h *sharing.Handler }
+
+func (a deliveryShareAdapter) CreateShareLink(ctx context.Context, opts delivery.ShareCreateOptions) (delivery.ShareCreateResult, error) {
+	res, err := a.h.CreateInternal(ctx, sharing.InternalCreateOptions{
+		OrgID:         opts.OrgID,
+		UserID:        opts.UserID,
+		FileID:        opts.FileID,
+		Role:          opts.Role,
+		ExpiresIn:     opts.ExpiresIn,
+		Password:      opts.Password,
+		OneTime:       opts.OneTime,
+		DownloadLimit: opts.DownloadLimit,
+	})
+	if err != nil {
+		return delivery.ShareCreateResult{}, err
+	}
+	return delivery.ShareCreateResult{
+		ShareID: res.ShareID,
+		Token:   res.Token,
+		URL:     res.URL,
+	}, nil
+}
+
+// deliveryMailerAdapter exposes mail.Mailer as delivery.EmailSender.
+// The translation is straight-through — both packages converged on
+// roughly the same option shape so we just rename a few fields.
+type deliveryMailerAdapter struct{ m *mail.Mailer }
+
+func (a deliveryMailerAdapter) Send(ctx context.Context, opts delivery.EmailSendOptions) (string, error) {
+	return a.m.Send(ctx, mail.SendOptions{
+		OrgID:        opts.OrgID,
+		UserID:       opts.UserID,
+		TemplateID:   opts.TemplateID,
+		OutputFileID: opts.OutputFileID,
+		Kind:         opts.Kind,
+		Source:       opts.Source,
+		Message: email.Message{
+			To:          opts.To,
+			CC:          opts.CC,
+			BCC:         opts.BCC,
+			Subject:     opts.Subject,
+			TextBody:    opts.TextBody,
+			HTMLBody:    opts.HTMLBody,
+			Attachments: opts.Attachments,
 		},
 		Metadata: opts.Metadata,
 	})

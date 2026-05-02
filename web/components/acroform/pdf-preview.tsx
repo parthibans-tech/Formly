@@ -57,6 +57,15 @@ type Props = {
   buffer?: number;
   overlayForPage: (rp: RenderedPage) => React.ReactNode;
   onPageClick?: (pageNum: number) => void;
+  // Bubbled to the parent whenever the lowest visible page number
+  // changes. Used by the mapping panel's "current page only" filter so
+  // the right-hand list can mirror what the user is looking at.
+  onCurrentPageChange?: (pageNum: number) => void;
+  // Fires while the underlying PDF download is in flight. `loaded` and
+  // `total` are bytes; total may be 0 when the server doesn't expose
+  // Content-Length. Used to drive the loading progress bar — important
+  // for 500+ page PDFs where the initial download is the bottleneck.
+  onLoadProgress?: (loaded: number, total: number) => void;
 };
 
 const US_LETTER_W = 612;
@@ -69,7 +78,14 @@ const ZOOM_MIN = 0.25;
 const ZOOM_MAX = 4;
 const ZOOM_STEPS = [0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
 
-export function PdfPreview({ url, scale = 1, buffer = 2, overlayForPage }: Props) {
+export function PdfPreview({
+  url,
+  scale = 1,
+  buffer = 2,
+  overlayForPage,
+  onCurrentPageChange,
+  onLoadProgress,
+}: Props) {
   const [numPages, setNumPages] = useState<number | null>(null);
   const [rendered, setRendered] = useState<Record<number, RenderedPage>>({});
   const [visiblePages, setVisiblePages] = useState<Set<number>>(() => new Set([1]));
@@ -77,7 +93,25 @@ export function PdfPreview({ url, scale = 1, buffer = 2, overlayForPage }: Props
   const pageRefs = useRef<Record<number, HTMLDivElement | null>>({});
   const observerRef = useRef<IntersectionObserver | null>(null);
 
-  const file = useMemo(() => ({ url, withCredentials: false }), [url]);
+  // Pass options straight through to pdfjs.getDocument. The two big ones
+  // for huge PDFs:
+  //   • disableAutoFetch — don't pre-download the entire file. Only the
+  //     bytes for visible pages get fetched. Without this, opening a
+  //     500-page PDF kicks off a single ~50 MB GET that blocks the
+  //     worker until it finishes, freezing initial paint.
+  //   • disableStream: false — we WANT streaming so progressive chunks
+  //     can decode as they arrive.
+  // Combined, these turn first paint from "wait for whole file" into
+  // "render the visible pages as soon as their byte range arrives."
+  const file = useMemo(
+    () => ({
+      url,
+      withCredentials: false,
+      disableAutoFetch: true,
+      disableStream: false,
+    }),
+    [url]
+  );
 
   // Auto-fit: compute a scale that makes the PDF fit the container width.
   // This is the "fit" baseline; the `zoom` multiplier below scales on top
@@ -227,6 +261,14 @@ export function PdfPreview({ url, scale = 1, buffer = 2, overlayForPage }: Props
     return Number.isFinite(min) ? min : 1;
   }, [visiblePages]);
 
+  // Bubble currentPage changes to the parent. Done in an effect (not
+  // inline at compute time) so the callback fires once per real change
+  // — the mapping panel uses this to drive the "current page only"
+  // filter and would otherwise re-run its grouping work on every render.
+  useEffect(() => {
+    if (onCurrentPageChange) onCurrentPageChange(currentPage);
+  }, [currentPage, onCurrentPageChange]);
+
   function jumpTo(pageNum: number) {
     if (!numPages) return;
     const clamped = Math.max(1, Math.min(numPages, Math.floor(pageNum)));
@@ -264,6 +306,9 @@ export function PdfPreview({ url, scale = 1, buffer = 2, overlayForPage }: Props
       <Document
         file={file}
         onLoadSuccess={({ numPages: n }) => setNumPages(n)}
+        onLoadProgress={({ loaded, total }) => {
+          if (onLoadProgress) onLoadProgress(loaded, total ?? 0);
+        }}
         loading={
           <div className="flex items-center justify-center p-10 text-sm text-muted-foreground">
             <Loader2 className="mr-2 h-4 w-4 animate-spin" />

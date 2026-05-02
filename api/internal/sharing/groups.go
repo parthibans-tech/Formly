@@ -26,7 +26,9 @@ package sharing
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -58,16 +60,45 @@ type groupMemberDTO struct {
 // GroupsList: GET /v1/groups. Returns every group in the caller's org
 // with a member count so the UI can render them in a picker without a
 // second roundtrip.
+//
+// Optional ?q= filters by group name (case-insensitive substring) and
+// optional ?limit= caps the row count. Both default to "no filter" so
+// existing callers (settings page, etc.) keep working unchanged. Limit
+// is clamped to [1,200]; 0 means "no limit". Used by the share-people
+// modal so a workspace with hundreds of groups doesn't dump them all
+// into a picker.
 func (h *Handler) GroupsList(w http.ResponseWriter, r *http.Request) {
 	c := r.Context().Value(auth.UserCtxKey).(*auth.Claims)
-	rows, err := h.DB.Query(r.Context(), `
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	limit := 0
+	if v := strings.TrimSpace(r.URL.Query().Get("limit")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			limit = n
+		}
+	}
+	if limit > 200 {
+		limit = 200
+	}
+
+	args := []any{c.OrgID}
+	sql := `
 		SELECT g.id, g.name, g.created_by, u.email,
 		       (SELECT COUNT(*) FROM group_members gm WHERE gm.group_id = g.id),
 		       g.created_at, g.updated_at
 		  FROM groups g
 		  LEFT JOIN users u ON u.id = g.created_by
-		 WHERE g.org_id = $1
-		 ORDER BY lower(g.name) ASC`, c.OrgID)
+		 WHERE g.org_id = $1`
+	if q != "" {
+		args = append(args, "%"+q+"%")
+		sql += fmt.Sprintf(" AND g.name ILIKE $%d", len(args))
+	}
+	sql += ` ORDER BY lower(g.name) ASC`
+	if limit > 0 {
+		args = append(args, limit)
+		sql += fmt.Sprintf(" LIMIT $%d", len(args))
+	}
+
+	rows, err := h.DB.Query(r.Context(), sql, args...)
 	if err != nil {
 		writeErr(w, 500, "db_error", err.Error())
 		return
