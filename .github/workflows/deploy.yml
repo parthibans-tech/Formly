@@ -232,8 +232,15 @@ jobs:
           tags: |
             ${{ env.REGISTRY }}/${{ needs.plan.outputs.repo_lower }}-api:${{ needs.plan.outputs.image_tag }}
             ${{ env.REGISTRY }}/${{ needs.plan.outputs.repo_lower }}-api:latest
+          # APP_COMMIT becomes APP_COMMIT env in the runtime image and
+          # surfaces on the super-admin "Running versions" card via
+          # formly_build_info{commit=...}. We use the full SHA because
+          # the UI truncates to 7 chars at render time anyway —
+          # storing the long form keeps the PromQL output greppable
+          # against `git show $COMMIT`.
           build-args: |
             VERSION=${{ needs.plan.outputs.image_tag }}
+            APP_COMMIT=${{ github.sha }}
           cache-from: type=gha,scope=api
           cache-to: type=gha,scope=api,mode=max
 

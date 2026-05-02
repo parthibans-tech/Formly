@@ -3,8 +3,8 @@
 // Breadcrumbs — a thin renderer plus a path-derived auto-builder.
 //
 // Most pages don't need custom labels: the URL is the breadcrumb.
-// `autoCrumbs(pathname)` turns "/settings/admin/users" into a
-// [Settings, Admin, Users] trail using the SEGMENT_LABELS table for
+// `autoCrumbs(pathname)` turns "/admin/users" into a
+// [Admin, Users] trail using the SEGMENT_LABELS table for
 // well-known segments and humanizing the rest. Pages that need
 // dynamic data (e.g. /drive nests folders fetched from the API) pass
 // a `breadcrumbs` prop to AppShell to override the auto behavior.

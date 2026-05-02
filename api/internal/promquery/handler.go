@@ -524,6 +524,31 @@ func (h *Handler) InfraHandler(w http.ResponseWriter, r *http.Request) {
 	out.Components = append(out.Components, probeURL(ctx, "blackbox",
 		strings.TrimSpace(getenv("BLACKBOX_URL")), "/-/healthy"))
 
+	// Loki — log aggregation. /ready returns 200 once the
+	// ingester ring has converged.
+	out.Components = append(out.Components, probeURL(ctx, "loki",
+		strings.TrimSpace(getenv("LOKI_URL")), "/ready"))
+
+	// Postgres exporter — surfaces "is the metrics view of pg up?".
+	// Distinct from the API's own DB-pool metric: this catches the
+	// case where the exporter itself died but Postgres is fine,
+	// which would otherwise leave the infra dashboard dark.
+	out.Components = append(out.Components, probeURL(ctx, "postgres-exporter",
+		strings.TrimSpace(getenv("POSTGRES_EXPORTER_URL")), "/metrics"))
+
+	// Redis exporter — same pattern.
+	out.Components = append(out.Components, probeURL(ctx, "redis-exporter",
+		strings.TrimSpace(getenv("REDIS_EXPORTER_URL")), "/metrics"))
+
+	// cAdvisor — per-container CPU + memory.
+	out.Components = append(out.Components, probeURL(ctx, "cadvisor",
+		strings.TrimSpace(getenv("CADVISOR_URL")), "/healthz"))
+
+	// Pyroscope — continuous profiling. /ready returns 200 once the
+	// ingester ring is up, mirroring the Loki/Tempo readiness shape.
+	out.Components = append(out.Components, probeURL(ctx, "pyroscope",
+		strings.TrimSpace(getenv("PYROSCOPE_URL")), "/ready"))
+
 	writeJSON(w, http.StatusOK, out)
 }
 

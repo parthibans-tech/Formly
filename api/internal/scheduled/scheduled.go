@@ -394,7 +394,9 @@ func (h *Handler) Tick(ctx context.Context) (int, error) {
 			UserID:     userID,
 			TemplateID: templateID,
 			Data:       data,
-			Flatten:    false,
+			// Flatten left nil so the runner honours the template's
+			// output.flattenDefault — scheduled runs are unattended,
+			// so per-template policy is the right place to decide.
 		})
 		if err == nil {
 			_, _ = h.Queue.EnqueueContext(ctx, task)

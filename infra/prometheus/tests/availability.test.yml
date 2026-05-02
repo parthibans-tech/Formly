@@ -38,6 +38,7 @@ tests:
                 Prometheus has been unable to scrape api:8080
                 for 2 minutes. The process is either crashed, hung, or
                 unreachable on the network.
+              runbook_url: "https://github.com/formly/formly/blob/main/infra/runbooks/process-down.md"
 
   - interval: 1m
     name: FormlyEndpointDown — pages after 2m of probe_success==0
@@ -63,6 +64,7 @@ tests:
                 `http://api/healthz` has been failing for 2m.
                 Check the network path — DNS, load balancer, TLS,
                 or the listener itself.
+              runbook_url: "https://github.com/formly/formly/blob/main/infra/runbooks/endpoint-down.md"
 
   - interval: 1m
     name: FormlyEndpointSlow — fires after 15m of slow probes

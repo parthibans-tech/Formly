@@ -47,7 +47,8 @@ type Result struct {
 //	{
 //	  "output": {
 //	    "folderPath":       "clients/{{customerName}}/{{year}}",
-//	    "filenameTemplate": "Invoice-{{invoiceNumber}}.pdf"
+//	    "filenameTemplate": "Invoice-{{invoiceNumber}}.pdf",
+//	    "flattenDefault":   true
 //	  },
 //	  "security": {
 //	    "ownerPassword": "...",
@@ -71,6 +72,13 @@ type RunOptions struct {
 	// rules. Empty string means "no folder override" — the template's
 	// config_json folderPath (if any) is still used.
 	OutputPath string
+
+	// Flatten overrides config.output.flattenDefault. Pointer so we can
+	// distinguish "not provided, fall back to template default" (nil)
+	// from "explicitly false, do NOT flatten even if the template would"
+	// (&false). When nil, render() consults outputConfig.FlattenDefault;
+	// when that's also unset, the legacy behaviour (don't flatten) wins.
+	Flatten *bool
 }
 
 // outputConfig is the parsed shape of config_json.output. Kept private —
@@ -78,6 +86,12 @@ type RunOptions struct {
 type outputConfig struct {
 	FolderPath       string `json:"folderPath"`
 	FilenameTemplate string `json:"filenameTemplate"`
+	// FlattenDefault is the template-author-provided "if the caller
+	// doesn't specify, should we flatten?" knob. Pointer so the JSON
+	// shape can distinguish absent (nil → no opinion) from explicit
+	// false (don't flatten). Resolution precedence: per-call override >
+	// this template default > legacy bool param (false).
+	FlattenDefault *bool `json:"flattenDefault,omitempty"`
 }
 
 // securityConfig is the parsed shape of config_json.security.
@@ -142,7 +156,7 @@ type renderResult struct {
 // Security (passwords / permissions) IS applied here so both Run and
 // RunPreview produce identically-protected bytes — a previewed PDF
 // shows the same lock prompt the integrator's end users will see.
-func (r *Runner) render(ctx context.Context, orgID, templateID string, data map[string]interface{}, flatten bool) (renderResult, error) {
+func (r *Runner) render(ctx context.Context, orgID, templateID string, data map[string]interface{}, flatten *bool) (renderResult, error) {
 	var (
 		mode, storageKey, tplName string
 		cfgRaw                    []byte
@@ -159,6 +173,17 @@ func (r *Runner) render(ctx context.Context, orgID, templateID string, data map[
 	pdfBytes, err := r.Storage.GetBytes(ctx, storageKey)
 	if err != nil {
 		return renderResult{}, fmt.Errorf("load source pdf: %w", err)
+	}
+
+	// Resolve flatten precedence: explicit per-call > template-level
+	// output.flattenDefault > false. Done here (inside render) so every
+	// entry point — sync, async, preview, RenderInline — gets the same
+	// resolution without each caller having to re-parse config_json.
+	resolvedFlatten := false
+	if flatten != nil {
+		resolvedFlatten = *flatten
+	} else if outCfg := parseOutputConfig(cfgRaw); outCfg.FlattenDefault != nil {
+		resolvedFlatten = *outCfg.FlattenDefault
 	}
 
 	pageLayout := layout.FromConfig(cfgRaw)
@@ -195,7 +220,7 @@ func (r *Runner) render(ctx context.Context, orgID, templateID string, data map[
 		if err != nil {
 			return renderResult{}, err
 		}
-		output, err = acroform.Fill(pdfBytes, fields, cfg.Mappings, data, flatten)
+		output, err = acroform.Fill(pdfBytes, fields, cfg.Mappings, data, resolvedFlatten)
 		if err != nil {
 			return renderResult{}, fmt.Errorf("acroform fill: %w", err)
 		}
@@ -279,7 +304,10 @@ func (s securityConfig) IsEnabled() bool {
 // Returns (output bytes, template name) — the latter is handy for
 // fallback filenames when the recipe doesn't set output_name_template.
 func (r *Runner) RenderInline(ctx context.Context, orgID, templateID string, data map[string]interface{}, flatten bool) ([]byte, string, error) {
-	res, err := r.render(ctx, orgID, templateID, data, flatten)
+	// Wrap into *bool because mergerecipes always carries an explicit
+	// per-component flatten flag (sourced from the recipe row), so the
+	// template's flattenDefault should NOT override it.
+	res, err := r.render(ctx, orgID, templateID, data, &flatten)
 	if err != nil {
 		return nil, "", err
 	}
@@ -296,14 +324,28 @@ func (r *Runner) RenderInline(ctx context.Context, orgID, templateID string, dat
 // {{key}} substitution against the request data. For per-call overrides
 // (e.g. "this one invoice should be named X.pdf"), use RunWithOpts.
 func (r *Runner) Run(ctx context.Context, orgID, userID, templateID string, data map[string]interface{}, flatten bool) (*Result, error) {
-	return r.RunWithOpts(ctx, orgID, userID, templateID, data, flatten, nil)
+	// Legacy callers (mail-merge, formlinks, batch ZIP, scheduled jobs)
+	// pass `false` because they had no integrator surface to override
+	// it. We honour the template's flattenDefault for them too — if a
+	// template explicitly opts in, every code path should respect that.
+	// Callers that need to force a specific value go through RunWithOpts
+	// with a non-nil opts.Flatten.
+	var override *bool
+	if flatten {
+		override = &flatten
+	}
+	return r.RunWithOpts(ctx, orgID, userID, templateID, data, &RunOptions{Flatten: override})
 }
 
 // RunWithOpts is Run + per-call output overrides. Callers (the HTTP
-// handler) populate opts.OutputName / opts.OutputPath from the request
-// body so integrators can name a single render without baking it into
-// the template config.
-func (r *Runner) RunWithOpts(ctx context.Context, orgID, userID, templateID string, data map[string]interface{}, flatten bool, opts *RunOptions) (*Result, error) {
+// handler) populate opts.OutputName / opts.OutputPath / opts.Flatten
+// from the request body so integrators can name and tune a single
+// render without baking it into the template config.
+func (r *Runner) RunWithOpts(ctx context.Context, orgID, userID, templateID string, data map[string]interface{}, opts *RunOptions) (*Result, error) {
+	var flatten *bool
+	if opts != nil {
+		flatten = opts.Flatten
+	}
 	res, err := r.render(ctx, orgID, templateID, data, flatten)
 	if err != nil {
 		return nil, err
@@ -401,7 +443,7 @@ type PreviewResult struct {
 // subsequent preview overwrites the same blob rather than piling up new
 // objects in MinIO — so a user can click Run 50 times without leaving
 // any footprint besides the latest preview.
-func (r *Runner) RunPreview(ctx context.Context, orgID, userID, templateID string, data map[string]interface{}, flatten bool) (*PreviewResult, error) {
+func (r *Runner) RunPreview(ctx context.Context, orgID, userID, templateID string, data map[string]interface{}, flatten *bool) (*PreviewResult, error) {
 	res, err := r.render(ctx, orgID, templateID, data, flatten)
 	if err != nil {
 		return nil, err

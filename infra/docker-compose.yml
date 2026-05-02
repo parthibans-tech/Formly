@@ -155,7 +155,7 @@ services:
   # worker process already binds :9090 on the host for its own
   # /metrics listener). Set `PROMETHEUS_URL=http://localhost:9091`
   # in api/.env to light up the Live Dashboard panels in
-  # /settings/admin/observability.
+  # /admin/observability.
   #
   # The dev config (prometheus.dev.yml) skips basic auth and scrapes
   # host.docker.internal:{8080,9090}. The recording + alerting rule
@@ -180,6 +180,13 @@ services:
       - --storage.tsdb.path=/prometheus
       - --storage.tsdb.retention.time=7d
       - --web.enable-lifecycle
+      # Accept inbound remote_write so Tempo's metrics-generator
+      # can push the service-graph histograms here. Without this
+      # flag Tempo logs 404s on every push.
+      - --web.enable-remote-write-receiver
+      # Exemplars on histogram metrics — required for the
+      # exemplar→trace pivot in Grafana. Off by default.
+      - --enable-feature=exemplar-storage
     ports:
       - "9091:9090"
     volumes:
@@ -302,6 +309,179 @@ services:
       timeout: 3s
       retries: 6
 
+  # Loki — log aggregation backend. Receives lines from Promtail
+  # over HTTP and persists them as compressed chunks indexed by a
+  # tiny set of stream labels (service, level, trace_id). Pairs
+  # with Tempo for trace<->log correlation: a log line with a
+  # `trace_id` field becomes clickable in Grafana and resolves
+  # straight to the matching span.
+  #
+  # Single-binary mode — fine up to a few thousand QPS on one
+  # disk. Split into the microservices topology (ingester /
+  # querier / distributor) when retention or volume warrants it.
+  loki:
+    image: grafana/loki:3.2.0
+    command: ["-config.file=/etc/loki/loki-config.yaml"]
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - lokidata:/loki
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - -q
+        - --spider
+        - http://localhost:3100/ready
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+  # Promtail — log shipper. Tails every other container's stdout/
+  # stderr via the docker.sock unix socket and pushes lines to
+  # Loki. The pipeline_stages in promtail-config.yaml extract
+  # `level` and `trace_id` from JSON log bodies and promote them
+  # to stream labels — that's what makes the Grafana derived-field
+  # click on a log line jump to the matching Tempo span.
+  promtail:
+    image: grafana/promtail:3.2.0
+    command: ["-config.file=/etc/promtail/promtail-config.yaml"]
+    depends_on:
+      loki:
+        condition: service_healthy
+    volumes:
+      - ./promtail/promtail-config.yaml:/etc/promtail/promtail-config.yaml:ro
+      # Read-only docker socket so promtail can discover containers
+      # via the docker_sd_configs block. The socket is the
+      # canonical Docker SD path and matches the Kubernetes
+      # equivalent (file SD on /var/log/containers) so the same
+      # config shape moves between environments.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - promtaildata:/tmp
+
+  # postgres_exporter — exposes Postgres internals (replication
+  # lag, long-running queries, connection state, table bloat) on
+  # :9187/metrics. Custom queries layered on top live in
+  # postgres-exporter/queries.yaml.
+  #
+  # Why this is separate from `formly_db_pool_*` (the pgxpool
+  # metrics emitted by the API): those are about the *application*
+  # using the database; this is about the *database itself*. A
+  # blocked query that the API can't see (because its request
+  # already returned) still shows up here.
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATA_SOURCE_NAME: "postgresql://drive360:drive360@postgres:5432/drive360?sslmode=disable"
+      PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres-exporter/queries.yaml
+    ports:
+      - "9187:9187"
+    volumes:
+      - ./postgres-exporter/queries.yaml:/etc/postgres-exporter/queries.yaml:ro
+    healthcheck:
+      test:
+        - CMD
+        - sh
+        - -c
+        - "wget -q -O- http://localhost:9187/metrics | head -1 || exit 1"
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+  # redis_exporter — Redis internals on :9121/metrics. Asynq sits
+  # on top of Redis, so the queue dashboards lean on these series
+  # (memory pressure, evicted keys, blocked clients).
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.62.0
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_ADDR: "redis://redis:6379"
+    ports:
+      - "9121:9121"
+    healthcheck:
+      test:
+        - CMD
+        - sh
+        - -c
+        - "wget -q -O- http://localhost:9121/metrics | head -1 || exit 1"
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+  # cAdvisor — per-container CPU / memory / network metrics on
+  # :8081/metrics. Required because /metrics from the API +
+  # worker only covers the Go process; cAdvisor covers everything
+  # else in the compose stack (Postgres CPU, Tempo memory, etc.)
+  # and is the de facto layer below node_exporter for "what's
+  # this container actually using" questions.
+  #
+  # Linux-only filesystem mounts. macOS Docker Desktop doesn't
+  # expose /sys/fs/cgroup the same way the linux kernel does,
+  # so cadvisor is best-effort there — service comes up but a
+  # subset of metrics will be missing. That's fine for a dev
+  # laptop; in prod we run on Linux nodes where the picture is
+  # complete.
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    privileged: true
+    ports:
+      - "8081:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk:/dev/disk:ro
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - -q
+        - --spider
+        - http://localhost:8080/healthz
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+  # Pyroscope — continuous profiling. Pulls /debug/pprof/* from
+  # the API + worker on a 15s cadence (see pyroscope.yaml) and
+  # stores flame graphs by profile type (cpu, heap, goroutine,
+  # allocs). Closes the LGTM+P loop: metrics tell you WHAT got
+  # slow, traces tell you WHICH request, profiles tell you WHY
+  # the function was hot.
+  #
+  # The scrape config targets host.docker.internal because the
+  # Go API + worker run on the host (not in this compose
+  # network). Same shape as how Prometheus reaches them via
+  # extra_hosts. On Linux dev machines the extra_hosts entry
+  # below makes that hostname resolve too.
+  pyroscope:
+    image: grafana/pyroscope:1.8.0
+    command: ["-config.file=/etc/pyroscope/pyroscope.yaml"]
+    ports:
+      - "4040:4040"
+    volumes:
+      - ./pyroscope/pyroscope.yaml:/etc/pyroscope/pyroscope.yaml:ro
+      - pyroscopedata:/var/pyroscope/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - -q
+        - --spider
+        - http://localhost:4040/ready
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
   # Grafana — operator dashboards. Provisioned from disk:
   # datasources (Prometheus + Tempo + Alertmanager) and the four
   # dashboards under infra/grafana/dashboards/. The container
@@ -317,7 +497,7 @@ services:
   # itself, not by a per-source credential.
   grafana:
     image: grafana/grafana:11.2.0
-    # All three datasources are provisioned at boot — Grafana
+    # All four datasources are provisioned at boot — Grafana
     # marks a datasource as failing if it can't reach the URL on
     # the first health check. Waiting for each backend to report
     # healthy means the Datasources page is green from the very
@@ -328,6 +508,10 @@ services:
       tempo:
         condition: service_healthy
       alertmanager:
+        condition: service_healthy
+      loki:
+        condition: service_healthy
+      pyroscope:
         condition: service_healthy
     ports:
       - "3001:3000"
@@ -358,3 +542,6 @@ volumes:
   alertmanagerdata:
   tempodata:
   grafanadata:
+  lokidata:
+  promtaildata:
+  pyroscopedata:

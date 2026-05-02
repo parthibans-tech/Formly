@@ -17,6 +17,7 @@ import {
   CheckSquare,
   Clock,
   CreditCard,
+  Database,
   FileSignature,
   Files,
   Gauge,
@@ -24,6 +25,7 @@ import {
   KeyRound,
   Layers,
   LayoutDashboard,
+  LineChart,
   Lock,
   Mail,
   Pin,
@@ -242,37 +244,60 @@ const SECTIONS: Section[] = [
     // workspaces don't see links the API would 403 anyway.
     items: [
       {
-        href: "/settings/admin",
+        href: "/admin",
         label: "Dashboard",
         icon: LayoutDashboard,
         superAdmin: true,
         hint: "Platform overview",
       },
       {
-        href: "/settings/admin/orgs",
+        href: "/admin/orgs",
         label: "Organizations",
         icon: Building2,
         superAdmin: true,
       },
       {
-        href: "/settings/admin/users",
+        href: "/admin/users",
         label: "Users (all orgs)",
         icon: UserCog,
         superAdmin: true,
       },
       {
-        href: "/settings/admin/billing",
+        href: "/admin/billing",
         label: "Billing & plans",
         icon: CreditCard,
         superAdmin: true,
         hint: "Plan catalog",
       },
       {
-        href: "/settings/admin/product-config",
+        // Operator-side P&L: per-currency revenue from invoices,
+        // expenses from the operator-tracked ledger, MRR vs MRE,
+        // top vendors / top paying orgs, CSV export. Distinct from
+        // /admin/billing (catalog editor) — this is the financial
+        // health of the product itself.
+        href: "/admin/finance",
+        label: "Revenue & expenses",
+        icon: LineChart,
+        superAdmin: true,
+        hint: "P&L, MRR vs MRE",
+      },
+      {
+        href: "/admin/product-config",
         label: "Product config",
         icon: Lock,
         superAdmin: true,
         hint: "Upload defaults",
+      },
+      {
+        // Cross-tenant object-storage operator surface: inventory,
+        // trash purge, orphan reconcile, backend health. Sits in the
+        // Platform section because it spans every workspace's bucket
+        // usage, not a single org.
+        href: "/admin/storage",
+        label: "Storage",
+        icon: Database,
+        superAdmin: true,
+        hint: "Inventory, trash, orphans",
       },
       {
         href: "/settings/ocr-profiles",
@@ -293,7 +318,7 @@ const SECTIONS: Section[] = [
         // the curated SLO/runbook reference. Pinned in the sidebar so
         // the on-call doesn't have to scroll the dashboard's Quick
         // Links card mid-incident.
-        href: "/settings/admin/observability",
+        href: "/admin/observability",
         label: "Observability",
         icon: Gauge,
         superAdmin: true,
@@ -534,7 +559,7 @@ export function AppSidebar({ onNavigate }: { onNavigate?: () => void }) {
             The full name lives on the link's `title` for hover, and on
             the logo's `alt` for screen readers. */}
         <Link
-          href={isSuperAdmin ? "/settings/admin" : "/drive"}
+          href={isSuperAdmin ? "/admin" : "/drive"}
           onClick={onNavigate}
           className="inline-flex min-w-0 items-center gap-2 px-2"
           title={!isSuperAdmin && org?.name ? org.name : "Drive360"}

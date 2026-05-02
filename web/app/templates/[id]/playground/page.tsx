@@ -1,10 +1,14 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import {
+  AlertCircle,
   ArrowLeft,
+  CheckCircle2,
   CloudUpload,
+  Download,
+  ExternalLink,
   FileCode,
   PencilLine,
   PlayCircle,
@@ -13,7 +17,7 @@ import {
   Trash2,
   Wand2,
 } from "lucide-react";
-import { api, getToken } from "@/lib/api";
+import { api, getToken, pollJob, type JobStatus } from "@/lib/api";
 import { useToast } from "@/components/toast";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -41,9 +45,50 @@ type Template = {
   name: string;
   mode: string;
   fields: Field[];
-  config: { mappings?: Record<string, Mapping> };
+  config: {
+    mappings?: Record<string, Mapping>;
+    output?: { folderPath?: string; filenameTemplate?: string; flattenDefault?: boolean };
+  };
 };
 type MockSet = { id: string; name: string; data: any; updatedAt: string };
+
+// RunResult is the playground's view of a generate call's outcome —
+// either a successful render (with a presigned URL we can iframe and
+// hand off to the user via Download / Open / Save to Drive) or a
+// structured error from the server. Keeping it as a union lets the
+// success/error card render off a single state slot without a tangle
+// of separate booleans.
+type RunResult =
+  | {
+      kind: "success";
+      url: string;
+      // bytes is whatever the server reports — the playground shows
+      // it as KiB so the user has a quick sanity check ("did it
+      // actually render anything, or did I get a 100-byte stub?").
+      bytes?: number;
+      // outputFileId is only populated on Save-to-Drive runs (i.e.
+      // not preview). The success card uses its presence to flip the
+      // CTA from "Save to Drive" to "Open in Drive".
+      outputFileId?: string;
+      outputName?: string;
+      // durationMs is wall-clock time from "click run" to "got URL".
+      // Useful for spotting templates that drift toward the chrome
+      // headless timeout under heavier payloads.
+      durationMs: number;
+    }
+  | {
+      kind: "error";
+      // code is the server's `error.code` (e.g. "fill_failed",
+      // "validation_failed"). Falls back to "unknown" when the error
+      // wasn't a structured API response (network failure, etc.).
+      code: string;
+      message: string;
+      // raw is the full JSON body when the API responded with one.
+      // The "view raw" disclosure surfaces it for integrators
+      // debugging unfamiliar error codes without forcing them into
+      // devtools.
+      raw?: string;
+    };
 
 export default function PlaygroundPage() {
   const router = useRouter();
@@ -59,6 +104,27 @@ export default function PlaygroundPage() {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [saving, setSaving] = useState(false);
+  // elapsed is bumped every 100ms while a render is in flight so the
+  // progress card can show a live "Rendering… 0.4s" timer. Cheaper
+  // than chasing actual page-render progress (the server doesn't
+  // stream that) and useful enough for the user to see the request
+  // hasn't stalled.
+  const [elapsedMs, setElapsedMs] = useState(0);
+  // jobStatus is non-null while we're polling an async job. The
+  // progress card shows the current status badge ("queued",
+  // "running") and the done/total counter when total > 0.
+  const [jobStatus, setJobStatus] = useState<JobStatus | null>(null);
+  const [result, setResult] = useState<RunResult | null>(null);
+  const [showRawError, setShowRawError] = useState(false);
+  // useAsync flips the run path through the worker queue. The
+  // playground used to always go sync — now we expose it so users
+  // testing scheduled / batch flows can see the same status surface
+  // their integrators will hit.
+  const [useAsync, setUseAsync] = useState(false);
+  // tickRef holds the interval handle so we can clear it on unmount
+  // / mid-render abort. Keeping it in a ref instead of state avoids
+  // re-renders on each tick (the elapsed value lives in state).
+  const tickRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     if (!getToken()) {
@@ -78,6 +144,9 @@ export default function PlaygroundPage() {
         toast.show("error", e.message);
       }
     })();
+    return () => {
+      if (tickRef.current) clearInterval(tickRef.current);
+    };
   }, [params.id, router]);
 
   function dataKeys(t: Template) {
@@ -99,49 +168,171 @@ export default function PlaygroundPage() {
     return out;
   }
 
+  // startTimer kicks the live elapsed counter. Resets to 0 first so
+  // back-to-back renders don't show stale timing from the previous
+  // run. The 100ms cadence is fine-grained enough to read as smooth
+  // without flooding React with re-renders.
+  function startTimer() {
+    setElapsedMs(0);
+    const start = Date.now();
+    if (tickRef.current) clearInterval(tickRef.current);
+    tickRef.current = setInterval(() => setElapsedMs(Date.now() - start), 100);
+  }
+
+  function stopTimer() {
+    if (tickRef.current) {
+      clearInterval(tickRef.current);
+      tickRef.current = null;
+    }
+  }
+
+  // parseError unwraps the error from the api() helper so the error
+  // card can render `error.code` separately from the human message,
+  // and offer the raw body for integrators chasing a 422. The api()
+  // helper throws Error objects that may carry .code / .body — we
+  // duck-type rather than importing a typed shape to stay tolerant
+  // of future API client refactors.
+  function parseError(e: any): RunResult {
+    const code: string =
+      typeof e?.code === "string"
+        ? e.code
+        : typeof e?.error?.code === "string"
+          ? e.error.code
+          : "unknown";
+    const message: string = e?.message || "Render failed";
+    // ApiError exposes the parsed JSON body as `.raw`; integrators
+    // chasing 422 validation_failed responses want to see the raw
+    // `fields` array so they can map keys back to their UI.
+    let raw: string | undefined;
+    const rawBody = e?.raw ?? e?.body;
+    if (rawBody !== undefined && rawBody !== null) {
+      try {
+        raw =
+          typeof rawBody === "string"
+            ? rawBody
+            : JSON.stringify(rawBody, null, 2);
+      } catch {
+        raw = undefined;
+      }
+    }
+    return { kind: "error", code, message, raw };
+  }
+
+  // resetRun clears the pre-render state so the success/error card
+  // doesn't briefly flicker the previous run's outcome before the
+  // new one lands. Called at the top of every run() / saveToDrive().
+  function resetRun() {
+    setResult(null);
+    setShowRawError(false);
+    setJobStatus(null);
+  }
+
   async function run() {
     if (!tpl) return;
     setRunning(true);
+    resetRun();
+    startTimer();
+    const startedAt = Date.now();
     try {
       const data = JSON.parse(jsonText);
       // `preview: true` flips the server's presigned URL to inline
-      // disposition so the PDF renders in the iframe below instead of
-      // the browser prompting a download. Without it, Safari (and some
-      // Chrome configurations) save the file as soon as the iframe src
-      // updates, which defeats the whole point of the playground.
-      const res = await api<{ downloadUrl: string }>(
-        `/v1/templates/${tpl.id}/generate`,
-        { method: "POST", body: JSON.stringify({ data, preview: true }) }
-      );
-      setPreviewUrl(res.downloadUrl);
-      toast.show("success", "Rendered");
+      // disposition so the PDF renders in the iframe below instead
+      // of the browser prompting a download. Async + preview can't
+      // both apply (preview is always sync server-side), so we
+      // route async runs through the persist path with a status
+      // polling loop instead.
+      if (useAsync) {
+        const res = await api<{ jobId: string; status: string }>(
+          `/v1/templates/${tpl.id}/generate`,
+          { method: "POST", body: JSON.stringify({ data, async: true }) }
+        );
+        setJobStatus({
+          id: res.jobId,
+          kind: "single",
+          status: res.status as any,
+          total: 1,
+          done: 0,
+        });
+        const done = await pollJob(res.jobId, (j) => setJobStatus(j));
+        if (done.status === "failed") {
+          throw Object.assign(new Error(done.error || "Job failed"), {
+            code: "job_failed",
+          });
+        }
+        if (!done.outputFileId) {
+          throw new Error("Job completed without an output file");
+        }
+        const dl = await api<{ downloadUrl: string }>(
+          `/v1/files/${done.outputFileId}/download`
+        );
+        setPreviewUrl(dl.downloadUrl);
+        setResult({
+          kind: "success",
+          url: dl.downloadUrl,
+          outputFileId: done.outputFileId,
+          durationMs: Date.now() - startedAt,
+        });
+      } else {
+        const res = await api<{ downloadUrl: string; bytes?: number }>(
+          `/v1/templates/${tpl.id}/generate`,
+          { method: "POST", body: JSON.stringify({ data, preview: true }) }
+        );
+        setPreviewUrl(res.downloadUrl);
+        setResult({
+          kind: "success",
+          url: res.downloadUrl,
+          bytes: res.bytes,
+          durationMs: Date.now() - startedAt,
+        });
+      }
     } catch (e: any) {
-      toast.show("error", e.message);
+      setResult(parseError(e));
+      toast.show("error", e.message || "Render failed");
     } finally {
+      stopTimer();
       setRunning(false);
     }
   }
 
-  // saveToDrive is the opt-in "persist this render to my Drive" path —
-  // distinct from Run, which intentionally previews without creating a
-  // Drive row. We call generate WITHOUT `preview: true` so the server
-  // takes the Runner.Run branch (inserts a files row + uploads to the
-  // canonical outputs/ key) instead of RunPreview (temp blob, no row).
-  // Users who just want to eyeball the output shouldn't have their
-  // Drive polluted with dozens of near-identical PDFs.
+  // saveToDrive is the opt-in "persist this render to my Drive" path
+  // — distinct from Run, which intentionally previews without
+  // creating a Drive row. We call generate WITHOUT `preview: true`
+  // so the server takes the Runner.Run branch (inserts a files row +
+  // uploads to the canonical outputs/ key) instead of RunPreview
+  // (temp blob, no row). Users who just want to eyeball the output
+  // shouldn't have their Drive polluted with dozens of near-
+  // identical PDFs.
   async function saveToDrive() {
     if (!tpl) return;
     setSaving(true);
+    resetRun();
+    startTimer();
+    const startedAt = Date.now();
     try {
       const data = JSON.parse(jsonText);
-      const res = await api<{ outputFileId: string; outputName: string }>(
-        `/v1/templates/${tpl.id}/generate`,
-        { method: "POST", body: JSON.stringify({ data }) }
-      );
+      const res = await api<{
+        outputFileId: string;
+        outputName: string;
+        downloadUrl: string;
+        bytes?: number;
+      }>(`/v1/templates/${tpl.id}/generate`, {
+        method: "POST",
+        body: JSON.stringify({ data }),
+      });
+      setResult({
+        kind: "success",
+        url: res.downloadUrl,
+        bytes: res.bytes,
+        outputFileId: res.outputFileId,
+        outputName: res.outputName,
+        durationMs: Date.now() - startedAt,
+      });
       toast.show("success", `Saved "${res.outputName}" to Drive`);
     } catch (e: any) {
-      toast.show("error", e.message);
+      setResult(parseError(e));
+      toast.show("error", e.message || "Save failed");
     } finally {
+      stopTimer();
       setSaving(false);
     }
   }
@@ -213,6 +404,8 @@ export default function PlaygroundPage() {
       </div>
     );
   }
+
+  const inFlight = running || saving;
 
   return (
     <div className="flex min-h-screen flex-col">
@@ -293,6 +486,16 @@ export default function PlaygroundPage() {
               <Wand2 className="h-4 w-4" />
               Fake data
             </Button>
+            <label className="ml-2 flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground">
+              <input
+                type="checkbox"
+                className="h-3.5 w-3.5 accent-primary"
+                checked={useAsync}
+                onChange={(e) => setUseAsync(e.target.checked)}
+                disabled={inFlight}
+              />
+              Async (worker queue)
+            </label>
             <div className="flex-1" />
             <Button
               size="sm"
@@ -318,15 +521,28 @@ export default function PlaygroundPage() {
           />
         </section>
 
-        <section className="w-1/2 bg-muted/40 min-h-0">
+        <section className="flex w-1/2 flex-col bg-muted/40 min-h-0">
+          {/* The status strip is anchored above the iframe so progress,
+              success, and error cards all share the same vertical slot
+              — the user's eye doesn't have to hunt for "what just
+              happened" after clicking Run. */}
+          <StatusStrip
+            inFlight={inFlight}
+            elapsedMs={elapsedMs}
+            jobStatus={jobStatus}
+            result={result}
+            templateId={tpl.id}
+            showRawError={showRawError}
+            onToggleRaw={() => setShowRawError((v) => !v)}
+          />
           {previewUrl ? (
             <iframe
               src={previewUrl}
-              className="h-full w-full bg-background"
+              className="flex-1 w-full bg-background"
               title="Preview"
             />
           ) : (
-            <div className="grid h-full place-items-center px-6 text-center text-sm text-muted-foreground">
+            <div className="grid flex-1 place-items-center px-6 text-center text-sm text-muted-foreground">
               Press{" "}
               <kbd className="mx-1 rounded border bg-background px-1.5 py-0.5">
                 Run
@@ -338,6 +554,148 @@ export default function PlaygroundPage() {
       </div>
     </div>
   );
+}
+
+// StatusStrip renders one of three states above the preview iframe:
+// 1. in-flight  — a progress card with an elapsed-seconds timer (and
+//    job status badge + counter for async runs)
+// 2. success    — render duration, byte size, plus Download / Open /
+//    Save-to-Drive CTAs targeting the just-rendered URL
+// 3. error      — server-reported `error.code`, a human message, and
+//    a "view raw" disclosure for the JSON body
+//
+// Pulled into a sub-component to keep the parent JSX readable; all
+// state is owned upstream so callers can reset it on the next run.
+function StatusStrip({
+  inFlight,
+  elapsedMs,
+  jobStatus,
+  result,
+  templateId,
+  showRawError,
+  onToggleRaw,
+}: {
+  inFlight: boolean;
+  elapsedMs: number;
+  jobStatus: JobStatus | null;
+  result: RunResult | null;
+  templateId: string;
+  showRawError: boolean;
+  onToggleRaw: () => void;
+}) {
+  if (inFlight) {
+    const seconds = (elapsedMs / 1000).toFixed(1);
+    return (
+      <div className="border-b bg-background/60 px-4 py-2.5 text-xs">
+        <div className="flex items-center gap-3">
+          <div className="h-2 w-2 animate-pulse rounded-full bg-primary" />
+          <span className="font-medium">
+            {jobStatus
+              ? jobStatus.status === "queued"
+                ? "Waiting in queue…"
+                : jobStatus.status === "running"
+                  ? "Worker is rendering…"
+                  : `Status: ${jobStatus.status}`
+              : "Rendering…"}
+          </span>
+          <span className="text-muted-foreground">{seconds}s elapsed</span>
+          {jobStatus && jobStatus.total > 0 && (
+            <Badge variant="outline" className="text-[10px]">
+              {jobStatus.done} / {jobStatus.total}
+            </Badge>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (result?.kind === "success") {
+    const sizeKiB = result.bytes ? (result.bytes / 1024).toFixed(1) : null;
+    const seconds = (result.durationMs / 1000).toFixed(2);
+    return (
+      <div className="border-b border-green-500/30 bg-green-50/60 px-4 py-2.5 text-xs dark:bg-green-500/10">
+        <div className="flex flex-wrap items-center gap-3">
+          <CheckCircle2 className="h-3.5 w-3.5 text-green-600 dark:text-green-400" />
+          <span className="font-medium text-green-900 dark:text-green-100">
+            {result.outputFileId
+              ? `Saved "${result.outputName ?? "render"}" to Drive`
+              : "Rendered preview"}
+          </span>
+          <span className="text-muted-foreground">{seconds}s</span>
+          {sizeKiB && (
+            <span className="text-muted-foreground">· {sizeKiB} KiB</span>
+          )}
+          <div className="flex-1" />
+          <Button size="sm" variant="ghost" asChild>
+            <a href={result.url} download>
+              <Download className="h-3.5 w-3.5" />
+              Download
+            </a>
+          </Button>
+          <Button size="sm" variant="ghost" asChild>
+            <a href={result.url} target="_blank" rel="noreferrer">
+              <ExternalLink className="h-3.5 w-3.5" />
+              Open
+            </a>
+          </Button>
+          {result.outputFileId && (
+            <Button size="sm" variant="ghost" asChild>
+              <Link href={`/drive?file=${result.outputFileId}`}>
+                <CloudUpload className="h-3.5 w-3.5" />
+                Open in Drive
+              </Link>
+            </Button>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (result?.kind === "error") {
+    return (
+      <div className="border-b border-destructive/30 bg-destructive/10 px-4 py-2.5 text-xs">
+        <div className="flex items-start gap-3">
+          <AlertCircle className="mt-0.5 h-3.5 w-3.5 text-destructive" />
+          <div className="flex-1 space-y-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge variant="outline" className="font-mono text-[10px]">
+                {result.code}
+              </Badge>
+              <span className="font-medium text-destructive">
+                {result.message}
+              </span>
+            </div>
+            <div className="flex gap-3 text-[11px]">
+              {result.code === "validation_failed" && (
+                <Link
+                  href={`/templates/${templateId}/settings`}
+                  className="text-muted-foreground underline"
+                >
+                  Open template settings
+                </Link>
+              )}
+              {result.raw && (
+                <button
+                  type="button"
+                  onClick={onToggleRaw}
+                  className="text-muted-foreground underline"
+                >
+                  {showRawError ? "Hide raw response" : "View raw response"}
+                </button>
+              )}
+            </div>
+            {showRawError && result.raw && (
+              <pre className="mt-1 max-h-40 overflow-auto rounded bg-background/60 p-2 font-mono text-[10px]">
+                {result.raw}
+              </pre>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return null;
 }
 
 function fakeValue(key: string): any {

@@ -17,8 +17,11 @@
 // scroll position and the active filter state.
 
 import { useCallback, useEffect, useState } from "react";
+import Link from "next/link";
 import {
   AlertTriangle,
+  BarChart3,
+  Download,
   Inbox,
   Key,
   KeyRound,
@@ -31,7 +34,14 @@ import {
   Unlock,
   UserCog,
 } from "lucide-react";
-import { api } from "@/lib/api";
+import {
+  HourHeatmap,
+  KpiTile,
+  LineChart,
+  formatCount,
+  type TimePoint,
+} from "@/components/admin-charts";
+import { api, API_URL, getToken } from "@/lib/api";
 import { useToast } from "@/components/toast";
 import { useConfirm } from "@/components/ui/confirm";
 import {
@@ -128,6 +138,103 @@ export default function AdminUsersPage() {
   // row action and the drawer footer.
   const [lockTarget, setLockTarget] = useState<UserRow | null>(null);
   const [lockReason, setLockReason] = useState("");
+
+  // Bulk-select state — sticky toolbar surfaces lock / unlock when
+  // at least one row is checked.
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [bulkLockOpen, setBulkLockOpen] = useState(false);
+  const [bulkLockReason, setBulkLockReason] = useState("");
+
+  function toggleSelected(id: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+  function selectAllVisible() {
+    if (!rows) return;
+    const eligible = rows.filter((u) => !u.lockedAt).map((u) => u.id);
+    setSelected((prev) => {
+      const next = new Set(prev);
+      eligible.forEach((id) => next.add(id));
+      return next;
+    });
+  }
+  function clearSelection() {
+    setSelected(new Set());
+  }
+
+  async function exportCSV() {
+    try {
+      const qs = new URLSearchParams();
+      if (q) qs.set("q", q);
+      if (orgFilter) qs.set("orgId", orgFilter);
+      if (statusFilter) qs.set("status", statusFilter);
+      if (roleFilter) qs.set("role", roleFilter);
+      const res = await fetch(
+        `${API_URL}/v1/admin/users/export.csv?` + qs.toString(),
+        { headers: { Authorization: `Bearer ${getToken() ?? ""}` } }
+      );
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `formly-users-${new Date().toISOString().slice(0, 10)}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast.show("success", "Export downloaded");
+    } catch (e: any) {
+      toast.show("error", "Export failed", { description: e?.message });
+    }
+  }
+
+  async function bulkLockSubmit() {
+    try {
+      const r = await api<{ requested: number; affected: number }>(
+        "/v1/admin/users/bulk-lock",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            ids: Array.from(selected),
+            reason: bulkLockReason,
+          }),
+        }
+      );
+      toast.show(
+        "success",
+        `Locked ${r.affected} of ${r.requested} accounts`
+      );
+      setBulkLockOpen(false);
+      setBulkLockReason("");
+      clearSelection();
+      await load();
+    } catch (e: any) {
+      toast.show("error", e?.message || "Bulk lock failed");
+    }
+  }
+
+  async function bulkUnlock() {
+    try {
+      const r = await api<{ requested: number; affected: number }>(
+        "/v1/admin/users/bulk-unlock",
+        {
+          method: "POST",
+          body: JSON.stringify({ ids: Array.from(selected) }),
+        }
+      );
+      toast.show(
+        "success",
+        `Unlocked ${r.affected} of ${r.requested} accounts`
+      );
+      clearSelection();
+      await load();
+    } catch (e: any) {
+      toast.show("error", e?.message || "Bulk unlock failed");
+    }
+  }
 
   const load = useCallback(async () => {
     setRefreshing(true);
@@ -301,14 +408,28 @@ export default function AdminUsersPage() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">
-          Users (all orgs)
-        </h1>
-        <p className="text-sm text-muted-foreground">
-          Search the whole platform. Lock accounts, reset MFA, or kill stuck
-          sessions for any user.
-        </p>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">
+            Users (all orgs)
+          </h1>
+          <p className="text-sm text-muted-foreground">
+            Search the whole platform. Lock accounts, reset MFA, or kill stuck
+            sessions for any user.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <Button asChild size="sm" variant="outline">
+            <Link href="/admin/users/analytics">
+              <BarChart3 className="h-3.5 w-3.5" />
+              Analytics
+            </Link>
+          </Button>
+          <Button size="sm" variant="outline" onClick={exportCSV}>
+            <Download className="h-3.5 w-3.5" />
+            Export
+          </Button>
+        </div>
       </div>
 
       {/* Compact filter toolbar. */}
@@ -388,12 +509,44 @@ export default function AdminUsersPage() {
         </div>
       </div>
 
+      {selected.size > 0 && (
+        <div className="sticky top-2 z-10 flex flex-wrap items-center gap-2 rounded-md border bg-background/95 p-2 shadow-sm backdrop-blur">
+          <span className="text-xs font-medium">
+            {selected.size} selected
+          </span>
+          <Button size="sm" variant="ghost" className="h-7" onClick={selectAllVisible}>
+            Select all visible
+          </Button>
+          <div className="ml-auto flex items-center gap-1">
+            <Button
+              size="sm"
+              variant="outline"
+              className="text-destructive"
+              onClick={() => {
+                setBulkLockOpen(true);
+                setBulkLockReason("");
+              }}
+            >
+              <Lock className="h-3.5 w-3.5" />
+              Lock
+            </Button>
+            <Button size="sm" variant="outline" onClick={bulkUnlock}>
+              <Unlock className="h-3.5 w-3.5" />
+              Unlock
+            </Button>
+            <Button size="sm" variant="ghost" onClick={clearSelection}>
+              Clear
+            </Button>
+          </div>
+        </div>
+      )}
+
       <Card>
         <CardHeader>
           <CardTitle className="text-base">Users</CardTitle>
           <CardDescription>
-            Click any row for the detail drawer. Most actions live there;
-            common ones (lock / unlock / reset MFA) are inline.
+            Click any row for the detail drawer. Tick a row to enable bulk
+            lock / unlock; common per-user actions are inline.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -414,6 +567,8 @@ export default function AdminUsersPage() {
                 <UserRowItem
                   key={u.id}
                   u={u}
+                  selected={selected.has(u.id)}
+                  onToggle={() => toggleSelected(u.id)}
                   onOpen={() => setOpenId(u.id)}
                   onLock={() => {
                     setLockTarget(u);
@@ -514,12 +669,64 @@ export default function AdminUsersPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* Bulk lock — same shape as the single-user lock dialog, but
+          we reuse one reason across every selected ID. The backend
+          revokes sessions atomically per row. */}
+      <Dialog
+        open={bulkLockOpen}
+        onOpenChange={(o) => {
+          if (!o) {
+            setBulkLockOpen(false);
+            setBulkLockReason("");
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Lock className="h-5 w-5 text-destructive" />
+              Lock {selected.size} account{selected.size === 1 ? "" : "s"}?
+            </DialogTitle>
+            <DialogDescription>
+              Each selected user is locked, all their active sessions are
+              revoked, and a per-user audit row is written. Operators can
+              never lock themselves; that ID is silently skipped.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-1.5">
+            <Label htmlFor="bulk-lock-reason">Reason (audit log)</Label>
+            <Input
+              id="bulk-lock-reason"
+              autoFocus
+              value={bulkLockReason}
+              onChange={(e) => setBulkLockReason(e.target.value)}
+              placeholder="Compromised credential set / mass off-boarding / incident #4567"
+            />
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setBulkLockOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={bulkLockSubmit}
+              disabled={!bulkLockReason.trim()}
+            >
+              <Lock className="h-4 w-4" />
+              Lock {selected.size}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
 
 function UserRowItem({
   u,
+  selected,
+  onToggle,
   onOpen,
   onLock,
   onUnlock,
@@ -527,6 +734,8 @@ function UserRowItem({
   onRevokeSessions,
 }: {
   u: UserRow;
+  selected: boolean;
+  onToggle: () => void;
   onOpen: () => void;
   onLock: () => void;
   onUnlock: () => void;
@@ -534,8 +743,24 @@ function UserRowItem({
   onRevokeSessions: () => void;
 }) {
   const locked = !!u.lockedAt;
+  // Already-locked accounts shouldn't be selectable for bulk-lock
+  // (no-op) and bulk-unlock takes the same set, so we hide the
+  // checkbox on locked rows. The single-row "Unlock" button is right
+  // there — that's the right path for one-off unlocks.
+  const selectable = !locked;
   return (
     <li className="flex flex-wrap items-center gap-3 py-3">
+      {selectable ? (
+        <input
+          type="checkbox"
+          aria-label={`Select ${u.email}`}
+          checked={selected}
+          onChange={onToggle}
+          className="h-4 w-4 cursor-pointer accent-primary"
+        />
+      ) : (
+        <span className="inline-block h-4 w-4" aria-hidden />
+      )}
       <button
         type="button"
         onClick={onOpen}
@@ -628,9 +853,9 @@ function DetailPanel({
   onForcePasswordReset: () => void;
   onAuditFilterChange: (prefix: string) => void;
 }) {
-  const [tab, setTab] = useState<"overview" | "memberships" | "security" | "audit">(
-    "overview"
-  );
+  const [tab, setTab] = useState<
+    "overview" | "analytics" | "memberships" | "security" | "audit"
+  >("overview");
   const locked = !!detail.lockedAt;
 
   return (
@@ -646,7 +871,7 @@ function DetailPanel({
       </DialogHeader>
 
       <div className="mt-4 flex gap-1 border-b">
-        {(["overview", "memberships", "security", "audit"] as const).map((t) => (
+        {(["overview", "analytics", "memberships", "security", "audit"] as const).map((t) => (
           <button
             key={t}
             type="button"
@@ -672,6 +897,7 @@ function DetailPanel({
             onUnlock={onUnlock}
           />
         )}
+        {tab === "analytics" && <UserAnalyticsTab userId={detail.id} />}
         {tab === "memberships" && <MembershipsTab detail={detail} />}
         {tab === "security" && (
           <SecurityTab
@@ -749,6 +975,136 @@ function OverviewTab({
           </Button>
         )}
       </div>
+    </div>
+  );
+}
+
+// Per-user analytics drilldown shown inside the detail drawer.
+//
+// We pull the per-ID series at a fixed 30-day window — matching the
+// org drilldown — so support engineers can quickly answer "is this
+// account behaving normally?" without hopping to the global page.
+type UserIdAnalytics = {
+  window: string;
+  bucket: string;
+  activity: TimePoint[];
+  hourlyPattern: number[];
+  sessionStarts: TimePoint[];
+  failedLogins30d: number;
+  actions30d: { total: number; distinct: number };
+};
+
+function UserAnalyticsTab({ userId }: { userId: string }) {
+  const toast = useToast();
+  const [data, setData] = useState<UserIdAnalytics | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api<UserIdAnalytics>(`/v1/admin/users/${userId}/analytics?window=30d`)
+      .then((r) => {
+        if (!cancelled) setData(r);
+      })
+      .catch((e) => {
+        if (!cancelled) {
+          toast.show("error", "Couldn't load analytics", {
+            description: e?.message,
+          });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId]);
+
+  if (!data) {
+    return (
+      <div className="space-y-2">
+        <Skeleton className="h-24 w-full" />
+        <Skeleton className="h-24 w-full" />
+      </div>
+    );
+  }
+
+  // HourHeatmap takes the raw int[24] from the API as-is.
+  const heatmap = data.hourlyPattern;
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-end">
+        <Button asChild size="sm" variant="outline">
+          <Link href={`/admin/users/${userId}/analytics`}>
+            <BarChart3 className="h-3.5 w-3.5" />
+            Open full dashboard
+          </Link>
+        </Button>
+      </div>
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+        <KpiTile
+          label="Actions (30d)"
+          value={formatCount(data.actions30d.total)}
+          sublabel={`${data.actions30d.distinct} distinct`}
+        />
+        <KpiTile
+          label="Sessions (30d)"
+          value={formatCount(
+            data.sessionStarts.reduce((a, p) => a + p.value, 0)
+          )}
+          sublabel="new sign-ins"
+        />
+        <KpiTile
+          label="Failed logins (30d)"
+          value={formatCount(data.failedLogins30d)}
+          sublabel="security signal"
+        />
+      </div>
+
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-xs">Activity</CardTitle>
+          <CardDescription className="text-[11px]">
+            Audit-log events authored by this user, last 30 days.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <LineChart
+            height={140}
+            series={[
+              { name: "Events", color: "#3b82f6", data: data.activity },
+            ]}
+          />
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-xs">Hour-of-day pattern</CardTitle>
+          <CardDescription className="text-[11px]">
+            Auth events by UTC hour, last 60 days. A spike outside the
+            usual band is a strong takeover signal.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <HourHeatmap data={heatmap} />
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-xs">Session starts</CardTitle>
+          <CardDescription className="text-[11px]">
+            New sessions per day — flat line is fine, spikes warrant a look.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <LineChart
+            height={140}
+            series={[
+              { name: "Sessions", color: "#22c55e", data: data.sessionStarts },
+            ]}
+          />
+        </CardContent>
+      </Card>
     </div>
   );
 }

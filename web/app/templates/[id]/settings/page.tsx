@@ -64,6 +64,13 @@ type SecurityCfg = {
 type OutputCfg = {
   folderPath?: string;
   filenameTemplate?: string;
+  // flattenDefault is a tri-state at this layer: undefined ("no
+  // template-level opinion, follow legacy / per-call default"), true
+  // ("flatten unless the request explicitly says otherwise"), false
+  // ("never flatten unless the request explicitly says so"). The form
+  // control below is a Select so users see all three states without
+  // mistaking an unchecked checkbox for an explicit "no".
+  flattenDefault?: boolean;
 };
 
 type Template = {
@@ -91,6 +98,12 @@ export default function TemplateSettingsPage() {
   // Save. Mirrors the pattern used by the AcroForm designer.
   const [folderPath, setFolderPath] = useState("");
   const [filenameTemplate, setFilenameTemplate] = useState("");
+  // "inherit" → don't write flattenDefault to config; "yes" → true;
+  // "no" → false. We use a string in state because <Select> values
+  // must be strings, then map back to the JSON tri-state on save.
+  const [flattenDefault, setFlattenDefault] = useState<"inherit" | "yes" | "no">(
+    "inherit",
+  );
   const [secEnabled, setSecEnabled] = useState(false);
   const [ownerPassword, setOwnerPassword] = useState("");
   const [userPassword, setUserPassword] = useState("");
@@ -117,6 +130,8 @@ export default function TemplateSettingsPage() {
         // through TemplateViewer and never hit this page.
         setFolderPath(t.config?.output?.folderPath ?? "");
         setFilenameTemplate(t.config?.output?.filenameTemplate ?? "");
+        const fd = t.config?.output?.flattenDefault;
+        setFlattenDefault(fd === true ? "yes" : fd === false ? "no" : "inherit");
         const sec = t.config?.security;
         if (sec && (sec.ownerPassword || sec.userPassword)) {
           setSecEnabled(true);
@@ -144,14 +159,18 @@ export default function TemplateSettingsPage() {
       // a clean read-modify-write here is the right shape.
       const nextConfig: Record<string, any> = { ...(tpl.config || {}) };
 
-      if (folderPath.trim() === "" && filenameTemplate.trim() === "") {
+      const hasFolder = folderPath.trim() !== "";
+      const hasFilename = filenameTemplate.trim() !== "";
+      const flattenSet = flattenDefault !== "inherit";
+      if (!hasFolder && !hasFilename && !flattenSet) {
         delete nextConfig.output;
       } else {
         nextConfig.output = {
-          ...(folderPath.trim() && { folderPath: folderPath.trim() }),
-          ...(filenameTemplate.trim() && {
+          ...(hasFolder && { folderPath: folderPath.trim() }),
+          ...(hasFilename && {
             filenameTemplate: filenameTemplate.trim(),
           }),
+          ...(flattenSet && { flattenDefault: flattenDefault === "yes" }),
         };
       }
 
@@ -298,6 +317,39 @@ export default function TemplateSettingsPage() {
             other path-traversal tricks are stripped per segment.
           </p>
         </div>
+        {tpl.mode === "acroform" && (
+          <div className="space-y-2">
+            <Label>Default flatten behaviour</Label>
+            <Select
+              value={flattenDefault}
+              onValueChange={(v: "inherit" | "yes" | "no") =>
+                setFlattenDefault(v)
+              }
+            >
+              <SelectTrigger className="w-72">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="inherit">
+                  No default — caller decides each render
+                </SelectItem>
+                <SelectItem value="yes">
+                  Flatten by default (locks fields into the page)
+                </SelectItem>
+                <SelectItem value="no">
+                  Never flatten by default (keeps fields editable)
+                </SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-muted-foreground">
+              Applied when the request body omits{" "}
+              <code className="font-mono">flatten</code>. Sending{" "}
+              <code className="font-mono">{`"flatten": false`}</code> in
+              the request still wins, even when this is set to{" "}
+              <em>Flatten by default</em>.
+            </p>
+          </div>
+        )}
       </section>
 
       {/* --- PDF security --- */}

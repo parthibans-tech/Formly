@@ -1,0 +1,143 @@
+{
+  "annotations": {"list": []},
+  "description": "Postgres + Redis + per-container CPU/memory. The under-the-app layer.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "panels": [
+    {"type": "row", "title": "Postgres", "id": 100, "gridPos": {"x": 0, "y": 0, "w": 24, "h": 1}},
+    {
+      "type": "stat",
+      "title": "Active connections",
+      "id": 1,
+      "gridPos": {"x": 0, "y": 1, "w": 6, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "expr": "sum(pg_stat_activity_count)"}],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "type": "stat",
+      "title": "Long-running queries (>60s)",
+      "id": 2,
+      "gridPos": {"x": 6, "y": 1, "w": 6, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "expr": "pg_long_running_count"}],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 1}, {"color": "red", "value": 5}]}
+        }
+      },
+      "options": {"colorMode": "background"}
+    },
+    {
+      "type": "stat",
+      "title": "Blocked queries",
+      "id": 3,
+      "gridPos": {"x": 12, "y": 1, "w": 6, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "expr": "pg_blocked_queries_count"}],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 1}, {"color": "red", "value": 5}]}
+        }
+      },
+      "options": {"colorMode": "background"}
+    },
+    {
+      "type": "stat",
+      "title": "Replication lag",
+      "id": 4,
+      "gridPos": {"x": 18, "y": 1, "w": 6, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "expr": "pg_replication_lag_seconds"}],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 30}, {"color": "red", "value": 60}]}
+        }
+      },
+      "options": {"colorMode": "background"}
+    },
+    {"type": "row", "title": "Redis", "id": 101, "gridPos": {"x": 0, "y": 5, "w": 24, "h": 1}},
+    {
+      "type": "timeseries",
+      "title": "Redis memory used vs max",
+      "id": 5,
+      "gridPos": {"x": 0, "y": 6, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "redis_memory_used_bytes", "legendFormat": "used"},
+        {"refId": "B", "expr": "redis_memory_max_bytes", "legendFormat": "max"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "bytes", "custom": {"drawStyle": "line", "fillOpacity": 10}}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Redis connected clients",
+      "id": 6,
+      "gridPos": {"x": 12, "y": 6, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "expr": "redis_connected_clients"}],
+      "fieldConfig": {"defaults": {"unit": "short", "custom": {"drawStyle": "line", "fillOpacity": 10}}}
+    },
+    {"type": "row", "title": "Containers (cAdvisor)", "id": 102, "gridPos": {"x": 0, "y": 14, "w": 24, "h": 1}},
+    {
+      "type": "timeseries",
+      "title": "CPU per container (cores)",
+      "id": 7,
+      "gridPos": {"x": 0, "y": 15, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (name) (rate(container_cpu_usage_seconds_total{name!=\"\"}[1m]))",
+          "legendFormat": "{{name}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "short", "custom": {"drawStyle": "line", "fillOpacity": 10, "stacking": {"mode": "normal"}}}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Memory per container (working set)",
+      "id": 8,
+      "gridPos": {"x": 12, "y": 15, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (name) (container_memory_working_set_bytes{name!=\"\"})",
+          "legendFormat": "{{name}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "bytes", "custom": {"drawStyle": "line", "fillOpacity": 10}}}
+    },
+    {"type": "row", "title": "Service graph (from Tempo)", "id": 103, "gridPos": {"x": 0, "y": 23, "w": 24, "h": 1}},
+    {
+      "type": "nodeGraph",
+      "title": "Service edges (req/s)",
+      "id": 9,
+      "gridPos": {"x": 0, "y": 24, "w": 24, "h": 10},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (client, server) (rate(traces_service_graph_request_total[5m]))",
+          "format": "table"
+        }
+      ]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["formly", "infra"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Formly · Infrastructure",
+  "uid": "formly-infrastructure",
+  "version": 1,
+  "weekStart": ""
+}

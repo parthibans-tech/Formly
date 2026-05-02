@@ -60,6 +60,11 @@ export type OutputDoc = {
   folderPath?: string;
   filenameTemplate?: string;
   placeholders?: string[];
+  // flattenDefault echoes the template's output.flattenDefault. When
+  // set, the API will flatten (true) or skip flattening (false) when
+  // the request body omits `flatten`. The integrator can still pass
+  // `flatten` explicitly to override per call.
+  flattenDefault?: boolean;
 };
 
 // SecurityDoc mirrors api/internal/templates/schema.go::securityDoc.
@@ -586,6 +591,21 @@ export function ApiGuide({ templateId, refreshKey = 0, compact = false }: Props)
                   boolean — flatten AcroForm fields into page content so the
                   output PDF can&rsquo;t be edited. Ignored on non-AcroForm
                   modes.
+                  {schema.output?.flattenDefault !== undefined && (
+                    <span className="mt-1 block">
+                      Template default:{" "}
+                      <span className="font-medium">
+                        {schema.output.flattenDefault ? "true" : "false"}
+                      </span>{" "}
+                      (applied when this key is omitted; passing{" "}
+                      <code className="font-mono">
+                        {schema.output.flattenDefault
+                          ? '"flatten": false'
+                          : '"flatten": true'}
+                      </code>{" "}
+                      overrides per call).
+                    </span>
+                  )}
                 </td>
               </tr>
               <tr>

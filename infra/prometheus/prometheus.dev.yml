@@ -90,6 +90,69 @@ scrape_configs:
       - target_label: __address__
         replacement: blackbox:9115
 
+  # postgres_exporter — Postgres internals (replication, locks,
+  # bloat). The custom queries in postgres-exporter/queries.yaml
+  # add `pg_replication_lag_seconds`, `pg_long_running_count`,
+  # `pg_blocked_queries_count`, and `pg_table_bloat_estimate_*`.
+  - job_name: postgres-exporter
+    static_configs:
+      - targets:
+          - postgres-exporter:9187
+        labels:
+          process: infra
+          component: postgres
+
+  # redis_exporter — Redis internals. Asynq queue depth + worker
+  # latency lean on these series.
+  - job_name: redis-exporter
+    static_configs:
+      - targets:
+          - redis-exporter:9121
+        labels:
+          process: infra
+          component: redis
+
+  # cAdvisor — per-container CPU / memory / network. The
+  # `id` label (which contains the cgroup path) is high
+  # cardinality; we drop it via metric_relabel_configs and
+  # surface the friendlier `name` (container name) instead.
+  - job_name: cadvisor
+    static_configs:
+      - targets:
+          - cadvisor:8080
+        labels:
+          process: infra
+          component: container
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: "container_(network|tasks|cpu|memory|fs|spec|last_seen).*"
+        action: keep
+      - regex: "id"
+        action: labeldrop
+      - regex: "(image|pod)"
+        action: labeldrop
+
+  # Loki self-metrics — read latency, ingester pressure. Loki
+  # exposes Prometheus-format metrics on its own /metrics endpoint
+  # so the same Prom scrapes the metrics, queries the logs, and
+  # alerts on Loki being slow.
+  - job_name: loki
+    static_configs:
+      - targets:
+          - loki:3100
+        labels:
+          process: infra
+          component: loki
+
+  # Tempo self-metrics — block compaction, ingester WAL size.
+  - job_name: tempo
+    static_configs:
+      - targets:
+          - tempo:3200
+        labels:
+          process: infra
+          component: tempo
+
   # DNS probe — sanity check that the embedded resolver in the
   # blackbox exporter can resolve our public hostname. Catches
   # accidentally-broken DNS on a developer laptop. Cheap.

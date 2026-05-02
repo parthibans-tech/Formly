@@ -5,16 +5,58 @@
   label on a separate line and bury the runbook link three scrolls
   down. A pager that needs scrolling is a pager that gets ignored.
   These templates target a one-glance summary: who is on fire,
-  how badly, and where to read the runbook.
+  how badly, and three deep-links — runbook, dashboard, silence.
 
-  Defined templates:
-    - formly.summary           — one-line "X firing: <alertname> (<labels>)"
-    - formly.externalURL       — URL back to Alertmanager / Prometheus
-    - formly.slack.title       — Slack message title
-    - formly.slack.text        — Slack message body
-    - formly.slack.color       — green/yellow/red for the side bar
+  Defined templates
+  -----------------
+    - formly.grafanaBase           — single edit point for the
+                                     Grafana base URL referenced by
+                                     formly.dashboardURL. Override
+                                     this when deploying in prod
+                                     (sed at deploy time, or fork
+                                     the file on the AM container).
+    - formly.summary               — one-line "X firing: <alertname>"
+    - formly.externalURL           — URL back to Alertmanager root
+    - formly.silenceURL            — Alertmanager silence pre-fill
+                                     deep-link for one alert
+    - formly.dashboardURL          — Grafana dashboard for the
+                                     current alertname (best-effort
+                                     mapping; falls back to the
+                                     global health board)
+    - formly.slack.title           — Slack message title
+    - formly.slack.text            — Slack message body
+    - formly.slack.color           — green/yellow/red sidebar
     - formly.pagerduty.description — PagerDuty incident description
+    - formly.email.subject         — Email subject
+    - formly.email.html            — Email HTML body
+
+  Operator deep-links
+  -------------------
+  Three URLs accompany every firing alert:
+
+    1. :book:  Runbook    — the alert's `runbook_url` annotation,
+                            authored at PR time and CI-validated.
+    2. :bar_chart: Dashboard — Grafana dashboard for the alert
+                            family. The mapping is in
+                            formly.dashboardURL — extend it when
+                            you add a new alert family.
+    3. :no_bell: Silence  — Alertmanager URL with the matchers
+                            pre-filled, so silencing one specific
+                            alert is two clicks instead of nine.
+
+  Resolved messages drop the deep-links because the operator no
+  longer needs them — green-bar + alertname is enough.
+
+  Template-engine note
+  --------------------
+  Alertmanager runs Go's text/template plus a tiny extension set
+  (`title`, `toUpper`, `toLower`, `match`, `reReplaceAll`, `join`,
+  `safeHtml`, `stringSlice`). Notably absent: sprig (`default`,
+  `hasPrefix`, `env`, `list`/`append`). Stick to those eight + the
+  stdlib (`printf`, `index`, `range`, `with`, `if/else`).
 */}}
+
+{{ define "formly.grafanaBase" -}}http://localhost:3001{{- end }}
 
 {{ define "formly.summary" -}}
 {{ if eq .Status "firing" -}}
@@ -27,6 +69,59 @@ resolved
 
 {{ define "formly.externalURL" -}}
 {{ .ExternalURL }}
+{{- end }}
+
+{{/*
+  formly.silenceURL — produces a deep-link to Alertmanager's
+  silence-creation page with `matchers` pre-populated for the
+  alert's stable labels (alertname + tier + kind + instance,
+  whichever exist). This skips the "type each matcher in the
+  modal" friction that otherwise stops people silencing during
+  an incident.
+
+  Implementation: build a {curly,brace,enclosed} matcher list
+  from the first alert's labels, URL-encode the body. The shape
+  the AM web UI consumes is:
+
+    /#/silences/new?filter=%7Balertname%3D%22Foo%22%2Ctier%3D%22pro%22%7D
+*/}}
+{{ define "formly.silenceURL" -}}
+{{- $a := index .Alerts 0 -}}
+{{- $body := printf "alertname=\"%s\"" $a.Labels.alertname -}}
+{{- with $a.Labels.tier }}{{ $body = printf "%s,tier=\"%s\"" $body . }}{{ end -}}
+{{- with $a.Labels.kind }}{{ $body = printf "%s,kind=\"%s\"" $body . }}{{ end -}}
+{{- with $a.Labels.instance }}{{ $body = printf "%s,instance=\"%s\"" $body . }}{{ end -}}
+{{ $.ExternalURL }}/#/silences/new?filter=%7B{{ $body | urlquery }}%7D
+{{- end }}
+
+{{/*
+  formly.dashboardURL — best-effort alert-family → Grafana
+  dashboard mapping. The set is intentionally short: the global-
+  health board is the right landing for most alerts; the SLO +
+  queue boards win for their specialised families. New alert
+  family → add an `else if match` branch so the operator's
+  dashboard click resolves to the chart that actually shows the
+  relevant series.
+
+  `match` runs RE2 on .GroupLabels.alertname. The patterns are
+  prefix-anchored on purpose — a future "FormlyAuthLockoutBackoff"
+  alert should land on the auth-abuse dashboard automatically.
+*/}}
+{{ define "formly.dashboardURL" -}}
+{{- $name := .GroupLabels.alertname -}}
+{{- $uid := "formly-global-health" -}}
+{{- if or (match "^FormlyTenantSLO" $name) (eq $name "FormlyHighErrorRate") -}}
+{{- $uid = "formly-slo-burn" -}}
+{{- else if or (match "^FormlyQueue" $name) (match "^FormlyAI" $name) (match "^FormlyWebhook" $name) -}}
+{{- $uid = "formly-queue-and-services" -}}
+{{- else if or (match "^FormlyAuth" $name) (match "^FormlyAPIKey" $name) (match "^FormlyRateLimit" $name) -}}
+{{- $uid = "formly-auth-abuse" -}}
+{{- else if or (match "^FormlyPostgres" $name) (match "^FormlyRedis" $name) (match "^FormlyContainer" $name) -}}
+{{- $uid = "formly-infrastructure" -}}
+{{- else if match "^FormlyWebVitals" $name -}}
+{{- $uid = "formly-rum" -}}
+{{- end -}}
+{{ template "formly.grafanaBase" . }}/d/{{ $uid }}
 {{- end }}
 
 {{/* ── Slack ─────────────────────────────────────────────────── */}}
@@ -55,10 +150,13 @@ good
 {{ if .Labels.tier }}_tier:_ `{{ .Labels.tier }}`  {{ end }}
 {{- if .Labels.kind }}_kind:_ `{{ .Labels.kind }}`  {{ end }}
 {{- if .Labels.instance }}_instance:_ `{{ .Labels.instance }}`{{ end }}
-{{ if .Annotations.runbook_url }}<{{ .Annotations.runbook_url }}|:book: Runbook>  {{ end }}
-{{- if .GeneratorURL }}<{{ .GeneratorURL }}|:mag: Query>  {{ end }}
-<{{ $.ExternalURL }}|:bell: Silence>
 {{ end -}}
+{{ if eq .Status "firing" -}}
+{{ with (index .Alerts 0).Annotations.runbook_url }}<{{ . }}|:book: Runbook>  {{ end -}}
+<{{ template "formly.dashboardURL" . }}|:bar_chart: Dashboard>  {{- " " }}
+<{{ template "formly.silenceURL" . }}|:no_bell: Silence>  {{- " " }}
+{{- with (index .Alerts 0).GeneratorURL }}<{{ . }}|:mag: Query>{{- end }}
+{{- end }}
 {{- end }}
 
 {{/* ── PagerDuty ─────────────────────────────────────────────── */}}
@@ -68,4 +166,49 @@ good
 {{ range .Alerts -}}
 - {{ .Annotations.summary }}
 {{ end -}}
+{{- end }}
+
+{{/* ── Email ─────────────────────────────────────────────────── */}}
+
+{{ define "formly.email.subject" -}}
+[{{ .Status | toUpper }}{{ if eq .CommonLabels.severity "page" }} · PAGE{{ end }}] {{ .GroupLabels.alertname }} ({{ .Alerts.Firing | len }})
+{{- end }}
+
+{{ define "formly.email.html" -}}
+<!doctype html>
+<html><body style="font-family:system-ui,Segoe UI,Helvetica,Arial,sans-serif;color:#1f2328;line-height:1.45">
+  <div style="max-width:640px;margin:0 auto;padding:16px">
+    <h2 style="margin:0 0 8px">
+      {{ if eq .Status "firing" }}🔴{{ else }}🟢{{ end }}
+      {{ .GroupLabels.alertname }}
+      {{ if eq .CommonLabels.severity "page" }}<span style="background:#ffebe9;color:#a40e26;padding:2px 6px;border-radius:4px;font-size:12px;margin-left:6px">PAGE</span>{{ end }}
+    </h2>
+    <div style="color:#57606a;font-size:13px;margin-bottom:16px">
+      {{ .Alerts.Firing | len }} firing · {{ .Alerts.Resolved | len }} resolved
+      {{ if .CommonLabels.job }} · job: <code>{{ .CommonLabels.job }}</code>{{ end }}
+    </div>
+    {{ range .Alerts }}
+    <div style="border:1px solid #d0d7de;border-radius:6px;padding:12px;margin-bottom:12px">
+      <div style="font-weight:600;margin-bottom:4px">{{ .Annotations.summary }}</div>
+      {{ if .Annotations.description }}
+      <div style="color:#57606a;font-size:14px;white-space:pre-wrap">{{ .Annotations.description }}</div>
+      {{ end }}
+      <div style="margin-top:8px;font-size:12px;color:#57606a">
+        {{ if .Labels.tier }}tier=<code>{{ .Labels.tier }}</code> · {{ end }}
+        {{ if .Labels.kind }}kind=<code>{{ .Labels.kind }}</code> · {{ end }}
+        {{ if .Labels.instance }}instance=<code>{{ .Labels.instance }}</code>{{ end }}
+      </div>
+    </div>
+    {{ end }}
+    {{ if eq .Status "firing" }}
+    <div style="margin-top:16px;padding-top:12px;border-top:1px solid #d0d7de">
+      {{ with (index .Alerts 0).Annotations.runbook_url }}
+      <a href="{{ . }}" style="display:inline-block;padding:6px 12px;background:#0969da;color:#fff;text-decoration:none;border-radius:6px;margin-right:6px">📖 Runbook</a>
+      {{ end }}
+      <a href="{{ template "formly.dashboardURL" . }}" style="display:inline-block;padding:6px 12px;background:#1f883d;color:#fff;text-decoration:none;border-radius:6px;margin-right:6px">📊 Dashboard</a>
+      <a href="{{ template "formly.silenceURL" . }}" style="display:inline-block;padding:6px 12px;background:#6e7781;color:#fff;text-decoration:none;border-radius:6px">🔕 Silence</a>
+    </div>
+    {{ end }}
+  </div>
+</body></html>
 {{- end }}

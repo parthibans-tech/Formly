@@ -1,0 +1,98 @@
+# Loki — local log store, paired with Promtail (collector) and
+# Grafana (query UI). The third pillar of the observability stack
+# alongside Prometheus (metrics) and Tempo (traces). Logs in Loki
+# are indexed by a tiny set of "stream labels" (job, container,
+# level, trace_id) and the line bodies are compressed and stored
+# unindexed — Grep-on-disk for the body, fast key lookups on the
+# label set. This shape works well at our volume (one developer
+# laptop to a couple of thousand QPS) without paying for
+# Elasticsearch's index overhead.
+#
+# Single-binary mode: we run all loki components in one process.
+# Splitting into the microservices topology is a step we'd take
+# when retention needed to scale past one disk; for dev and small
+# prod that day is far away.
+#
+# The trace<->log link is the value add: any line whose JSON body
+# contains a `trace_id` field becomes clickable in Grafana and
+# resolves to the matching Tempo span. The reverse pivot — from a
+# trace span back to surrounding logs — is configured on the
+# Tempo datasource (provisioning/datasources/datasources.yml).
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: info
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+query_range:
+  results_cache:
+    cache:
+      embedded_cache:
+        enabled: true
+        max_size_mb: 100
+
+# 14d retention matches Tempo's window so a trace and its
+# surrounding logs age out together — clicking an exemplar from
+# 30 days ago shouldn't land on a half-resolved trace with no
+# logs (or vice versa). Bump in lockstep.
+limits_config:
+  retention_period: 336h
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+  max_streams_per_user: 0
+  max_global_streams_per_user: 5000
+  ingestion_rate_mb: 16
+  ingestion_burst_size_mb: 32
+  # Keep the cardinality watchdog tight — one rogue label that
+  # leaks request_id or user_id into a stream label can blow up
+  # the index in minutes.
+  max_label_name_length: 1024
+  max_label_value_length: 4096
+  max_label_names_per_series: 30
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+ruler:
+  alertmanager_url: http://alertmanager:9093
+  enable_api: true
+  storage:
+    type: local
+    local:
+      directory: /loki/rules
+  rule_path: /loki/rules-temp
+  ring:
+    kvstore:
+      store: inmemory
+
+compactor:
+  working_directory: /loki/compactor
+  compaction_interval: 10m
+  retention_enabled: true
+  retention_delete_delay: 2h
+  retention_delete_worker_count: 150
+  delete_request_store: filesystem
+
+analytics:
+  reporting_enabled: false

@@ -84,9 +84,14 @@ type GenerateOnePayload struct {
 	UserID     string                 `json:"userId"`
 	TemplateID string                 `json:"templateId"`
 	Data       map[string]interface{} `json:"data"`
-	Flatten    bool                   `json:"flatten"`
-	OutputName string                 `json:"outputName,omitempty"`
-	OutputPath string                 `json:"outputPath,omitempty"`
+	// Flatten is a pointer so we can distinguish "request body omitted
+	// flatten — fall back to template's output.flattenDefault" (nil)
+	// from "explicitly false, do not flatten regardless of the template
+	// default" (&false). Existing payloads that serialised `false`
+	// continue to deserialise into a non-nil pointer.
+	Flatten    *bool  `json:"flatten,omitempty"`
+	OutputName string `json:"outputName,omitempty"`
+	OutputPath string `json:"outputPath,omitempty"`
 }
 
 // GenerateBatchPayload references a previously-uploaded tabular input via

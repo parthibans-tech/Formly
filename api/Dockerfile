@@ -35,16 +35,37 @@ COPY . .
 #   CGO_ENABLED=0       fully static, no libc dependency
 #   -trimpath           strip absolute build paths from the binary
 #   -ldflags=-s -w      drop symbol table + DWARF debug info (~30% smaller)
-#   -X main.version     stamp the release so /v1/health can echo it
+#
+# Version + commit are NOT stamped via -ldflags here because no
+# package-level `var version string` exists to receive them — the
+# binaries read APP_VERSION / APP_COMMIT from the environment at
+# startup (see internal/metrics.New), and the runtime stage below
+# bakes those env vars into the image so `formly_build_info` carries
+# real values instead of "dev"/"unknown".
 ARG VERSION=dev
+ARG APP_COMMIT=unknown
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build \
         -trimpath \
-        -ldflags="-s -w -X main.version=${VERSION}" \
+        -ldflags="-s -w" \
         -o /out/drive360-api \
         ./cmd/api
+
+# Worker binary lives in the same image — at runtime the compose
+# `worker` service overrides CMD to launch this entrypoint instead of
+# the API. Keeps the build matrix to one Dockerfile and guarantees the
+# worker ships with the exact same internal/* code as the API that
+# enqueued the job.
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build \
+        -trimpath \
+        -ldflags="-s -w" \
+        -o /out/drive360-worker \
+        ./cmd/worker
 
 # ---------- runtime ----------
 FROM debian:bookworm-slim
@@ -82,6 +103,7 @@ RUN groupadd --system --gid 1000 drive360 \
 
 WORKDIR /app
 COPY --from=builder /out/drive360-api /app/drive360-api
+COPY --from=builder /out/drive360-worker /app/drive360-worker
 COPY migrations /app/migrations
 RUN chown -R drive360:drive360 /app
 USER drive360
@@ -90,6 +112,17 @@ USER drive360
 # binds to all interfaces inside the container — Docker network
 # isolation is what keeps it private.
 ENV LISTEN_ADDR=:8080
+
+# Re-declare the build args in the runtime stage so we can promote
+# them to ENV. Without re-declaring, ARGs from the builder stage are
+# out of scope here (multi-stage scoping rule). These two get baked
+# into the image and read by internal/metrics.New at boot to populate
+# the formly_build_info gauge — the values surfaced on the
+# super-admin "Running versions" card.
+ARG VERSION=dev
+ARG APP_COMMIT=unknown
+ENV APP_VERSION=${VERSION}
+ENV APP_COMMIT=${APP_COMMIT}
 EXPOSE 8080
 
 # Healthcheck endpoint exposed by api/internal/observability.

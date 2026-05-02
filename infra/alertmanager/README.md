@@ -97,7 +97,7 @@ Two are wired:
 
 ## Live state in the API dashboard
 
-`/settings/admin/observability` already pulls the current alert
+`/admin/observability` already pulls the current alert
 state from Prometheus's `/api/v1/alerts` (which is the same
 source Alertmanager reads). Once Alertmanager is running and a
 real receiver is wired, the dashboard's "Active alerts" panel

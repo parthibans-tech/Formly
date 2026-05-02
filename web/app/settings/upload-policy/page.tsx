@@ -455,16 +455,10 @@ export default function UploadPolicyPage() {
           />
           <ToggleOverride
             title="Antivirus scan"
-            desc="Stub today; will gate downloads on a clean ClamAV verdict once the scanner ships."
+            desc="Gates downloads on a clean ClamAV verdict. Uploads sit in a scanning state until the worker returns; infected files are blocked from every download, share, and preview path."
             productValue={product.scanEnabled}
             override={draft.scanEnabled}
             onSet={(v) => setOverride("scanEnabled", v)}
-            disabled
-            badge={
-              <Badge variant="outline" className="text-[10px]">
-                Coming soon
-              </Badge>
-            }
           />
           <ToggleOverride
             title="Force download on risky types"

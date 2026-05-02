@@ -1,0 +1,322 @@
+{
+  "annotations": {"list": []},
+  "description": "Real User Monitoring — Core Web Vitals as measured in the browser, beaconed to /v1/rum, recorded by the formly-rum rule group. The headline percentiles use p75 because that's how Google ranks pages (the 75th-percentile real-user sample, not the median). Pair this with slo-burn.json for the server-side latency story.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "type": "row",
+      "title": "Core Web Vitals — p75 across all routes",
+      "id": 100,
+      "gridPos": {"x": 0, "y": 0, "w": 24, "h": 1}
+    },
+    {
+      "type": "stat",
+      "title": "LCP p75 (good ≤ 2.5s, poor > 4.0s)",
+      "id": 1,
+      "gridPos": {"x": 0, "y": 1, "w": 8, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "metric:formly_web_vitals_seconds:p75{metric=\"LCP\"}",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 2.5},
+              {"color": "red", "value": 4.0}
+            ]
+          }
+        }
+      },
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "center"}
+    },
+    {
+      "type": "stat",
+      "title": "INP p75 (good ≤ 200ms, poor > 500ms)",
+      "id": 2,
+      "gridPos": {"x": 8, "y": 1, "w": 8, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "metric:formly_web_vitals_seconds:p75{metric=\"INP\"}",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 3,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 0.2},
+              {"color": "red", "value": 0.5}
+            ]
+          }
+        }
+      },
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "center"}
+    },
+    {
+      "type": "stat",
+      "title": "CLS p75 (good ≤ 0.1, poor > 0.25)",
+      "id": 3,
+      "gridPos": {"x": 16, "y": 1, "w": 8, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "metric:formly_web_vitals_seconds:p75{metric=\"CLS\"}",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 3,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 0.1},
+              {"color": "red", "value": 0.25}
+            ]
+          }
+        }
+      },
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "center"}
+    },
+    {
+      "type": "row",
+      "title": "Trends — p75 over time",
+      "id": 200,
+      "gridPos": {"x": 0, "y": 6, "w": 24, "h": 1}
+    },
+    {
+      "type": "timeseries",
+      "title": "Time-based vitals (LCP / INP / FCP / TTFB) — p75",
+      "id": 4,
+      "gridPos": {"x": 0, "y": 7, "w": 12, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "metric:formly_web_vitals_seconds:p75{metric=~\"LCP|INP|FCP|TTFB\"}",
+          "legendFormat": "{{metric}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 2,
+          "custom": {"drawStyle": "line", "fillOpacity": 8, "lineWidth": 2}
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "CLS — p75 (unitless)",
+      "id": 5,
+      "gridPos": {"x": 12, "y": 7, "w": 12, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "metric:formly_web_vitals_seconds:p75{metric=\"CLS\"}",
+          "legendFormat": "CLS"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 3,
+          "custom": {"drawStyle": "line", "fillOpacity": 8, "lineWidth": 2},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 0.1},
+              {"color": "red", "value": 0.25}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Rating distribution — what fraction of users got what",
+      "id": 300,
+      "gridPos": {"x": 0, "y": 16, "w": 24, "h": 1}
+    },
+    {
+      "type": "timeseries",
+      "title": "Sample share by rating (30m, per metric)",
+      "id": 6,
+      "gridPos": {"x": 0, "y": 17, "w": 24, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "metric_rating:formly_rum_sample_ratio:rate30m",
+          "legendFormat": "{{metric}} · {{rating}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": {"drawStyle": "line", "fillOpacity": 12, "stacking": {"mode": "none"}}
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Per-route drilldown",
+      "id": 400,
+      "gridPos": {"x": 0, "y": 25, "w": 24, "h": 1}
+    },
+    {
+      "type": "table",
+      "title": "Worst routes by LCP p75 (top 20)",
+      "id": 7,
+      "gridPos": {"x": 0, "y": 26, "w": 12, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(20, metric_route:formly_web_vitals_seconds:p75{metric=\"LCP\"})",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {"Time": true, "__name__": true, "metric": true},
+            "renameByName": {"Value": "LCP p75 (s)"}
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "s", "decimals": 2},
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "LCP p75 (s)"},
+            "properties": [
+              {"id": "custom.cellOptions", "value": {"type": "color-background"}},
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {"color": "green", "value": null},
+                    {"color": "orange", "value": 2.5},
+                    {"color": "red", "value": 4.0}
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "type": "table",
+      "title": "Worst routes by INP p75 (top 20)",
+      "id": 8,
+      "gridPos": {"x": 12, "y": 26, "w": 12, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(20, metric_route:formly_web_vitals_seconds:p75{metric=\"INP\"})",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {"Time": true, "__name__": true, "metric": true},
+            "renameByName": {"Value": "INP p75 (s)"}
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "s", "decimals": 3},
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "INP p75 (s)"},
+            "properties": [
+              {"id": "custom.cellOptions", "value": {"type": "color-background"}},
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {"color": "green", "value": null},
+                    {"color": "orange", "value": 0.2},
+                    {"color": "red", "value": 0.5}
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "type": "row",
+      "title": "Volume — health of the ingest pipe",
+      "id": 500,
+      "gridPos": {"x": 0, "y": 35, "w": 24, "h": 1}
+    },
+    {
+      "type": "timeseries",
+      "title": "Samples ingested / sec (per metric, 5m)",
+      "id": 9,
+      "gridPos": {"x": 0, "y": 36, "w": 24, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (metric) (rate(formly_rum_samples_total[5m]))",
+          "legendFormat": "{{metric}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "decimals": 2,
+          "custom": {"drawStyle": "line", "fillOpacity": 10, "stacking": {"mode": "normal"}}
+        }
+      }
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["formly", "rum", "frontend"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Formly · Real User Monitoring (Web Vitals)",
+  "uid": "formly-rum",
+  "version": 1,
+  "weekStart": ""
+}

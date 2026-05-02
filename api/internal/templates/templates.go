@@ -600,9 +600,15 @@ func (h *Handler) UpdateConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 type generateReq struct {
-	Data    map[string]interface{} `json:"data"`
-	Flatten bool                   `json:"flatten"`
-	Async   bool                   `json:"async"`
+	Data map[string]interface{} `json:"data"`
+	// Flatten is *bool so the request can distinguish "unset, fall
+	// back to the template's output.flattenDefault" (omitted from JSON
+	// → nil) from "explicitly false, don't flatten" (`"flatten": false`
+	// → &false). Older clients that always sent `"flatten": false`
+	// continue to work — the runner just sees an explicit false and
+	// skips the template default.
+	Flatten *bool `json:"flatten,omitempty"`
+	Async   bool  `json:"async"`
 	// Preview routes the request through Runner.RunPreview instead of
 	// Runner.Run: the render is uploaded to a deterministic per-(user,
 	// template) temp key and returned as an inline-disposition presigned
@@ -705,9 +711,10 @@ func (h *Handler) Generate(w http.ResponseWriter, r *http.Request) {
 	// Sync path: delegate to the shared Runner. Per-call output naming
 	// overrides ride along via RunWithOpts; security is template-level
 	// only (intentionally not overridable from the request body).
-	res, err := h.Runner.RunWithOpts(r.Context(), c.OrgID, c.UserID, id, req.Data, req.Flatten, &generate.RunOptions{
+	res, err := h.Runner.RunWithOpts(r.Context(), c.OrgID, c.UserID, id, req.Data, &generate.RunOptions{
 		OutputName: req.OutputName,
 		OutputPath: req.OutputPath,
+		Flatten:    req.Flatten,
 	})
 	if err != nil {
 		// Validation failures are a 422 with a structured `fields` list so

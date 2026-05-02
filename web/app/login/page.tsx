@@ -60,7 +60,7 @@ export default function LoginPage() {
   const [pending, setPending] = useState<FormValues | null>(null);
 
   // Captured once on render — if it's set, login redirects there
-  // instead of the default /drive (or /settings/admin for super
+  // instead of the default /drive (or /admin for super
   // admins). Wired by the accept-invite "Sign in to accept" CTA.
   const nextPath = safeNext(searchParams.get("next"));
 
@@ -143,7 +143,7 @@ export default function LoginPage() {
         router.replace(nextPath);
         return;
       }
-      router.replace(res.user?.isSuperAdmin ? "/settings/admin" : "/drive");
+      router.replace(res.user?.isSuperAdmin ? "/admin" : "/drive");
     } catch (e: any) {
       setFormError(e.message || "Unable to sign in");
       toast.show("error", "Unable to sign in", { description: e.message });

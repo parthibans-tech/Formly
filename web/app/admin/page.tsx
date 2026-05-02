@@ -189,7 +189,7 @@ export default function AdminDashboardPage() {
               ? `${data.orgs.active ?? 0} active · ${data.orgs.frozen ?? 0} frozen · ${data.orgs.last30d ?? 0} new (30d)`
               : undefined
           }
-          href="/settings/admin/orgs"
+          href="/admin/orgs"
         />
         <KpiCard
           icon={<Users className="h-4 w-4" />}
@@ -200,7 +200,7 @@ export default function AdminDashboardPage() {
               ? `${data.users.locked ?? 0} locked · ${data.users.last30d ?? 0} new (30d)`
               : undefined
           }
-          href="/settings/admin/users"
+          href="/admin/users"
         />
         <KpiCard
           icon={<CreditCard className="h-4 w-4" />}
@@ -321,7 +321,7 @@ export default function AdminDashboardPage() {
         <PanelCard
           icon={<Sparkles className="h-4 w-4" />}
           title="Recent signups"
-          href="/settings/admin/users"
+          href="/admin/users"
         >
           {!data ? (
             <Skeleton className="h-32 w-full" />
@@ -453,7 +453,7 @@ export default function AdminDashboardPage() {
         <PanelCard
           icon={<History className="h-4 w-4" />}
           title="Recent audit events"
-          href="/settings/admin/audit"
+          href="/admin/audit"
         >
           {!data ? (
             <Skeleton className="h-32 w-full" />
@@ -497,17 +497,17 @@ export default function AdminDashboardPage() {
         </CardHeader>
         <CardContent className="grid gap-2 sm:grid-cols-2 md:grid-cols-4">
           <QuickLink
-            href="/settings/admin/orgs"
+            href="/admin/orgs"
             icon={<Building2 className="h-4 w-4" />}
             label="Organizations"
           />
           <QuickLink
-            href="/settings/admin/users"
+            href="/admin/users"
             icon={<UserCog className="h-4 w-4" />}
             label="Users (all orgs)"
           />
           <QuickLink
-            href="/settings/admin/audit"
+            href="/admin/audit"
             icon={<History className="h-4 w-4" />}
             label="Platform audit"
           />
@@ -517,7 +517,7 @@ export default function AdminDashboardPage() {
             label="Email audit"
           />
           <QuickLink
-            href="/settings/admin/observability"
+            href="/admin/observability"
             icon={<Gauge className="h-4 w-4" />}
             label="Observability (Prometheus)"
           />

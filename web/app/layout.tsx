@@ -6,6 +6,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { ConfirmProvider } from "@/components/ui/confirm";
 import { PromptProvider } from "@/components/ui/prompt";
 import { VaultUnlockProvider } from "@/components/vault-unlock";
+import { RUMCollector } from "@/components/rum-collector";
 import { siteUrl } from "@/lib/site";
 
 export const metadata: Metadata = {
@@ -67,6 +68,11 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <script dangerouslySetInnerHTML={{ __html: themeInitScript }} />
       </head>
       <body className="min-h-screen bg-background font-sans text-foreground antialiased">
+        {/* Real User Monitoring — Core Web Vitals → /v1/rum.
+            Renders nothing; subscribes to LCP/INP/CLS/FCP/TTFB and
+            beacons one batch on page-unload. Mounted at the root so
+            it sees the very first paint of the very first route. */}
+        <RUMCollector />
         <TooltipProvider delayDuration={150}>
           <ConfirmProvider>
             <PromptProvider>

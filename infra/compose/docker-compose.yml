@@ -54,7 +54,14 @@ services:
       context: ../../api
       dockerfile: Dockerfile
       args:
+        # VERSION → APP_VERSION env in the image. Passed through here
+        # from IMAGE_TAG so a tagged release (e.g. v1.4.2) shows up on
+        # the "Running versions" card without extra wiring. APP_COMMIT
+        # should be the short git SHA — your CI sets it to
+        # `$(git rev-parse --short HEAD)`; locally `make build` does
+        # the same. Falls back to "unknown" if neither is set.
         VERSION: ${IMAGE_TAG:-dev}
+        APP_COMMIT: ${APP_COMMIT:-unknown}
     restart: unless-stopped
     environment:
       # ── Connections (resolved by docker DNS, never localhost) ──
@@ -290,6 +297,117 @@ services:
           memory: 1500M
 
   # ────────────────────────────────────────────────────────────
+  # Worker — async job runner (asynq consumer). Same image as the
+  # API; CMD overridden so it launches /app/drive360-worker. Picks
+  # up jobs the API enqueues onto Redis: antivirus scans, AI
+  # embeddings, scheduled merges, webhook deliveries, etc.
+  #
+  # Without this service running, any code path that calls
+  # queue.NewClient(...).Enqueue(...) succeeds at the API level
+  # (the task lands in Redis) but nothing ever processes it. The
+  # antivirus gate is the most visible victim — files sit in
+  # `status='scanning'` forever and the download handler refuses
+  # them.
+  #
+  # Resource budget kept modest: scans stream from MinIO straight
+  # to clamd over the network — neither side holds the whole blob,
+  # so memory tracks Concurrency * (chunk buffer) not file size.
+  # ────────────────────────────────────────────────────────────
+  worker:
+    image: ${API_IMAGE:-ghcr.io/your-org/drive360-api:latest}
+    build:
+      context: ../../api
+      dockerfile: Dockerfile
+      args:
+        # Same image, same build args — both binaries ship together,
+        # so the worker's APP_VERSION / APP_COMMIT match the api's.
+        VERSION: ${IMAGE_TAG:-dev}
+        APP_COMMIT: ${APP_COMMIT:-unknown}
+    command: ["/app/drive360-worker"]
+    restart: unless-stopped
+    environment:
+      # Worker shares the API's data plane: same DB, same Redis,
+      # same MinIO. Anything the API writes, the worker reads.
+      DATABASE_URL: postgres://drive360:${POSTGRES_PASSWORD}@postgres:5432/drive360?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: ${S3_BUCKET:-drive360}
+      MINIO_REGION: us-east-1
+      MINIO_SSL: "false"
+      # Antivirus: when CLAMAV_ADDR is set, scanner.FromEnv
+      # returns the ClamAV TCP scanner; unset → Noop (every scan
+      # comes back Skipped). The clamav service below exposes
+      # clamd on the docker network at clamav:3310.
+      CLAMAV_ADDR: ${CLAMAV_ADDR:-clamav:3310}
+      # AI mirrors the API's config so async embeddings / autotag
+      # use the same provider the inline path does. Toggle off
+      # globally by setting AI_ENABLED=false in .env.
+      AI_ENABLED: ${AI_ENABLED:-false}
+      AI_PROVIDER: ${AI_PROVIDER:-ollama}
+      AI_BASE_URL: ${AI_BASE_URL:-http://ollama:11434}
+      AI_CHAT_MODEL: ${AI_CHAT_MODEL:-llama3.2:3b}
+      AI_EMBED_MODEL: ${AI_EMBED_MODEL:-nomic-embed-text}
+      AI_VISION_MODEL: ${AI_VISION_MODEL:-}
+      AI_TIMEOUT_SEC: ${AI_TIMEOUT_SEC:-180}
+      # Worker exposes /metrics on :9090 for Prometheus. Bound to
+      # the docker network only (no host port published) — scrape
+      # via the prometheus service in infra/observability.
+      WORKER_METRICS_ADDR: ":9090"
+      METRICS_BASIC_AUTH_USER: ${METRICS_BASIC_AUTH_USER:-}
+      METRICS_BASIC_AUTH_PASSWORD: ${METRICS_BASIC_AUTH_PASSWORD:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      clamav:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ────────────────────────────────────────────────────────────
+  # ClamAV daemon — backs the antivirus-scan toggle on the
+  # upload-policy surface. The official image bundles freshclam
+  # (signature updater) and clamd (scan daemon) in one process
+  # supervisor; first boot downloads the full signature DB
+  # (~250 MB) before clamd will accept connections — the
+  # healthcheck below waits on that.
+  #
+  # Memory budget: clamd loads the entire signature DB into RAM.
+  # 1.5 GB is the documented minimum for the default ruleset;
+  # going lower causes clamd to refuse to start with
+  # "LibClamAV Error: cli_loaddb...". On a tight VPS, scale this
+  # down only after pruning rules.
+  # ────────────────────────────────────────────────────────────
+  clamav:
+    image: clamav/clamav:stable
+    restart: unless-stopped
+    volumes:
+      # Persist the signature DB across restarts so freshclam
+      # doesn't re-download 250 MB on every redeploy.
+      - clamav_data:/var/lib/clamav
+    healthcheck:
+      # `clamdcheck.sh` is a shipped helper that pings clamd via
+      # the local socket; it returns non-zero until the daemon
+      # has loaded its DB and is accepting INSTREAM scans.
+      test: ["CMD", "clamdcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 300s
+    deploy:
+      resources:
+        limits:
+          memory: 1500M
+
+  # ────────────────────────────────────────────────────────────
   # Ollama — local AI. Big (~4 GB image, models are 2-7 GB each
   # in the volume). On KVM 2 (8 GB RAM total) this competes hard
   # with ONLYOFFICE; pick one or upgrade.
@@ -317,3 +435,4 @@ volumes:
   onlyoffice_cache:
   onlyoffice_db:
   ollama_data:
+  clamav_data:

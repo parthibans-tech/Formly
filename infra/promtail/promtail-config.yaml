@@ -1,0 +1,93 @@
+# Promtail — log shipper. Tails Docker container logs on the
+# compose host and pushes them to Loki at http://loki:3100.
+#
+# In dev we lean on Docker's JSON-file logging driver: every
+# container writes its stdout/stderr to /var/lib/docker/containers
+# and Promtail walks that directory. The labels we extract come
+# from the Docker daemon (container_name, image), with one piece
+# of post-processing: if the line body parses as JSON and has a
+# `trace_id` field, that gets promoted to a Loki stream label so
+# the Grafana derived-field click resolves directly to a Tempo
+# span without re-parsing in the query layer.
+#
+# In production this same shape works against a sidecar pattern
+# (one Promtail per node tailing /var/log/containers, the same way
+# it does in Kubernetes), but the entry point is left as the file
+# path on disk — Loki itself doesn't care where the lines came from.
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+    # Backoff defaults are aggressive enough for dev; tighten in
+    # prod if we ever lose the Loki-side ingestion ring.
+    backoff_config:
+      min_period: 500ms
+      max_period: 5m
+      max_retries: 10
+
+scrape_configs:
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+        # Filter to the formly compose project. Without this we'd
+        # also pull every random container the dev's running
+        # outside this project.
+        filters:
+          - name: label
+            values: ["com.docker.compose.project=infra"]
+    relabel_configs:
+      - source_labels: [__meta_docker_container_name]
+        regex: "/(.*)"
+        target_label: container
+      - source_labels: [__meta_docker_container_log_stream]
+        target_label: logstream
+      - source_labels: [__meta_docker_container_label_com_docker_compose_service]
+        target_label: service
+      - source_labels: [__meta_docker_container_label_com_docker_compose_project]
+        target_label: project
+    pipeline_stages:
+      # Strip the docker JSON envelope, hand the inner line to
+      # the next stage. Docker writes one JSON object per line:
+      # {"log":"...","stream":"stdout","time":"..."}
+      - docker: {}
+
+      # Parse the inner line as JSON if possible. Failed parses
+      # silently fall through (Loki indexes the raw line as-is),
+      # which is what we want for non-structured logs (Postgres,
+      # MinIO, Tempo's own startup banner).
+      - json:
+          expressions:
+            level: level
+            msg: msg
+            trace_id: trace_id
+            request_id: request_id
+
+      # Promote `level` to a stream label so Grafana's level
+      # column auto-colors. Limited cardinality (debug/info/warn/
+      # error/fatal) — safe to label.
+      - labels:
+          level:
+
+      # Promote `trace_id` to a stream label so the Grafana
+      # derived-field click on a log line jumps to the Tempo span.
+      # Cardinality is unbounded in theory but each value is
+      # unique and short-lived (one trace lives ~minutes), so the
+      # active-stream count stays bounded by `retention_period /
+      # mean_trace_lifetime` — well under the 5k limit per user
+      # in loki-config.yaml.
+      - labels:
+          trace_id:
+
+      # Drop empty trace_id labels — Promtail emits the label
+      # with an empty value when the field is missing, which is
+      # both visually noisy and bad for cardinality.
+      - match:
+          selector: '{trace_id=""}'
+          action: drop

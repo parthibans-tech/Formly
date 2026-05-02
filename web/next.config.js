@@ -137,6 +137,33 @@ module.exports = {
     config.resolve.alias.canvas = false;
     return config;
   },
+  // Permanent redirects from the old /settings/admin/* paths to the new
+  // top-level /admin/* console. Super-admin lived under /settings for
+  // historical reasons; it isn't a "setting", it's a separate cross-tenant
+  // operator console, so it earned its own root segment. The 308s here
+  // keep any bookmarked / linked URLs working without a UX cliff.
+  //
+  // We carefully do NOT redirect /settings/admin-email — that's a
+  // different route (the org-level email-audit page) that just happens
+  // to share a prefix with our old /settings/admin path.
+  async redirects() {
+    return [
+      {
+        source: "/settings/admin",
+        destination: "/admin",
+        permanent: true,
+      },
+      {
+        // Catch-all for every nested page that used to live under
+        // /settings/admin/<anything>. Path param syntax `:slug*` matches
+        // zero-or-more path segments, so this covers /settings/admin/orgs,
+        // /settings/admin/users/[id]/analytics, etc.
+        source: "/settings/admin/:slug*",
+        destination: "/admin/:slug*",
+        permanent: true,
+      },
+    ];
+  },
   async headers() {
     return [
       {

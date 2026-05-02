@@ -9,7 +9,7 @@
 //     shipped Aadhaar, PAN, Receipt, etc.) appear in the list as
 //     read-only — they're shown so the user can see their full picker
 //     inventory in one view, but the Edit button is hidden.
-//   - Super admin lands here from /settings/admin → "OCR profiles" and
+//   - Super admin lands here from /admin → "OCR profiles" and
 //     additionally gets edit/delete on built-ins. Creating a new
 //     profile prompts whether it's an org-scoped row or a new platform
 //     built-in via the "Make this a platform built-in" toggle in the
@@ -22,7 +22,7 @@
 //
 // The data is identical (same list endpoint, same row shape) and the
 // editor differs by exactly one toggle. Splitting into /settings/
-// ocr-profiles and /settings/admin/ocr-profiles would duplicate the
+// ocr-profiles and /admin/ocr-profiles would duplicate the
 // 400 lines of editor + list code for that single boolean. Instead we
 // branch on `isSuperAdmin` from the cached user blob; the URL is
 // reached from either sidebar group.
@@ -181,7 +181,7 @@ export default function OcrProfilesPage() {
     // `load`, which would re-fire the mount effect below in a loop and
     // hammer /v1/ocr/profiles. The toast methods themselves dispatch
     // through module-scope shadcn calls so they're safe to use without
-    // a dep entry. Same pattern as /settings/admin/users.
+    // a dep entry. Same pattern as /admin/users.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

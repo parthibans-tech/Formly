@@ -40,14 +40,19 @@ import (
 	"github.com/docforge/api/internal/onlyoffice"
 	"github.com/docforge/api/internal/orggate"
 	"github.com/docforge/api/internal/platform"
+	"github.com/docforge/api/internal/profiling"
 	"github.com/docforge/api/internal/promquery"
+	"github.com/docforge/api/internal/rum"
 	"github.com/docforge/api/internal/vault"
+	"github.com/docforge/api/internal/platformanalytics"
 	"github.com/docforge/api/internal/platformaudit"
 	"github.com/docforge/api/internal/me"
 	"github.com/docforge/api/internal/orgdashboard"
 	"github.com/docforge/api/internal/orgs"
 	"github.com/docforge/api/internal/platformdashboard"
+	"github.com/docforge/api/internal/platformfinance"
 	"github.com/docforge/api/internal/platformorgs"
+	"github.com/docforge/api/internal/platformstorage"
 	"github.com/docforge/api/internal/platformusers"
 	"github.com/docforge/api/internal/presence"
 	"github.com/docforge/api/internal/queue"
@@ -337,6 +342,16 @@ func main() {
 	po := platformorgs.New(pool)
 	pa := platformaudit.New(pool)
 	pd := platformdashboard.New(pool)
+	// P3-enterprise: org + user analytics, CSV exports, bulk actions.
+	pan := platformanalytics.New(pool)
+	// Enterprise storage management: cross-tenant inventory, trash
+	// purge, orphan reconcile, backend health. Needs the storage client
+	// for hard-delete + ping.
+	pst := platformstorage.New(pool, store)
+	// Revenue & Expenses console: pairs the existing invoice/subscription
+	// data with operator-tracked expense entries so super-admins can see
+	// a real P&L (revenue, expense, net, MRR/MRE) per currency.
+	pfin := platformfinance.New(pool)
 	od := orgdashboard.New(pool)
 	meh := me.New(pool)
 	// /v1/me/profile surfaces the org logo URL too — the me handler
@@ -548,8 +563,29 @@ func main() {
 	r.Method("GET", "/metrics", metricsReg.Handler(metricsUser, metricsPass))
 	r.Get("/v1/ops/metrics", obs.Metrics)
 
+	// /debug/pprof/* — continuous profiling pull endpoints. Pyroscope
+	// scrapes these on the same cadence Prometheus scrapes /metrics
+	// and stores flame graphs by profile type (cpu, heap, goroutine,
+	// allocs). Same access policy as /metrics: basic auth when env
+	// creds are set, loopback-only otherwise — pprof endpoints leak
+	// stack traces, source paths, and process internals, so the
+	// guard isn't optional.
+	profiling.Mount(r, func(h http.Handler) http.Handler {
+		return metrics.AccessGuard(metricsUser, metricsPass, h)
+	})
+
 	// OpenAPI spec — public so docs viewers can fetch it without a token.
 	r.Get("/v1/openapi.json", platform.OpenAPIHandler())
+
+	// /v1/rum — Real User Monitoring ingestion. Public on purpose:
+	// Core Web Vitals fire on the FIRST page load before any login
+	// or app shell completes, so an auth gate would systematically
+	// drop the only sample population worth measuring (cold-cache
+	// first paints). Cardinality + body-size guards inside the
+	// handler replace what auth would do — see internal/rum for the
+	// threat model.
+	rumH := rum.New(metricsReg)
+	r.Post("/v1/rum", rumH.Ingest)
 
 	r.Route("/v1/auth", func(r chi.Router) {
 		r.Use(authRateLimit)
@@ -874,7 +910,14 @@ func main() {
 		r.Route("/v1/admin/users", func(r chi.Router) {
 			r.Use(requireSuperAdmin)
 			r.Get("/", pu.List)
+			// Enterprise analytics + bulk + export must come before /{id}
+			// so they aren't shadowed by the dynamic segment.
+			r.Get("/analytics", pan.UserAnalytics)
+			r.Get("/export.csv", pan.ExportUsersCSV)
+			r.Post("/bulk-lock", pan.BulkLockUsers)
+			r.Post("/bulk-unlock", pan.BulkUnlockUsers)
 			r.Get("/{id}", pu.Detail)
+			r.Get("/{id}/analytics", pan.UserAnalyticsForID)
 			r.Post("/{id}/lock", pu.Lock)
 			r.Post("/{id}/unlock", pu.Unlock)
 			r.Post("/{id}/reset-mfa", pu.ResetMFA)
@@ -888,7 +931,13 @@ func main() {
 		r.Route("/v1/admin/orgs", func(r chi.Router) {
 			r.Use(requireSuperAdmin)
 			r.Get("/", po.List)
+			// Enterprise analytics + bulk + export must come before /{id}.
+			r.Get("/analytics", pan.OrgAnalytics)
+			r.Get("/export.csv", pan.ExportOrgsCSV)
+			r.Post("/bulk-freeze", pan.BulkFreezeOrgs)
+			r.Post("/bulk-unfreeze", pan.BulkUnfreezeOrgs)
 			r.Get("/{id}", po.Detail)
+			r.Get("/{id}/analytics", pan.OrgAnalyticsForID)
 			r.Post("/{id}/freeze", po.Freeze)
 			r.Post("/{id}/unfreeze", po.Unfreeze)
 			r.Delete("/{id}", po.SoftDelete)
@@ -896,12 +945,46 @@ func main() {
 			r.Patch("/{id}/quotas", po.SetQuotas)
 		})
 
+		// Enterprise storage management. Cross-tenant inventory, trash
+		// purge, orphan reconcile, backend ping. Static routes are
+		// registered before the {id} param routes so chi doesn't
+		// shadow `/inventory` etc.
+		r.Route("/v1/admin/storage", func(r chi.Router) {
+			r.Use(requireSuperAdmin)
+			r.Get("/overview", pst.Overview)
+			r.Get("/inventory", pst.Inventory)
+			r.Get("/backend", pst.BackendHealth)
+			r.Get("/trash/stats", pst.TrashStats)
+			r.Post("/trash/purge", pst.PurgeTrash)
+			r.Get("/orphans", pst.Orphans)
+			r.Post("/orphans/purge", pst.PurgeOrphans)
+			r.Post("/files/bulk-purge", pst.BulkPurge)
+			r.Get("/files/{id}", pst.FileDetail)
+			r.Post("/files/{id}/purge", pst.PurgeFile)
+		})
+
+		// Revenue & Expenses console. Overview pairs invoice-side
+		// revenue with operator-tracked expense rows so the super-admin
+		// gets a per-currency P&L. CRUD handlers manage the expense
+		// ledger directly (no provider, no webhook). CSV export streams
+		// invoices + expenses tagged with a `kind` column so a finance
+		// team can pivot in a spreadsheet.
+		r.Route("/v1/admin/finance", func(r chi.Router) {
+			r.Use(requireSuperAdmin)
+			r.Get("/overview", pfin.Overview)
+			r.Get("/expenses", pfin.ListExpenses)
+			r.Post("/expenses", pfin.CreateExpense)
+			r.Patch("/expenses/{id}", pfin.UpdateExpense)
+			r.Delete("/expenses/{id}", pfin.DeleteExpense)
+			r.Get("/export.csv", pfin.ExportCSV)
+		})
+
 		// Phase 3: platform-wide audit log viewer.
 		r.With(requireSuperAdmin).Get("/v1/admin/audit", pa.List)
 
 		// Tier 3: Prometheus-powered super-admin observability.
 		// Both routes 503 cleanly when PROMETHEUS_URL is unset, so a
-		// fresh dev checkout still loads /settings/admin/observability
+		// fresh dev checkout still loads /admin/observability
 		// — the page just hides its live panels.
 		obsq := promquery.NewHandler(promquery.New(
 			os.Getenv("PROMETHEUS_URL"),

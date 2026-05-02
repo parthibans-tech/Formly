@@ -161,6 +161,38 @@ type Registry struct {
 	// integration that needs a key rotation.
 	APIKeyAuth *prometheus.CounterVec
 
+	// --- Tier 5: Web Vitals (real-user monitoring) -------------------
+	//
+	// The browser emits five Core Web Vitals per page load (LCP, INP,
+	// CLS, FCP, TTFB). The frontend's lib/rum.ts beacons batches of
+	// these samples to /v1/rum where the rum.Handler funnels them into
+	// the vectors below.
+	//
+	// Cardinality discipline:
+	//
+	//   - `metric` is the enum {LCP, INP, CLS, FCP, TTFB} — bounded.
+	//   - `rating` is the enum {good, needs_improvement, poor} that
+	//     web-vitals.js computes from the sample value against
+	//     Google's published thresholds; bounded.
+	//   - `route` is a SANITISED Next.js route pattern, NOT the raw
+	//     URL. Sanitisation happens server-side in rum.Handler so a
+	//     hostile client cannot poison cardinality by posting random
+	//     paths. Template-style routes (/orgs/[id]/files) collapse to
+	//     a stable ~150-route ceiling.
+	//
+	// Bucket choice: LCP/INP/FCP/TTFB are millisecond-grained, so the
+	// histogram is in seconds with sub-100ms granularity at the bottom
+	// and a long tail to 30s for catastrophic loads. CLS is unitless
+	// (cumulative layout shift score, 0..several) — same vector to
+	// keep the metric surface uniform; the unit label on the
+	// dashboard side disambiguates.
+	WebVitals *prometheus.HistogramVec
+
+	// Per-sample counter so dashboards can show "X measurements taken
+	// per minute" alongside the histogram percentiles. Pairs with
+	// WebVitals on the same labels.
+	WebVitalsCount *prometheus.CounterVec
+
 	// --- Tier 4: deadman + cardinality watchdogs ---------------------
 	//
 	// CronLastRun is a per-cron unix-timestamp gauge updated each time
@@ -389,6 +421,30 @@ func New(opts Options) *Registry {
 		Help:      "API key (fk_*) verification outcomes. result ∈ {ok, invalid, revoked, expired, error}.",
 	}, []string{"result"})
 
+	// --- Tier 5 metric vectors --------------------------------------
+
+	r.WebVitals = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "formly",
+		Subsystem: "rum",
+		Name:      "web_vitals_seconds",
+		Help:      "Real-user Core Web Vitals samples (LCP/INP/CLS/FCP/TTFB) reported by the browser. CLS is unitless; the seconds unit on the histogram is a labelling artefact and the dashboard disambiguates.",
+		// LCP/INP/FCP/TTFB live in 0.1s..10s for healthy sites; CLS
+		// hugs the bottom of this scale (0..1 typical) but the same
+		// vector keeps the surface uniform. 12 buckets is the same
+		// budget as the HTTP histogram — wider than that costs
+		// scrape pages without informational gain.
+		Buckets: []float64{
+			0.05, 0.1, 0.25, 0.5, 1, 2, 3, 5, 8, 12, 20, 30,
+		},
+	}, []string{"metric", "rating", "route"})
+
+	r.WebVitalsCount = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "formly",
+		Subsystem: "rum",
+		Name:      "samples_total",
+		Help:      "Total Web Vitals samples ingested. Pairs with web_vitals_seconds for per-rating volume.",
+	}, []string{"metric", "rating", "route"})
+
 	// --- Tier 4 metric vectors --------------------------------------
 
 	r.CronLastRun = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -418,6 +474,8 @@ func New(opts Options) *Registry {
 		r.AuthAttempts,
 		r.RateLimitHits,
 		r.APIKeyAuth,
+		r.WebVitals,
+		r.WebVitalsCount,
 		r.CronLastRun,
 	)
 

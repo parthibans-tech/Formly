@@ -15,6 +15,8 @@ deleteDatasources:
   - name: Prometheus
   - name: Tempo
   - name: Alertmanager
+  - name: Loki
+  - name: Pyroscope
 
 datasources:
   - name: Prometheus
@@ -69,8 +71,66 @@ datasources:
       search:
         hide: false
       lokiSearch:
-        # No Loki in this stack — leave this off.
-        hide: true
+        datasourceUid: loki
+      # Trace -> logs pivot. From a span in Tempo, jump to the
+      # surrounding logs in Loki. The match is on the trace_id
+      # stream label that Promtail promotes from JSON log bodies
+      # (see infra/promtail/promtail-config.yaml). Without this
+      # the tracing pane shows spans but operator has to copy
+      # the trace_id by hand.
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: -1m
+        spanEndTimeShift: 1m
+        tags:
+          - key: service.name
+            value: service
+        filterByTraceID: true
+        filterBySpanID: false
+        customQuery: false
+      # Trace -> profiles pivot. From a span in Tempo, jump to the
+      # CPU / heap flame graph for the same service around the
+      # span's time window. The match is on `service.name` (Tempo)
+      # → `service_name` (Pyroscope) — both stamp the same string
+      # ("formly-api" / "formly-worker") so the pivot resolves
+      # without a mapping table.
+      tracesToProfiles:
+        datasourceUid: pyroscope
+        # Same +/- 1m window as the metrics pivot. Pyroscope
+        # bins by 15s scrape interval, so a 2m window captures
+        # ~8 samples per profile type — enough to see a hot
+        # function without dragging in unrelated history.
+        spanStartTimeShift: -1m
+        spanEndTimeShift: 1m
+        tags:
+          - key: service.name
+            value: service_name
+        # Default profile type — process CPU is what an operator
+        # wants 90% of the time when arriving from a slow trace.
+        # The Grafana UI lets them switch to heap / goroutine
+        # without re-pivoting.
+        profileTypeId: process_cpu:cpu:nanoseconds:cpu:nanoseconds
+        customQuery: false
+
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: false
+    jsonData:
+      maxLines: 1000
+      # Logs -> traces pivot. Any line whose stream has a
+      # `trace_id` label gets a clickable button on the right
+      # that opens the trace in Tempo. The derived field reads
+      # the trace_id from the line label, not the body.
+      derivedFields:
+        - name: trace_id
+          matcherType: label
+          matcherRegex: "trace_id"
+          url: "$${__value.raw}"
+          datasourceUid: tempo
+          urlDisplayLabel: "View trace"
 
   - name: Alertmanager
     uid: alertmanager
@@ -83,3 +143,19 @@ datasources:
       # Alertmanager-managed silences and active groups.
       implementation: prometheus
       handleGrafanaManagedAlerts: false
+
+  # Pyroscope — continuous profiling. Datasource type is
+  # `grafana-pyroscope-datasource` (the Grafana-built one, not
+  # the legacy `phlare`). Lights up the Profiles section in
+  # Explore + the Drilldown view on the trace pane.
+  - name: Pyroscope
+    uid: pyroscope
+    type: grafana-pyroscope-datasource
+    access: proxy
+    url: http://pyroscope:4040
+    editable: false
+    jsonData:
+      # Default minimum step ensures dashboard panels don't ask
+      # for nano-resolution flame graphs over a 30d range and
+      # collapse the queryier. 15s matches the scrape interval.
+      minStep: "15s"

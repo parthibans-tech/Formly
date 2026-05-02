@@ -1,0 +1,122 @@
+{
+  "annotations": {"list": []},
+  "description": "Continuous-profile flame graphs (CPU + heap + goroutines) for the API and worker, scraped by Pyroscope. The drilldown for a slow trace: from a hot bucket on Global health, pivot to the trace in Tempo, then to the matching flame graph here.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "type": "row",
+      "title": "API process",
+      "id": 100,
+      "gridPos": {"x": 0, "y": 0, "w": 24, "h": 1}
+    },
+    {
+      "type": "flamegraph",
+      "title": "API · CPU flame graph",
+      "id": 1,
+      "gridPos": {"x": 0, "y": 1, "w": 24, "h": 12},
+      "datasource": {"type": "grafana-pyroscope-datasource", "uid": "pyroscope"},
+      "targets": [
+        {
+          "refId": "A",
+          "labelSelector": "{service_name=\"formly-api\"}",
+          "profileTypeId": "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
+          "groupBy": []
+        }
+      ]
+    },
+    {
+      "type": "flamegraph",
+      "title": "API · Heap (in-use objects)",
+      "id": 2,
+      "gridPos": {"x": 0, "y": 13, "w": 12, "h": 10},
+      "datasource": {"type": "grafana-pyroscope-datasource", "uid": "pyroscope"},
+      "targets": [
+        {
+          "refId": "A",
+          "labelSelector": "{service_name=\"formly-api\"}",
+          "profileTypeId": "memory:inuse_objects:count:space:bytes",
+          "groupBy": []
+        }
+      ]
+    },
+    {
+      "type": "flamegraph",
+      "title": "API · Goroutines",
+      "id": 3,
+      "gridPos": {"x": 12, "y": 13, "w": 12, "h": 10},
+      "datasource": {"type": "grafana-pyroscope-datasource", "uid": "pyroscope"},
+      "targets": [
+        {
+          "refId": "A",
+          "labelSelector": "{service_name=\"formly-api\"}",
+          "profileTypeId": "goroutine:goroutine:count:goroutine:count",
+          "groupBy": []
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Worker process",
+      "id": 200,
+      "gridPos": {"x": 0, "y": 23, "w": 24, "h": 1}
+    },
+    {
+      "type": "flamegraph",
+      "title": "Worker · CPU flame graph",
+      "id": 4,
+      "gridPos": {"x": 0, "y": 24, "w": 24, "h": 12},
+      "datasource": {"type": "grafana-pyroscope-datasource", "uid": "pyroscope"},
+      "targets": [
+        {
+          "refId": "A",
+          "labelSelector": "{service_name=\"formly-worker\"}",
+          "profileTypeId": "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
+          "groupBy": []
+        }
+      ]
+    },
+    {
+      "type": "flamegraph",
+      "title": "Worker · Heap (in-use objects)",
+      "id": 5,
+      "gridPos": {"x": 0, "y": 36, "w": 12, "h": 10},
+      "datasource": {"type": "grafana-pyroscope-datasource", "uid": "pyroscope"},
+      "targets": [
+        {
+          "refId": "A",
+          "labelSelector": "{service_name=\"formly-worker\"}",
+          "profileTypeId": "memory:inuse_objects:count:space:bytes",
+          "groupBy": []
+        }
+      ]
+    },
+    {
+      "type": "flamegraph",
+      "title": "Worker · Goroutines",
+      "id": 6,
+      "gridPos": {"x": 12, "y": 36, "w": 12, "h": 10},
+      "datasource": {"type": "grafana-pyroscope-datasource", "uid": "pyroscope"},
+      "targets": [
+        {
+          "refId": "A",
+          "labelSelector": "{service_name=\"formly-worker\"}",
+          "profileTypeId": "goroutine:goroutine:count:goroutine:count",
+          "groupBy": []
+        }
+      ]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["formly", "profiles"],
+  "templating": {"list": []},
+  "time": {"from": "now-15m", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Formly · Continuous profiles",
+  "uid": "formly-profiles",
+  "version": 1,
+  "weekStart": ""
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"time"
 
@@ -121,14 +122,31 @@ func main() {
 	}
 	go func() {
 		mux := http.NewServeMux()
-		mux.Handle("/metrics", metricsReg.Handler(
-			os.Getenv("METRICS_BASIC_AUTH_USER"),
-			os.Getenv("METRICS_BASIC_AUTH_PASSWORD"),
-		))
+		metricsUser := os.Getenv("METRICS_BASIC_AUTH_USER")
+		metricsPass := os.Getenv("METRICS_BASIC_AUTH_PASSWORD")
+		mux.Handle("/metrics", metricsReg.Handler(metricsUser, metricsPass))
 		mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("ok\n"))
 		})
+
+		// /debug/pprof/* — same access guard as /metrics so Pyroscope
+		// can scrape continuous profiles from the worker. Unlike the
+		// API (which uses chi.Mount via internal/profiling), this
+		// process speaks raw http.ServeMux — register each pprof
+		// handler explicitly through metrics.AccessGuard so the
+		// profile surface stays gated identically to /metrics.
+		guard := func(h http.Handler) http.Handler {
+			return metrics.AccessGuard(metricsUser, metricsPass, h)
+		}
+		mux.Handle("/debug/pprof/", guard(http.HandlerFunc(pprof.Index)))
+		mux.Handle("/debug/pprof/cmdline", guard(http.HandlerFunc(pprof.Cmdline)))
+		mux.Handle("/debug/pprof/profile", guard(http.HandlerFunc(pprof.Profile)))
+		mux.Handle("/debug/pprof/symbol", guard(http.HandlerFunc(pprof.Symbol)))
+		mux.Handle("/debug/pprof/trace", guard(http.HandlerFunc(pprof.Trace)))
+		for _, name := range []string{"allocs", "block", "goroutine", "heap", "mutex", "threadcreate"} {
+			mux.Handle("/debug/pprof/"+name, guard(pprof.Handler(name)))
+		}
 		srv := &http.Server{
 			Addr:              metricsAddr,
 			Handler:           mux,

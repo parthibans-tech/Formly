@@ -487,8 +487,13 @@ function InfraStrip({ infra }: { infra: InfraComponent[] }) {
     "prometheus",
     "alertmanager",
     "tempo",
+    "loki",
+    "pyroscope",
     "grafana",
     "blackbox",
+    "postgres-exporter",
+    "redis-exporter",
+    "cadvisor",
   ];
   const sorted = [...infra].sort(
     (a, b) =>
@@ -525,20 +530,40 @@ function InfraChip({ c }: { c: InfraComponent }) {
       ? "Alertmanager"
       : c.name === "tempo"
       ? "Tempo"
+      : c.name === "loki"
+      ? "Loki"
+      : c.name === "pyroscope"
+      ? "Pyroscope"
       : c.name === "grafana"
       ? "Grafana"
       : c.name === "blackbox"
       ? "Blackbox"
+      : c.name === "postgres-exporter"
+      ? "pg exporter"
+      : c.name === "redis-exporter"
+      ? "redis exporter"
+      : c.name === "cadvisor"
+      ? "cAdvisor"
       : c.name;
   const envHint =
     c.name === "alertmanager"
       ? "Set ALERTMANAGER_URL to enable"
       : c.name === "tempo"
       ? "Set OTEL_EXPORTER_OTLP_ENDPOINT to enable"
+      : c.name === "loki"
+      ? "Set LOKI_URL to enable"
+      : c.name === "pyroscope"
+      ? "Set PYROSCOPE_URL to enable"
       : c.name === "grafana"
       ? "Set GRAFANA_URL to enable"
       : c.name === "blackbox"
       ? "Set BLACKBOX_URL to enable"
+      : c.name === "postgres-exporter"
+      ? "Set POSTGRES_EXPORTER_URL to enable"
+      : c.name === "redis-exporter"
+      ? "Set REDIS_EXPORTER_URL to enable"
+      : c.name === "cadvisor"
+      ? "Set CADVISOR_URL to enable"
       : "Set PROMETHEUS_URL to enable";
   const title = !c.configured
     ? envHint

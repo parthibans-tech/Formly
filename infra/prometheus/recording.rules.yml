@@ -432,6 +432,167 @@ groups:
             1e-12
           )
 
+      # 30-day budget burndown. The convention in our SLO docs is
+      # "30-day window" (matches the typical billing cycle); 28d
+      # above is the engineering compromise between window length
+      # and "one query interval long enough to amortise scrape
+      # gaps". This rule names the same shape with the 30d label so
+      # dashboards and reports can refer to the cycle without an
+      # arithmetic disclaimer. Different sample, same answer to two
+      # decimal places under steady-state traffic.
+      - record: tier:formly_tenant_error_ratio:avg30d
+        expr: |
+          avg_over_time(
+            tier:formly_tenant_error_ratio:rate5m[30d]
+          )
+
+      - record: tier:formly_error_budget_remaining:ratio30d
+        expr: |
+          clamp(
+            1 - (
+              tier:formly_tenant_error_ratio:avg30d
+                /
+              0.005
+            ),
+            -1,
+            1
+          )
+
+      # Per-tier 30d total request volume — the denominator on
+      # incident reports ("we burned 12% of the budget on 850k
+      # requests"). Cheap on a recorded series; the Prometheus
+      # query planner does NOT collapse this into the same plan
+      # as the avg_over_time above, so each gets one read.
+      - record: tier:formly_tenant_requests:total30d
+        expr: |
+          sum_over_time(
+            (
+              sum by (tier) (
+                rate(formly_tenant_requests_total[5m])
+              )
+            )[30d:5m]
+          )
+            * 300
+
+      # Total 5xx volume over the 30d window — pairs with the total
+      # above to render "X errors out of Y requests" on the budget
+      # report. The same trick (rate × interval × samples) gives a
+      # close-enough integer count without the cost of an
+      # `increase()` over 30d on a hot counter.
+      - record: tier:formly_tenant_5xx:total30d
+        expr: |
+          sum_over_time(
+            (
+              sum by (tier) (
+                rate(formly_tenant_requests_total{code="5xx"}[5m])
+              )
+            )[30d:5m]
+          )
+            * 300
+
+      # Allowed-error budget at 99.5% over the 30d total. The chart
+      # subtracts this from the actual 5xx total to render the bar
+      # ("X errors used of N allowed").
+      - record: tier:formly_tenant_5xx:budget30d
+        expr: |
+          tier:formly_tenant_requests:total30d * 0.005
+
+      # Forecast: same predict_linear shape as the 28d version but
+      # against the 30d gauge. Lets the dashboard render two
+      # consistent forecasts (the 28d one is the alert input; the
+      # 30d one is the operator-facing report).
+      - record: tier:formly_error_budget_exhaustion_seconds:predict30d
+        expr: |
+          predict_linear(
+            tier:formly_error_budget_remaining:ratio30d[6h],
+            0
+          )
+          /
+          clamp_min(
+            -deriv(tier:formly_error_budget_remaining:ratio30d[6h]),
+            1e-12
+          )
+
+  # ---------------------------------------------------------------- #
+  # Tier 5: Real User Monitoring (Core Web Vitals).                  #
+  #                                                                  #
+  # The browser-side collector beacons LCP/INP/CLS/FCP/TTFB samples  #
+  # to /v1/rum, which records them onto a histogram labeled by       #
+  # {metric, rating, route}. These rollups give the dashboard cheap  #
+  # series for "what's the p75 across all users right now" — the     #
+  # standard Core Web Vitals reporting unit (Google ranks pages on   #
+  # the 75th percentile of real-user samples, not the median).       #
+  #                                                                  #
+  # Cardinality budget: 5 metrics × 3 ratings × ~20 routes = ~300    #
+  # series per quantile. Bounded by the route allowlist + ID-segment #
+  # collapse in internal/rum/sanitiseRoute.                          #
+  # ---------------------------------------------------------------- #
+
+  - name: formly-rum
+    interval: 30s
+    rules:
+      # Per-metric p75 across all routes — the headline SLI for Core
+      # Web Vitals. Aggregated to (metric) only because the dashboard
+      # wants one line per vital, not one per (vital, route) tuple.
+      - record: metric:formly_web_vitals_seconds:p75
+        expr: |
+          histogram_quantile(
+            0.75,
+            sum by (metric, le) (
+              rate(formly_rum_web_vitals_seconds_bucket[5m])
+            )
+          )
+
+      # p95 — the long-tail companion. Useful for spotting a regression
+      # that hits 5% of users hard before the median moves.
+      - record: metric:formly_web_vitals_seconds:p95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (metric, le) (
+              rate(formly_rum_web_vitals_seconds_bucket[5m])
+            )
+          )
+
+      # Per-(metric, route) p75 for the per-page drilldown. Cardinality
+      # is the same as the underlying histogram — bounded by the route
+      # sanitiser. The dashboard table reads this when the operator
+      # clicks into a specific vital.
+      - record: metric_route:formly_web_vitals_seconds:p75
+        expr: |
+          histogram_quantile(
+            0.75,
+            sum by (metric, route, le) (
+              rate(formly_rum_web_vitals_seconds_bucket[5m])
+            )
+          )
+
+      # Sample count by rating — the "how many users had a poor LCP"
+      # answer that the headline percentile alone hides. A page can
+      # have a "good" p75 while still failing 20% of users.
+      - record: metric_rating:formly_rum_samples:rate5m
+        expr: |
+          sum by (metric, rating) (
+            rate(formly_rum_samples_total[5m])
+          )
+
+      # Fraction of samples in each rating bucket. Pairs with the
+      # absolute count above; lets the alert fire on "more than 25%
+      # of LCP samples are poor in the last 30m" without having to
+      # also know the traffic level.
+      - record: metric_rating:formly_rum_sample_ratio:rate30m
+        expr: |
+          sum by (metric, rating) (
+            rate(formly_rum_samples_total[30m])
+          )
+            /
+          clamp_min(
+            sum by (metric) (
+              rate(formly_rum_samples_total[30m])
+            ),
+            1e-9
+          )
+
   - name: formly-cardinality-watchdog
     # Run sparingly — counting __name__ groups across the whole TSDB
     # is one of the more expensive recording rules. 5m is plenty.

@@ -10,6 +10,8 @@
 #   - alertmanager.yml syntax (amtool check-config)
 #   - blackbox.yml syntax (blackbox_exporter --config.check)
 #   - tempo.yaml syntax (tempo -config.file --config.verify)
+#   - pyroscope.yaml syntax (pyroscope -config.file -modules)
+#   - alertmanager templates render against a synthetic alert
 #   - grafana dashboard JSON syntactic validity (jq)
 #
 # Failures here block the PR. Add new validators sparingly — every
@@ -90,6 +92,128 @@ jobs:
         run: |
           amtool check-config infra/alertmanager/alertmanager.yml
 
+      - name: Render templates against a synthetic alert
+        # `amtool check-config` parses YAML + checks that defined
+        # templates compile, but does NOT execute them — a template
+        # that *parses* but blows up at runtime (wrong field path,
+        # `index` on a missing key) still passes the static check.
+        # This step boots alertmanager with the real config + an
+        # ephemeral webhook receiver, posts a representative alert
+        # via the v2 API, and asserts the receiver actually got a
+        # body. If a template panics during render alertmanager logs
+        # `msg="Notify error"` and the body never arrives.
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/amtest
+          # Tiny webhook sink — captures whatever AM POSTs and writes
+          # it to a file we can stat. ncat is in the runner image.
+          (ncat -lk -p 5009 -c 'cat > /tmp/amtest/got.json; echo -e "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"' >/dev/null 2>&1 &) || true
+          sleep 1
+
+          # Override the production receivers with a single webhook
+          # pointing at the sink, but keep the templates: stanza so
+          # the real templates load.
+          cat > /tmp/amtest/alertmanager.yml <<'YAML'
+          global:
+            resolve_timeout: 5m
+          templates:
+            - /etc/alertmanager/templates/formly.tmpl
+          route:
+            receiver: sink
+            group_wait: 1s
+            group_interval: 1s
+            repeat_interval: 1m
+          receivers:
+            - name: sink
+              webhook_configs:
+                - url: http://host.docker.internal:5009/
+                  send_resolved: false
+          YAML
+
+          docker run --rm -d --name am-smoke \
+            -p 9093:9093 \
+            --add-host=host.docker.internal:host-gateway \
+            -v /tmp/amtest/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro \
+            -v "${{ github.workspace }}/infra/alertmanager/templates:/etc/alertmanager/templates:ro" \
+            prom/alertmanager:v0.27.0 \
+            --config.file=/etc/alertmanager/alertmanager.yml
+          # Wait for alertmanager to be ready.
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:9093/-/ready >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+
+          # Post a representative alert. Labelset matches what the
+          # real rules emit (alertname, severity, tier, kind, job,
+          # instance) so the silence-URL builder + dashboard-URL
+          # match clauses both see realistic input.
+          curl -fsS -XPOST -H 'Content-Type: application/json' \
+            --data @- http://localhost:9093/api/v2/alerts <<'JSON'
+          [{
+            "labels": {
+              "alertname": "FormlyTenantSLOFastBurn",
+              "severity": "page",
+              "tier": "pro",
+              "kind": "write",
+              "job": "formly-api",
+              "instance": "host.docker.internal:8080"
+            },
+            "annotations": {
+              "summary": "tier=pro write burning 14× budget",
+              "description": "Synthetic alert injected by CI to exercise the template engine.",
+              "runbook_url": "https://github.com/formly/formly/blob/main/infra/runbooks/slo-fast-burn.md"
+            },
+            "generatorURL": "http://prometheus:9090/graph?g0.expr=up"
+          }]
+          JSON
+
+          # Wait for the dispatch.
+          for i in $(seq 1 20); do
+            [[ -s /tmp/amtest/got.json ]] && break
+            sleep 1
+          done
+
+          docker logs am-smoke > /tmp/amtest/am.log 2>&1 || true
+          docker rm -f am-smoke >/dev/null 2>&1 || true
+
+          if grep -qE 'msg="Notify error"|template:.*error|undefined' /tmp/amtest/am.log; then
+            echo "::error::alertmanager logged a template/notify error"
+            cat /tmp/amtest/am.log
+            exit 1
+          fi
+          if [[ ! -s /tmp/amtest/got.json ]]; then
+            echo "::error::no webhook body received — template render likely failed"
+            cat /tmp/amtest/am.log
+            exit 1
+          fi
+          echo "─── webhook body (first 500 bytes) ───"
+          head -c 500 /tmp/amtest/got.json; echo
+
+  pyroscope:
+    name: pyroscope config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate pyroscope.yaml
+        # Pyroscope (single-binary mode) doesn't ship a dedicated
+        # `-verify-config` flag, but it exits non-zero on a config
+        # parse error before the HTTP server binds. We run with
+        # `-modules` which prints the resolved module list and
+        # exits — a clean way to force config parse without leaving
+        # a process running.
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "${{ github.workspace }}/infra/pyroscope/pyroscope.yaml:/etc/pyroscope/config.yaml:ro" \
+            grafana/pyroscope:1.8.0 \
+            -config.file=/etc/pyroscope/config.yaml \
+            -modules 2>&1 | tee /tmp/pyroscope.log
+          if grep -qiE 'error|fail' /tmp/pyroscope.log; then
+            echo "::error::pyroscope config rejected"
+            exit 1
+          fi
+
   blackbox:
     name: blackbox config
     runs-on: ubuntu-latest
@@ -113,12 +237,79 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Validate tempo.yaml
+        # Tempo 2.6 has no dedicated `-verify-config` flag — we
+        # boot it briefly and assert the process reaches "Tempo
+        # started" without exiting on a config error. The
+        # `-modules` flag would only print the static module list
+        # without parsing the config, which is too weak.
         run: |
-          docker run --rm \
+          set -euo pipefail
+          docker run --rm -d --name tempo-smoke \
             -v "${{ github.workspace }}/infra/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro" \
             grafana/tempo:2.6.1 \
-            -config.file=/etc/tempo/tempo.yaml \
-            -config.verify
+            -config.file=/etc/tempo/tempo.yaml
+          sleep 5
+          if docker logs tempo-smoke 2>&1 | grep -q 'Tempo started'; then
+            echo "tempo started ok"
+            docker rm -f tempo-smoke
+          else
+            docker logs tempo-smoke
+            docker rm -f tempo-smoke
+            exit 1
+          fi
+
+  loki:
+    name: loki + promtail config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate loki-config.yaml
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}/infra/loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro" \
+            grafana/loki:3.2.0 \
+            -config.file=/etc/loki/loki-config.yaml \
+            -verify-config
+
+      - name: Validate promtail-config.yaml
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}/infra/promtail/promtail-config.yaml:/etc/promtail/promtail-config.yaml:ro" \
+            grafana/promtail:3.2.0 \
+            -config.file=/etc/promtail/promtail-config.yaml \
+            -check-syntax
+
+  runbooks:
+    name: runbook URLs resolve to files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Every runbook_url annotation must point at a real .md
+        # The convention is
+        #   runbook_url: "https://github.com/formly/formly/blob/main/infra/runbooks/<slug>.md"
+        # We extract every such URL from the alert rules and check
+        # the corresponding file exists. Catches the "operator
+        # clicks the link in a 3am page and gets a 404" failure
+        # mode at PR time.
+        run: |
+          set -euo pipefail
+          missing=0
+          # shellcheck disable=SC2013
+          for url in $(grep -oE 'https://github.com/formly/formly/blob/main/infra/runbooks/[^"]+\.md' infra/prometheus/alerts.rules.yml | sort -u); do
+            slug="${url##*/}"
+            if [[ ! -f "infra/runbooks/$slug" ]]; then
+              echo "::error::runbook missing for $url (expected infra/runbooks/$slug)"
+              missing=$((missing + 1))
+            else
+              echo "OK $slug"
+            fi
+          done
+          if [[ $missing -gt 0 ]]; then
+            echo "::error::$missing runbook(s) referenced by alerts but not present in infra/runbooks/"
+            exit 1
+          fi
 
   grafana-dashboards:
     name: grafana dashboards (JSON)

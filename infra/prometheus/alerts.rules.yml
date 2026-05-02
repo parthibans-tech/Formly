@@ -24,6 +24,7 @@ groups:
             Prometheus has been unable to scrape {{ $labels.instance }}
             for 2 minutes. The process is either crashed, hung, or
             unreachable on the network.
+          runbook_url: "https://github.com/formly/formly/blob/main/infra/runbooks/process-down.md"
 
       # Build_info absent — catches the case where the process is up
       # but the metrics package failed to register, or someone shipped
@@ -62,6 +63,7 @@ groups:
             5xx ratio over the last 5m is
             {{ $value | humanizePercentage }} on {{ $labels.process }}.
             Check the logs for a recent deploy or upstream outage.
+          runbook_url: "https://github.com/formly/formly/blob/main/infra/runbooks/high-error-rate.md"
 
       # Per-route slow burn — catches a single endpoint regressing
       # without dragging down the global ratio. 10% threshold with a
@@ -186,6 +188,7 @@ groups:
             pgxpool acquired/max on {{ $labels.process }} is at
             {{ $value | humanizePercentage }}. Requests are about
             to start blocking on Acquire.
+          runbook_url: "https://github.com/formly/formly/blob/main/infra/runbooks/db-pool-exhaustion.md"
 
       - alert: FormlyDBPoolHigh
         expr: process:formly_db_pool_utilization:ratio > 0.8
@@ -370,6 +373,7 @@ groups:
             availability. 1h ratio + 5m ratio both above threshold
             for at least 2 minutes — the customer cohort sharing
             this tier is seeing a real outage right now.
+          runbook_url: "https://github.com/formly/formly/blob/main/infra/runbooks/slo-fast-burn.md"
 
       # Slow-burn — the ticket. 6× over 6h consumes ~5% of the budget
       # before firing; coupled with the 30m inner gate so a sustained
@@ -470,6 +474,7 @@ groups:
             window. Likely a leaked key being probed. Inspect
             `formly_auth_apikey_attempts_total` source IPs and rotate
             the suspected key family.
+          runbook_url: "https://github.com/formly/formly/blob/main/infra/runbooks/api-key-abuse.md"
 
   # -------------------------------------------------------------- #
   # Tier 4: read/write split SLO + budget forecast + deadmans +    #
@@ -641,6 +646,7 @@ groups:
             `{{ $labels.instance }}` has been failing for 2m.
             Check the network path — DNS, load balancer, TLS,
             or the listener itself.
+          runbook_url: "https://github.com/formly/formly/blob/main/infra/runbooks/endpoint-down.md"
 
       # Slow probe — the endpoint is up but a synthetic GET is
       # taking longer than 2s consistently. Ticket because the
@@ -691,6 +697,272 @@ groups:
             The blackbox exporter cannot resolve names for 5m.
             Either the resolver in the container is broken or
             the upstream we probe (1.1.1.1 by default) is dead.
+
+  # -------------------------------------------------------------- #
+  # Infrastructure alerts (postgres / redis / cAdvisor)             #
+  #                                                                #
+  # The series here come from postgres_exporter, redis_exporter,   #
+  # and cAdvisor — separate from the in-process formly_* metrics. #
+  # Catches database/cache/runtime issues that the application    #
+  # process can't see (because the request returned before the    #
+  # symptom showed up).                                            #
+  # -------------------------------------------------------------- #
+
+  - name: formly-postgres
+    rules:
+      # Replication lag — only meaningful on a replica. The custom
+      # `pg_replication_lag_seconds` query returns 0 on a primary.
+      # 60s lag is the warning line; users start to notice missing
+      # rows around there.
+      - alert: FormlyPostgresReplicationLag
+        expr: pg_replication_lag_seconds > 60
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Postgres replica lag > 60s"
+          description: |
+            Replication lag on Postgres replica is
+            {{ $value | humanizeDuration }} sustained 5m.
+            Queries hitting the replica may return stale data.
+          runbook_url: "https://github.com/formly/formly/blob/main/infra/runbooks/postgres-replication-lag.md"
+
+      # Long-running queries — single query held >60s for 10m
+      # consecutive. Almost always a missing index or a runaway
+      # report.
+      - alert: FormlyPostgresLongRunningQueries
+        expr: pg_long_running_count > 0
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $value }} Postgres queries running >60s"
+          description: |
+            At least one Postgres query has been running >60s for
+            the last 10m. Check pg_stat_activity for the offender
+            and look for a missing index or a runaway batch job.
+
+      # Blocked queries — held lock waiting for another transaction
+      # to release. A handful is normal during a migration; a
+      # sustained handful is a deadlock or a long transaction
+      # holding ACCESS EXCLUSIVE.
+      - alert: FormlyPostgresBlockedQueries
+        expr: pg_blocked_queries_count > 5
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $value }} Postgres queries blocked on locks"
+          description: |
+            More than 5 Postgres connections have been blocked on
+            Lock waits for 10m. Likely a long-running transaction
+            holding ACCESS EXCLUSIVE on a hot table; use
+            pg_blocking_pids() to find the chain head.
+
+      # Connection saturation — Postgres rejects new connections
+      # at max_connections (default 100). 80% sustained means a
+      # connection leak somewhere upstream of pgxpool.
+      - alert: FormlyPostgresConnectionSaturation
+        expr: |
+          (
+            sum(pg_stat_activity_count)
+              /
+            pg_settings_max_connections
+          ) > 0.8
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "Postgres connections >80% of max"
+          description: |
+            Active Postgres connections at
+            {{ $value | humanizePercentage }} of max_connections.
+            New connections will start failing soon.
+
+  - name: formly-redis
+    rules:
+      # Memory pressure — Redis evicts when maxmemory hits, and
+      # asynq backing data is the first thing to go (we use the
+      # noeviction policy in prod, so a maxed-out Redis means
+      # writes start returning OOM errors instead).
+      - alert: FormlyRedisMemoryHigh
+        expr: |
+          (
+            redis_memory_used_bytes
+              /
+            (redis_memory_max_bytes > 0)
+          ) > 0.8
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "Redis memory >80% of maxmemory"
+          description: |
+            Redis is at {{ $value | humanizePercentage }} of
+            configured maxmemory. With noeviction the next write
+            will return OOM. Either raise maxmemory or find the
+            keyspace bloat (asynq dead-letter, idle keys).
+          runbook_url: "https://github.com/formly/formly/blob/main/infra/runbooks/redis-memory.md"
+
+      # Connection cliff — every Redis client costs an FD; once
+      # you cross maxclients the next handshake is rejected. Lower
+      # threshold than the API DB pool because the cost of running
+      # near the cliff is much higher (no graceful queuing).
+      - alert: FormlyRedisConnectionsHigh
+        expr: redis_connected_clients > 100
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Redis connected_clients > 100"
+          description: |
+            {{ $value }} clients connected to Redis sustained 5m.
+            Likely a client-side connection leak — every API/worker
+            instance should hold a single pool, not one client per
+            request.
+
+      # Slowlog growth — entries accumulate when commands run
+      # over the slowlog-log-slower-than threshold (default 10ms).
+      # A spike means a hot key is being scanned, a long blocking
+      # BRPOP is timing out, or a Lua script is taking too long.
+      - alert: FormlyRedisSlowlogSpike
+        expr: rate(redis_slowlog_length[5m]) > 0.1
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Redis slowlog growing >0.1 entries/s"
+          description: |
+            Redis is recording slowlog entries at
+            {{ $value | humanize }}/s — commands taking longer
+            than the slowlog threshold. Inspect SLOWLOG GET 10
+            to find the offending command pattern.
+
+  - name: formly-containers
+    rules:
+      # Per-container memory pressure — fires when a container
+      # is sitting at >90% of its cgroup memory limit. cAdvisor
+      # publishes both the working set and the limit; the ratio
+      # tells you "this container is one allocation away from OOM."
+      - alert: FormlyContainerMemoryHigh
+        expr: |
+          (
+            container_memory_working_set_bytes{name!=""}
+              /
+            (container_spec_memory_limit_bytes{name!=""} > 0)
+          ) > 0.9
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Container {{ $labels.name }} memory >90% of limit"
+          description: |
+            Container `{{ $labels.name }}` is at
+            {{ $value | humanizePercentage }} of its cgroup memory
+            limit. The next allocation may trigger OOM-kill.
+
+      # Container restart loop — fires if cAdvisor records the
+      # container's last_seen flipping. We allow 1 restart in 30m
+      # (deploys) but anything more is a crashloop.
+      - alert: FormlyContainerRestartLoop
+        expr: |
+          changes(container_last_seen{name!=""}[30m]) > 2
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Container {{ $labels.name }} restarted >2× in 30m"
+          description: |
+            Container `{{ $labels.name }}` has restarted more
+            than twice in the last 30m — likely a crashloop.
+            Inspect `docker logs {{ $labels.name }}` for the
+            panic.
+
+  - name: formly-rum
+    rules:
+      # Sustained poor LCP. Google's bar is "p75 ≤ 2.5s" — if the
+      # 75th-percentile LCP across all routes sits above 4.0s for
+      # half an hour, real users are reliably waiting too long for
+      # the largest content paint and we want a ticket. We don't
+      # page on this: RUM regressions are usually a deploy-shaped
+      # problem the next on-call can take during business hours,
+      # not a 3am emergency.
+      - alert: FormlyWebVitalsPoorLCP
+        expr: metric:formly_web_vitals_seconds:p75{metric="LCP"} > 4.0
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "p75 LCP is poor ({{ $value | humanizeDuration }}) for 30m"
+          description: |
+            The 75th-percentile Largest Contentful Paint across all
+            real users has exceeded Google's "poor" threshold (4.0s)
+            for 30 minutes. Likely causes: a recent frontend bundle
+            regression, an image hosting slowdown, or a font/CSS
+            blocking the hero render. Check the RUM dashboard for
+            the route breakdown.
+          runbook_url: "https://github.com/formly/formly/blob/main/infra/runbooks/rum-poor-vitals.md"
+
+      # Sustained poor INP. Google's bar is "p75 ≤ 200ms"; >500ms
+      # at p75 means a meaningful chunk of users are watching the
+      # main thread freeze on a click. Same business-hours severity
+      # as LCP.
+      - alert: FormlyWebVitalsPoorINP
+        expr: metric:formly_web_vitals_seconds:p75{metric="INP"} > 0.5
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "p75 INP is poor ({{ $value | humanizeDuration }}) for 30m"
+          description: |
+            The 75th-percentile Interaction-to-Next-Paint across all
+            real users has exceeded Google's "poor" threshold
+            (500ms) for 30 minutes. Likely causes: a long-running
+            JS handler blocking the main thread, a synchronous
+            third-party script, or a large React commit. Profile
+            with the Performance tab on a representative route.
+          runbook_url: "https://github.com/formly/formly/blob/main/infra/runbooks/rum-poor-vitals.md"
+
+      # Sustained poor CLS. Google's bar is "p75 ≤ 0.1"; >0.25 at
+      # p75 is the layout-shift equivalent of "the page is jumping
+      # under the user's cursor". Most often a missing width/height
+      # on an injected ad/embed/image.
+      - alert: FormlyWebVitalsPoorCLS
+        expr: metric:formly_web_vitals_seconds:p75{metric="CLS"} > 0.25
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "p75 CLS is poor ({{ $value }}) for 30m"
+          description: |
+            The 75th-percentile Cumulative Layout Shift across all
+            real users has exceeded Google's "poor" threshold
+            (0.25) for 30 minutes. Almost always: a recently-added
+            image / embed / ad slot is rendering without reserved
+            space, pushing content down as it loads.
+          runbook_url: "https://github.com/formly/formly/blob/main/infra/runbooks/rum-poor-vitals.md"
+
+      # RUM ingestion stopped. The frontend should beacon at least
+      # once per page-unload; an hour of zero samples means either
+      # /v1/rum is broken, the frontend bundle isn't shipping the
+      # collector, or the API is rejecting every batch (cardinality
+      # cap, body limit, JSON parse). Ticket — no live user impact,
+      # but our RUM signal is gone.
+      - alert: FormlyWebVitalsIngestStalled
+        expr: |
+          sum(rate(formly_rum_samples_total[1h])) == 0
+        for: 1h
+        labels:
+          severity: ticket
+        annotations:
+          summary: "No Web Vitals samples ingested for 1h"
+          description: |
+            POST /v1/rum has accepted zero samples in the last hour.
+            Either the frontend collector failed to deploy, the
+            endpoint is being rejected upstream, or every batch is
+            being dropped at parse time. Check the API logs for
+            "rum" entries and the network tab on a fresh page load.
+          runbook_url: "https://github.com/formly/formly/blob/main/infra/runbooks/rum-ingest-stalled.md"
 
   - name: formly-cardinality-watchdog
     rules:

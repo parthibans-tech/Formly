@@ -417,10 +417,8 @@ export default function ProductConfigPage() {
           <ToggleRow
             checked={draft.scanEnabled}
             onChange={(v) => set("scanEnabled", v)}
-            disabled
-            badge={<Badge variant="outline" className="text-[10px]">Coming soon</Badge>}
             title="Antivirus scan"
-            desc="Hands the uploaded blob to a ClamAV worker before exposing it for download. Scaffolded — toggle is stored, but the worker isn't deployed yet."
+            desc="Hands the uploaded blob to a ClamAV worker before exposing it for download. Files stay in scanning state until the verdict is in; infected uploads are blocked from every download/share/preview path. Requires CLAMAV_ADDR set on the worker — without it, scans report skipped and files release as if scanning was off."
           />
           <ToggleRow
             checked={draft.forceAttachmentForRisky}

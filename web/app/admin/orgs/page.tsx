@@ -8,9 +8,12 @@
 // route through this page so an operator never has to touch psql.
 
 import { useCallback, useEffect, useState } from "react";
+import Link from "next/link";
 import {
   AlertTriangle,
+  BarChart3,
   Building2,
+  Download,
   HardDrive,
   Inbox,
   Lock,
@@ -21,7 +24,17 @@ import {
   Undo2,
   Users,
 } from "lucide-react";
-import { api } from "@/lib/api";
+import {
+  Donut,
+  KpiTile,
+  LineChart,
+  TopList,
+  formatBytes as fmtBytes,
+  formatCount,
+  type LabelValue,
+  type TimePoint,
+} from "@/components/admin-charts";
+import { api, API_URL, getToken } from "@/lib/api";
 import { useToast } from "@/components/toast";
 import { useConfirm } from "@/components/ui/confirm";
 import {
@@ -121,6 +134,104 @@ export default function AdminOrgsPage() {
   const [quotasTarget, setQuotasTarget] = useState<OrgRow | null>(null);
   const [quotaUsers, setQuotaUsers] = useState("");
   const [quotaStorageGB, setQuotaStorageGB] = useState("");
+
+  // Bulk select state — rendered as a sticky toolbar above the list
+  // when at least one row is selected.
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [bulkFreezeOpen, setBulkFreezeOpen] = useState(false);
+  const [bulkFreezeReason, setBulkFreezeReason] = useState("");
+
+  function toggleSelected(id: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+  function selectAllVisible() {
+    if (!rows) return;
+    const eligible = rows
+      .filter((r) => !r.deletedAt && !r.frozenAt)
+      .map((r) => r.id);
+    setSelected((prev) => {
+      const next = new Set(prev);
+      eligible.forEach((id) => next.add(id));
+      return next;
+    });
+  }
+  function clearSelection() {
+    setSelected(new Set());
+  }
+
+  async function exportCSV() {
+    try {
+      const qs = new URLSearchParams();
+      if (q) qs.set("q", q);
+      if (statusFilter) qs.set("status", statusFilter);
+      if (planFilter) qs.set("plan", planFilter);
+      const res = await fetch(
+        `${API_URL}/v1/admin/orgs/export.csv?` + qs.toString(),
+        { headers: { Authorization: `Bearer ${getToken() ?? ""}` } }
+      );
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `formly-orgs-${new Date().toISOString().slice(0, 10)}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast.show("success", "Export downloaded");
+    } catch (e: any) {
+      toast.show("error", "Export failed", { description: e?.message });
+    }
+  }
+
+  async function bulkFreezeSubmit() {
+    try {
+      const r = await api<{ requested: number; affected: number }>(
+        "/v1/admin/orgs/bulk-freeze",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            ids: Array.from(selected),
+            reason: bulkFreezeReason,
+          }),
+        }
+      );
+      toast.show(
+        "success",
+        `Froze ${r.affected} of ${r.requested} organizations`
+      );
+      setBulkFreezeOpen(false);
+      setBulkFreezeReason("");
+      clearSelection();
+      await load();
+    } catch (e: any) {
+      toast.show("error", e?.message || "Bulk freeze failed");
+    }
+  }
+
+  async function bulkUnfreeze() {
+    try {
+      const r = await api<{ requested: number; affected: number }>(
+        "/v1/admin/orgs/bulk-unfreeze",
+        {
+          method: "POST",
+          body: JSON.stringify({ ids: Array.from(selected) }),
+        }
+      );
+      toast.show(
+        "success",
+        `Unfroze ${r.affected} of ${r.requested} organizations`
+      );
+      clearSelection();
+      await load();
+    } catch (e: any) {
+      toast.show("error", e?.message || "Bulk unfreeze failed");
+    }
+  }
 
   const load = useCallback(async () => {
     setRefreshing(true);
@@ -298,14 +409,28 @@ export default function AdminOrgsPage() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">
-          Organizations
-        </h1>
-        <p className="text-sm text-muted-foreground">
-          Every workspace on the platform. Freeze a misbehaving tenant,
-          adjust their quotas, or soft-delete and restore.
-        </p>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">
+            Organizations
+          </h1>
+          <p className="text-sm text-muted-foreground">
+            Every workspace on the platform. Freeze a misbehaving tenant,
+            adjust their quotas, or soft-delete and restore.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <Button asChild size="sm" variant="outline">
+            <Link href="/admin/orgs/analytics">
+              <BarChart3 className="h-3.5 w-3.5" />
+              Analytics
+            </Link>
+          </Button>
+          <Button size="sm" variant="outline" onClick={exportCSV}>
+            <Download className="h-3.5 w-3.5" />
+            Export
+          </Button>
+        </div>
       </div>
 
       {/* Compact filter toolbar — single row, label-via-placeholder. */}
@@ -377,12 +502,46 @@ export default function AdminOrgsPage() {
         </div>
       </div>
 
+      {/* Bulk-action toolbar — only renders when at least one row is selected.
+          Sticks to the top of the viewport so the operator can scroll the
+          list and still hit Freeze/Unfreeze without losing context. */}
+      {selected.size > 0 && (
+        <div className="sticky top-2 z-10 flex flex-wrap items-center gap-2 rounded-md border bg-background/95 p-2 shadow-sm backdrop-blur">
+          <span className="text-xs font-medium">
+            {selected.size} selected
+          </span>
+          <Button size="sm" variant="ghost" className="h-7" onClick={selectAllVisible}>
+            Select all visible
+          </Button>
+          <div className="ml-auto flex items-center gap-1">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => {
+                setBulkFreezeOpen(true);
+                setBulkFreezeReason("");
+              }}
+            >
+              <Snowflake className="h-3.5 w-3.5" />
+              Freeze
+            </Button>
+            <Button size="sm" variant="outline" onClick={bulkUnfreeze}>
+              <Snowflake className="h-3.5 w-3.5" />
+              Unfreeze
+            </Button>
+            <Button size="sm" variant="ghost" onClick={clearSelection}>
+              Clear
+            </Button>
+          </div>
+        </div>
+      )}
+
       <Card>
         <CardHeader>
           <CardTitle className="text-base">Workspaces</CardTitle>
           <CardDescription>
             Click any row for the detail drawer. Inline actions cover the
-            common cases.
+            common cases. Tick a row to enable bulk freeze / unfreeze.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -402,6 +561,8 @@ export default function AdminOrgsPage() {
                 <OrgRowItem
                   key={o.id}
                   o={o}
+                  selected={selected.has(o.id)}
+                  onToggle={() => toggleSelected(o.id)}
                   onOpen={() => setOpenId(o.id)}
                   onFreeze={() => {
                     setFreezeTarget(o);
@@ -478,6 +639,52 @@ export default function AdminOrgsPage() {
       </Dialog>
 
       <Dialog
+        open={bulkFreezeOpen}
+        onOpenChange={(o) => {
+          if (!o) {
+            setBulkFreezeOpen(false);
+            setBulkFreezeReason("");
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Snowflake className="h-5 w-5 text-blue-500" />
+              Freeze {selected.size} organization{selected.size === 1 ? "" : "s"}?
+            </DialogTitle>
+            <DialogDescription>
+              Every selected workspace will reject writes until you unfreeze.
+              Already-frozen and deleted orgs are silently skipped. Your own
+              org is excluded automatically as a safety rail.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-1.5">
+            <Label htmlFor="bulk-freeze-reason">Reason (audit log)</Label>
+            <Input
+              id="bulk-freeze-reason"
+              autoFocus
+              value={bulkFreezeReason}
+              onChange={(e) => setBulkFreezeReason(e.target.value)}
+              placeholder="Compliance review / mass non-payment / incident #4567"
+            />
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setBulkFreezeOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              onClick={bulkFreezeSubmit}
+              disabled={!bulkFreezeReason.trim()}
+            >
+              <Snowflake className="h-4 w-4" />
+              Freeze {selected.size}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
         open={!!quotasTarget}
         onOpenChange={(o) => !o && setQuotasTarget(null)}
       >
@@ -526,6 +733,8 @@ export default function AdminOrgsPage() {
 
 function OrgRowItem({
   o,
+  selected,
+  onToggle,
   onOpen,
   onFreeze,
   onUnfreeze,
@@ -534,6 +743,8 @@ function OrgRowItem({
   onQuotas,
 }: {
   o: OrgRow;
+  selected: boolean;
+  onToggle: () => void;
   onOpen: () => void;
   onFreeze: () => void;
   onUnfreeze: () => void;
@@ -543,8 +754,24 @@ function OrgRowItem({
 }) {
   const frozen = !!o.frozenAt;
   const deleted = !!o.deletedAt;
+  // Bulk operations don't make sense on already-frozen or deleted orgs,
+  // so the checkbox is hidden in those states. The backend ignores
+  // them anyway, but hiding here also prevents the operator from
+  // misreading the "N selected" counter.
+  const selectable = !frozen && !deleted;
   return (
     <li className="flex flex-wrap items-center gap-3 py-3">
+      {selectable ? (
+        <input
+          type="checkbox"
+          aria-label={`Select ${o.name}`}
+          checked={selected}
+          onChange={onToggle}
+          className="h-4 w-4 cursor-pointer accent-primary"
+        />
+      ) : (
+        <span className="inline-block h-4 w-4" aria-hidden />
+      )}
       <button type="button" onClick={onOpen} className="min-w-0 flex-1 text-left">
         <div className="flex flex-wrap items-center gap-2 text-sm">
           <span className="font-medium">{o.name}</span>
@@ -613,7 +840,7 @@ function OrgRowItem({
 
 function OrgDetailPanel({ detail }: { detail: OrgDetail }) {
   const [tab, setTab] = useState<
-    "overview" | "members" | "billing" | "audit"
+    "overview" | "analytics" | "members" | "billing" | "audit"
   >("overview");
   return (
     <>
@@ -628,7 +855,7 @@ function OrgDetailPanel({ detail }: { detail: OrgDetail }) {
       </DialogHeader>
 
       <div className="mt-4 flex gap-1 border-b">
-        {(["overview", "members", "billing", "audit"] as const).map((t) => (
+        {(["overview", "analytics", "members", "billing", "audit"] as const).map((t) => (
           <button
             key={t}
             type="button"
@@ -691,6 +918,8 @@ function OrgDetailPanel({ detail }: { detail: OrgDetail }) {
             )}
           </>
         )}
+
+        {tab === "analytics" && <OrgAnalyticsTab orgId={detail.id} />}
 
         {tab === "members" &&
           (detail.members.length === 0 ? (
@@ -795,6 +1024,195 @@ type AdminPlan = {
   interval: string;
   amountCents?: number | null;
 };
+
+// Per-org analytics drilldown shown inside the detail drawer.
+//
+// Talks to GET /v1/admin/orgs/{id}/analytics?window=30d. The window is
+// fixed at 30 days here on purpose — the standalone page is the place
+// for power users who want to slice longer ranges, while the drawer
+// optimizes for "what does this one org look like right now".
+type OrgIdAnalytics = {
+  window: string;
+  bucket: string;
+  memberGrowth: TimePoint[];
+  storageGrowth: TimePoint[];
+  activity: TimePoint[];
+  roleDistribution: LabelValue[];
+  topContributors: Array<{ actor: string; value: number }>;
+  topFiles: Array<{ id: string; name: string; size: number }>;
+  failedLogins30d: number;
+};
+
+function OrgAnalyticsTab({ orgId }: { orgId: string }) {
+  const toast = useToast();
+  const [data, setData] = useState<OrgIdAnalytics | null>(null);
+  // Inside a modal the chart real-estate is tight; the full-page
+  // dashboard at /admin/orgs/{id}/analytics is the better
+  // surface for power users. Surface it as a CTA.
+
+  useEffect(() => {
+    let cancelled = false;
+    api<OrgIdAnalytics>(`/v1/admin/orgs/${orgId}/analytics?window=30d`)
+      .then((r) => {
+        if (!cancelled) setData(r);
+      })
+      .catch((e) => {
+        if (!cancelled) {
+          toast.show("error", "Couldn't load analytics", {
+            description: e?.message,
+          });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [orgId]);
+
+  if (!data) {
+    return (
+      <div className="space-y-2">
+        <Skeleton className="h-24 w-full" />
+        <Skeleton className="h-24 w-full" />
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-end">
+        <Button asChild size="sm" variant="outline">
+          <Link href={`/admin/orgs/${orgId}/analytics`}>
+            <BarChart3 className="h-3.5 w-3.5" />
+            Open full dashboard
+          </Link>
+        </Button>
+      </div>
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+        <KpiTile
+          label="Members joined (30d)"
+          value={formatCount(
+            data.memberGrowth.reduce((a, p) => a + p.value, 0)
+          )}
+          sublabel="net new accounts"
+        />
+        <KpiTile
+          label="Activity (30d)"
+          value={formatCount(
+            data.activity.reduce((a, p) => a + p.value, 0)
+          )}
+          sublabel="audit events"
+        />
+        <KpiTile
+          label="Failed logins (30d)"
+          value={formatCount(data.failedLogins30d)}
+          sublabel="security signal"
+        />
+      </div>
+
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-xs">Member growth</CardTitle>
+          <CardDescription className="text-[11px]">
+            New users per day, last 30 days.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <LineChart
+            height={140}
+            series={[
+              { name: "Members", color: "#22c55e", data: data.memberGrowth },
+            ]}
+          />
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-xs">Storage growth</CardTitle>
+          <CardDescription className="text-[11px]">
+            Bytes uploaded per day. Use this to spot a runaway uploader.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <LineChart
+            height={140}
+            series={[
+              { name: "Bytes", color: "#a855f7", data: data.storageGrowth },
+            ]}
+            formatY={fmtBytes}
+          />
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-xs">Activity volume</CardTitle>
+          <CardDescription className="text-[11px]">
+            Audit-log events per day — proxy for how busy the workspace is.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <LineChart
+            height={140}
+            series={[
+              { name: "Events", color: "#3b82f6", data: data.activity },
+            ]}
+          />
+        </CardContent>
+      </Card>
+
+      <div className="grid gap-4 sm:grid-cols-2">
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-xs">Roles</CardTitle>
+          </CardHeader>
+          <CardContent className="grid place-items-center">
+            <Donut size={140} data={data.roleDistribution} />
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-xs">Top contributors (30d)</CardTitle>
+            <CardDescription className="text-[11px]">
+              Most audit events written by an actor.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <TopList
+              items={data.topContributors.map((c) => ({
+                label: c.actor,
+                value: c.value,
+              }))}
+              emptyLabel="No activity yet."
+            />
+          </CardContent>
+        </Card>
+      </div>
+
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-xs">Largest files</CardTitle>
+          <CardDescription className="text-[11px]">
+            Top 10 files by size — quick way to chase down a quota offender.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <TopList
+            items={data.topFiles.map((f) => ({
+              label: f.name || `(unnamed · ${f.id.slice(0, 8)})`,
+              value: f.size,
+            }))}
+            formatV={fmtBytes}
+            emptyLabel="No files."
+          />
+        </CardContent>
+      </Card>
+
+    </div>
+  );
+}
 
 function OrgBillingTab({ orgId }: { orgId: string }) {
   const toast = useToast();

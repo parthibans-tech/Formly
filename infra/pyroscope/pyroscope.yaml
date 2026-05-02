@@ -1,0 +1,120 @@
+# Pyroscope (Grafana Profiles) — continuous profiling backend.
+#
+# Pull-based mode: Pyroscope's own scraper hits /debug/pprof/* on
+# the API and worker processes (just like Prometheus scrapes
+# /metrics) and stores the resulting flame graphs by profile type
+# (cpu, heap, goroutine, mutex, block). No agent code in the Go
+# binaries — just the standard `net/http/pprof` handlers behind
+# the same access guard the metrics endpoint uses.
+#
+# Why pull-based here:
+#   - zero new Go deps; the runtime already exports pprof when the
+#     handlers are mounted.
+#   - one config file controls cadence + targets; restarting the
+#     scraper doesn't restart the apps.
+#   - resilient to app restarts; each scrape is independent.
+#
+# Why this is shipped alongside metrics + traces:
+#   - metrics tell you WHAT got slow (p99 spike on /v1/files)
+#   - traces tell you WHICH request was slow (one specific span)
+#   - profiles tell you WHY (the function holding the CPU)
+# All three pivot on `service.name` so a slow trace in Tempo
+# resolves cleanly to the matching CPU flame graph.
+#
+# Storage: on-disk, 14d retention. Same window as Tempo so a
+# trace and its profile fall out of the system together (avoids
+# the awkward "I have a trace but the profile aged out" bug).
+
+target: all
+
+server:
+  http_listen_port: 4040
+  log_level: info
+
+# Single-binary topology — all components in one process. Splits
+# into the microservices shape (distributor / ingester / querier)
+# later when volume warrants it. For dev + small prod, single is
+# fine and matches how we run Loki.
+analytics:
+  # Don't phone home with usage stats. Same posture as the rest
+  # of our self-hosted Grafana stack.
+  reporting_enabled: false
+
+storage:
+  backend: filesystem
+  filesystem:
+    dir: /var/pyroscope/data
+
+limits:
+  # Match the Tempo retention so the metrics ↔ traces ↔ profiles
+  # window stays consistent. 14d on a single dev disk is ~5–15 GiB
+  # depending on traffic — fine for one machine.
+  max_query_length: 24h
+  # Reject series with too many labels — the same cardinality
+  # discipline the Prometheus side enforces. service_name +
+  # __profile_type__ + a couple of go runtime tags is plenty.
+  max_label_names_per_series: 20
+
+# Pull-based scrape config. Pyroscope's `scrape_configs` block
+# is intentionally Prometheus-shaped so the same operator
+# vocabulary applies.
+scrape_configs:
+  - job_name: formly-api
+    # 15s is the default; profiles are heavier than metrics so
+    # don't drop below 10s without checking the impact on the
+    # scraped process. The CPU profile in particular runs the
+    # Go runtime profiler for the full window.
+    scrape_interval: 15s
+    scrape_timeout: 14s
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
+        labels:
+          service_name: formly-api
+          process: api
+    profiling_config:
+      pprof_config:
+        # Each entry maps a profile-type label to the pprof
+        # endpoint that yields it. Defaults are sensible — we
+        # explicitly list them so a future upstream change to
+        # the default list doesn't silently drop a profile we
+        # rely on (e.g. allocations).
+        memory:
+          enabled: true
+          path: /debug/pprof/allocs
+        block:
+          enabled: false
+          path: /debug/pprof/block
+        mutex:
+          enabled: false
+          path: /debug/pprof/mutex
+        goroutine:
+          enabled: true
+          path: /debug/pprof/goroutine
+        process_cpu:
+          enabled: true
+          # CPU profile runs for `seconds` of the scrape window.
+          # 10s gives a useful sample without consuming the full
+          # scrape budget; if you bump this, bump scrape_timeout.
+          path: /debug/pprof/profile?seconds=10
+
+  - job_name: formly-worker
+    scrape_interval: 15s
+    scrape_timeout: 14s
+    static_configs:
+      # The worker process binds :9090 on the host for its own
+      # /metrics + /debug/pprof endpoints (the API uses :8080).
+      - targets: ["host.docker.internal:9090"]
+        labels:
+          service_name: formly-worker
+          process: worker
+    profiling_config:
+      pprof_config:
+        memory:
+          enabled: true
+          path: /debug/pprof/allocs
+        goroutine:
+          enabled: true
+          path: /debug/pprof/goroutine
+        process_cpu:
+          enabled: true
+          path: /debug/pprof/profile?seconds=10

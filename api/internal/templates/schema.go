@@ -87,6 +87,12 @@ type outputDoc struct {
 	// flag "you'll need to send `customerName` in `data` for this
 	// template's path to resolve".
 	Placeholders []string `json:"placeholders,omitempty"`
+	// FlattenDefault echoes the template's output.flattenDefault so the
+	// API guide can tell integrators "if you omit `flatten` from the
+	// request body, this template will/won't flatten the AcroForm
+	// before returning". Pointer so omitted (nil) and explicit false
+	// are distinguishable in the doc payload too.
+	FlattenDefault *bool `json:"flattenDefault,omitempty"`
 }
 
 // securityDoc surfaces the *shape* of security policy without leaking
@@ -139,9 +145,10 @@ func (h *Handler) Schema(w http.ResponseWriter, r *http.Request) {
 		Placeholders []string                               `json:"placeholders"`
 		Validations  map[string]*acroform.ValidationRule    `json:"validations"`
 		Required     []string                               `json:"required"`
-		Output       *struct {
+		Output *struct {
 			FolderPath       string `json:"folderPath"`
 			FilenameTemplate string `json:"filenameTemplate"`
+			FlattenDefault   *bool  `json:"flattenDefault,omitempty"`
 		} `json:"output"`
 		Security *struct {
 			OwnerPassword string                 `json:"ownerPassword"`
@@ -176,13 +183,19 @@ func (h *Handler) Schema(w http.ResponseWriter, r *http.Request) {
 	// the API guide can flag "you'll need these keys for the path to
 	// resolve cleanly".
 	var outDoc *outputDoc
-	if cfg.Output != nil && (cfg.Output.FolderPath != "" || cfg.Output.FilenameTemplate != "") {
+	if cfg.Output != nil && (cfg.Output.FolderPath != "" || cfg.Output.FilenameTemplate != "" || cfg.Output.FlattenDefault != nil) {
 		outDoc = &outputDoc{
 			FolderPath:       cfg.Output.FolderPath,
 			FilenameTemplate: cfg.Output.FilenameTemplate,
 			Placeholders:     extractPlaceholders(cfg.Output.FolderPath, cfg.Output.FilenameTemplate),
+			FlattenDefault:   cfg.Output.FlattenDefault,
 		}
-		notes = append(notes, "Output filename/folder support `{{key}}` placeholders resolved against your `data` payload — missing keys collapse to empty strings, so guard against that with sensible templates.")
+		if cfg.Output.FolderPath != "" || cfg.Output.FilenameTemplate != "" {
+			notes = append(notes, "Output filename/folder support `{{key}}` placeholders resolved against your `data` payload — missing keys collapse to empty strings, so guard against that with sensible templates.")
+		}
+		if cfg.Output.FlattenDefault != nil && *cfg.Output.FlattenDefault {
+			notes = append(notes, "This template flattens AcroForm fields by default — pass `\"flatten\": false` in the request body to override per call.")
+		}
 	}
 
 	// Security policy summary. We never echo passwords; the caller

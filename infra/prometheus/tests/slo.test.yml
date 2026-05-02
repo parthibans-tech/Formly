@@ -42,6 +42,7 @@ tests:
                 availability. 1h ratio + 5m ratio both above threshold
                 for at least 2 minutes — the customer cohort sharing
                 this tier is seeing a real outage right now.
+              runbook_url: "https://github.com/formly/formly/blob/main/infra/runbooks/slo-fast-burn.md"
 
   - interval: 1m
     name: FormlyTenantSLOFastBurn — does NOT page at 5% (below threshold)

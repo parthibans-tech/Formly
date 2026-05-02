@@ -73,7 +73,12 @@ type Template = {
   mode: string;
   name: string;
   version: number;
-  config: { mappings?: Record<string, Mapping>; placeholders?: string[]; pageLayout?: any };
+  config: {
+    mappings?: Record<string, Mapping>;
+    placeholders?: string[];
+    pageLayout?: any;
+    output?: { folderPath?: string; filenameTemplate?: string; flattenDefault?: boolean };
+  };
   fields: Field[];
   widgets: Widget[];
   // Server-computed edit permission. When false the UI drops into
@@ -145,6 +150,12 @@ export default function DesignerPage() {
       skeleton[key] = "";
     }
     setGenJSON(JSON.stringify(skeleton, null, 2));
+    // Seed the Flatten checkbox from the template's output.flattenDefault
+    // so the dialog shows what the API will actually do if the user just
+    // clicks Generate. The user can still toggle it before submitting —
+    // their explicit choice rides along in the request body and wins
+    // over the template default on the server side.
+    setGenFlatten(Boolean(tpl.config?.output?.flattenDefault));
     setGenErr(null);
     setGenOpen(true);
   }
@@ -622,15 +633,26 @@ export default function DesignerPage() {
               onChange={(e) => setGenJSON(e.target.value)}
             />
             <div className="flex flex-col gap-2 text-sm">
-              <label className="flex cursor-pointer items-center gap-2">
-                <input
-                  type="checkbox"
-                  className="h-4 w-4 accent-primary"
-                  checked={genFlatten}
-                  onChange={(e) => setGenFlatten(e.target.checked)}
-                />
-                Flatten (non-editable output)
-              </label>
+              <div className="flex flex-col gap-1">
+                <label className="flex cursor-pointer items-center gap-2">
+                  <input
+                    type="checkbox"
+                    className="h-4 w-4 accent-primary"
+                    checked={genFlatten}
+                    onChange={(e) => setGenFlatten(e.target.checked)}
+                  />
+                  Flatten (non-editable output)
+                </label>
+                {tpl?.config?.output?.flattenDefault !== undefined && (
+                  <p className="ml-6 text-xs text-muted-foreground">
+                    Template default:{" "}
+                    <span className="font-medium">
+                      {tpl.config.output.flattenDefault ? "flatten" : "don't flatten"}
+                    </span>{" "}
+                    — change in <Link href={`/templates/${tpl.id}/settings`} className="underline">settings</Link>.
+                  </p>
+                )}
+              </div>
               <label className="flex cursor-pointer items-center gap-2">
                 <input
                   type="checkbox"

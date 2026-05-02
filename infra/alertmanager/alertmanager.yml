@@ -151,12 +151,18 @@ receivers:
         client: "Formly Alertmanager"
         client_url: '{{ template "formly.externalURL" . }}'
 
-  # Ticket queue. Slack incoming webhook.
+  # Ticket queue. Slack incoming webhook + (optional) email.
   #
   # Production setup: replace https://hooks.slack.com/... with the
   # webhook URL for the channel you actually want noise in. Same
   # secret-management rule as PagerDuty applies — prefer
   # `api_url_file:` over inlining the URL.
+  #
+  # The Slack template body has three deep-links per alert:
+  # runbook (from the alert annotation), Grafana dashboard (mapped
+  # by alertname family in formly.dashboardURL), and a pre-filled
+  # Alertmanager silence URL. Together that's the on-call's full
+  # action menu in one message.
   - name: "tickets"
     slack_configs:
       - api_url: "https://hooks.slack.com/services/REPLACE/WITH/REAL"
@@ -165,6 +171,17 @@ receivers:
         title: '{{ template "formly.slack.title" . }}'
         text: '{{ template "formly.slack.text" . }}'
         color: '{{ template "formly.slack.color" . }}'
+    # Email is opt-in: if you want page+ticket alerts to also land
+    # in an inbox, uncomment and fill the SMTP config below. The
+    # global `smtp_*` block (not shown — see Alertmanager docs) is
+    # required for `email_configs` to work; in dev we leave it off
+    # so a fresh checkout doesn't try to dial out to nothing.
+    # email_configs:
+    #   - to: "ops@example.com"
+    #     send_resolved: true
+    #     headers:
+    #       Subject: '{{ template "formly.email.subject" . }}'
+    #     html: '{{ template "formly.email.html" . }}'
 
   # Dev firehose — opt-in receiver you can switch the root route
   # to during local testing. Same shape as `tickets` but reads the

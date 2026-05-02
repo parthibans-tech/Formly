@@ -68,15 +68,41 @@ storage:
 # Limits — keep the default tenant in dev. In prod you'd want
 # per-org_id ingest rate limits; we don't multitenant-tag spans
 # yet so the global tenant stays single-tenant.
+#
+# `service-graphs` derives a service-to-service graph from spans
+# (every parent->child crossing a service boundary becomes an
+# edge). Cheap and high-value: the Grafana Tempo node-graph view
+# uses these series to draw the architecture diagram live.
+#
+# `span-metrics` would re-emit RED metrics from spans. We skip
+# it because the API middleware already records HTTP RED with
+# better label hygiene (chi RoutePattern, not raw URI). Turning
+# both on causes double-counting on every dashboard panel.
 overrides:
   defaults:
     metrics_generator:
-      processors: []
+      processors: [service-graphs]
 
-# Metrics — Tempo can re-emit RED metrics from spans, but our
-# Prometheus already has direct RED metrics from the API
-# middleware. Disabling here avoids double-counting and the
-# accompanying scrape pressure.
+# Metrics-generator — runs alongside the ingester and pushes
+# generated time series via remote_write to Prometheus. Prometheus
+# has to be configured for `--enable-feature=remote-write-receiver`
+# (set on the prometheus service in docker-compose.yml) to accept
+# the inbound writes; without that flag the generator logs 404s
+# and the service-graph stays empty.
 metrics_generator:
   storage:
     path: /var/tempo/generator/wal
+    remote_write:
+      - url: http://prometheus:9090/api/v1/write
+        send_exemplars: true
+  registry:
+    external_labels:
+      source: tempo
+      cluster: dev
+  # Service-graph processor specifics. Keep histogram buckets
+  # tight (50ms..2s) — a service hop slower than 2s is interesting
+  # but not a sub-bucket-precision question.
+  processor:
+    service_graphs:
+      histogram_buckets: [0.05, 0.1, 0.25, 0.5, 1, 2]
+      dimensions: ["http.route", "http.method"]

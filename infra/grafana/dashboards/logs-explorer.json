@@ -1,0 +1,73 @@
+{
+  "annotations": {"list": []},
+  "description": "Loki log volume + level mix + recent error stream. Click trace_id on any line to jump to Tempo.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Log volume by service (1m)",
+      "id": 1,
+      "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+      "datasource": {"type": "loki", "uid": "loki"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service) (rate({project=\"infra\"}[1m]))",
+          "legendFormat": "{{service}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "logs/s", "custom": {"drawStyle": "bars", "fillOpacity": 50, "stacking": {"mode": "normal"}}}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Log volume by level",
+      "id": 2,
+      "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+      "datasource": {"type": "loki", "uid": "loki"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (level) (rate({project=\"infra\"}[1m]))",
+          "legendFormat": "{{level}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "logs/s", "custom": {"drawStyle": "bars", "fillOpacity": 50, "stacking": {"mode": "normal"}}}}
+    },
+    {
+      "type": "logs",
+      "title": "Error + warn lines (live)",
+      "id": 3,
+      "gridPos": {"x": 0, "y": 8, "w": 24, "h": 14},
+      "datasource": {"type": "loki", "uid": "loki"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{project=\"infra\", level=~\"error|warn|fatal\"}"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": true,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      }
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["formly", "logs"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Formly · Logs explorer",
+  "uid": "formly-logs-explorer",
+  "version": 1,
+  "weekStart": ""
+}
