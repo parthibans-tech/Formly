@@ -2,29 +2,80 @@
 @tailwind components;
 @tailwind utilities;
 
+/*
+ * Design system — emerald palette on layered structural primitives.
+ *
+ * Colour palette stays close to the product's original brand voice:
+ * pure-white canvas, near-black slate text, emerald primary. The
+ * structural tokens below — elevation, motion, border weights, radius
+ * scale, typography helpers — encode the "premium tooling" decisions
+ * that the redesign earned.
+ *
+ * Three principles drive the tokens below:
+ *
+ *   1. Surface layering. Three layers max — canvas, surface-1,
+ *      surface-2. Depth is conveyed by light + elevation, not by
+ *      stacking colours.
+ *
+ *   2. Borders before shadows. Resting elements use a hairline border;
+ *      shadows are reserved for genuine elevation (popover, dialog,
+ *      toast). When a shadow IS used, it's a stack of 2-3 layers at
+ *      different blur radii — that's what makes premium UI shadows
+ *      feel like real photographic light.
+ *
+ *   3. 8px grid + 4px sub-grid. Every spacing, every line-height, every
+ *      icon offset lands on the grid. Pixel discipline is most of the
+ *      "premium" feeling — not the colour palette.
+ *
+ * Token values are HSL channels (h s% l%) so consumers can compose
+ * alpha via `hsl(var(--primary) / 0.5)`. Don't switch to hex without
+ * updating the tailwind config and shadcn primitives.
+ */
+
 @layer base {
   :root {
+    /* SURFACES ─────────────────────────────────────────────────────
+       Pure-white canvas with a near-black slate text colour. Pure white
+       is the right call for this product because the working surfaces
+       (designer canvas, document previews, table grids) need to mimic
+       paper — adding a cool wash to the page tints those surfaces too. */
     --background: 0 0% 100%;
     --foreground: 222 47% 11%;
 
-    --card: 0 0% 100%;
+    --card: 0 0% 100%;                /* surface-1 (cards, panels) */
     --card-foreground: 222 47% 11%;
 
-    --popover: 0 0% 100%;
+    --popover: 0 0% 100%;             /* surface-2 (popovers, dialogs) */
     --popover-foreground: 222 47% 11%;
 
+    /* INTENT ───────────────────────────────────────────────────────
+       Primary is emerald — the brand's call-to-action colour. Deep
+       enough to read as "considered," saturated enough to carry
+       weight as a button fill against the white canvas. */
     --primary: 160 84% 36%;
     --primary-foreground: 150 100% 98%;
 
+    /* Secondary surfaces (button bg, chips, hover targets). Sits
+       between canvas and surface-1 in lightness so it reads as a
+       quiet container, not a button-with-fill. */
     --secondary: 210 20% 97%;
     --secondary-foreground: 222 47% 11%;
 
+    /* Muted = secondary, but used semantically for subtle backgrounds
+       (skeletons, code blocks, empty-state panels). Same value, different
+       intent — split lets us shift them independently later. */
     --muted: 210 20% 97%;
     --muted-foreground: 215 16% 47%;
 
+    /* Accent = the hover/active surface for ghost buttons, list rows,
+       command-palette items. One step darker than muted. */
     --accent: 210 20% 96%;
     --accent-foreground: 222 47% 11%;
 
+    /* STATUS ───────────────────────────────────────────────────────
+       Standard saturated status palette. Red/green/amber lean fully
+       into their hue families — when something fails or succeeds it
+       should be unmistakable at a glance. */
     --destructive: 0 72% 51%;
     --destructive-foreground: 0 0% 100%;
 
@@ -34,20 +85,70 @@
     --warning: 32 95% 44%;
     --warning-foreground: 30 100% 12%;
 
+    --info: 210 75% 48%;              /* ink blue, distinct from primary */
+    --info-foreground: 0 0% 100%;
+
+    /* STRUCTURE ────────────────────────────────────────────────────
+       Two border weights. Hairline does the everyday work; "strong"
+       is reserved for definitive separators (table header underline,
+       sidebar:content split, footer rule). Most code only needs --border. */
     --border: 214 32% 91%;
+    --border-strong: 214 25% 80%;
     --input: 214 32% 91%;
-    --ring: 160 84% 36%;
+    --ring: 160 84% 36%;              /* matches primary */
 
-    --radius: 0.5rem;
+    /* RADIUS ──────────────────────────────────────────────────────
+       The base unit drives everything else. 8px is the workhorse
+       (buttons, inputs, badges); 10px goes on cards; 12px on modals.
+       Tight enough to feel engineered, generous enough to feel
+       intentional. */
+    --radius: 0.5rem;                 /* 8px */
+    --radius-lg: 0.625rem;            /* 10px — cards */
+    --radius-xl: 0.75rem;             /* 12px — modals */
 
-    --shadow-subtle: 0 1px 2px 0 rgb(15 23 42 / 0.04);
-    --shadow-card: 0 1px 3px 0 rgb(15 23 42 / 0.06),
-      0 1px 2px -1px rgb(15 23 42 / 0.04);
-    --shadow-elevated: 0 10px 38px -10px rgb(15 23 42 / 0.12),
-      0 10px 20px -15px rgb(15 23 42 / 0.08);
+    /* ELEVATION ───────────────────────────────────────────────────
+       Five levels. e0 is "no elevation" (canvas); e1-e2 add a hairline
+       border + subtle shadow; e3+ go shadow-only because they sit
+       above the page plane and a border would compete with the lift.
+       Every shadow is a STACK — two or three layers at different blur
+       radii. That stacking is what gives premium UI its photographic
+       feel; a single drop-shadow always reads as Photoshop. */
+    --shadow-e1: 0 1px 0 0 hsl(220 30% 15% / 0.04);
+    --shadow-e2: 0 1px 2px 0 hsl(220 30% 15% / 0.04),
+                 0 1px 3px -1px hsl(220 30% 15% / 0.06);
+    --shadow-e3: 0 4px 8px -2px hsl(220 30% 15% / 0.06),
+                 0 2px 4px -2px hsl(220 30% 15% / 0.05),
+                 0 0 0 1px hsl(220 30% 15% / 0.04);
+    --shadow-e4: 0 16px 32px -8px hsl(220 30% 15% / 0.10),
+                 0 8px 16px -8px hsl(220 30% 15% / 0.08),
+                 0 4px 8px -4px hsl(220 30% 15% / 0.04);
+    --shadow-e5: 0 8px 24px -4px hsl(220 30% 15% / 0.16),
+                 0 4px 8px -2px hsl(220 30% 15% / 0.08),
+                 0 0 0 1px hsl(220 30% 15% / 0.04);
+
+    /* MOTION ──────────────────────────────────────────────────────
+       Four duration tokens, one default easing. Premium tools use
+       fewer, more intentional curves than the default css-keyword
+       easings. The default here is close to Apple's HIG: a strong
+       deceleration that makes elements "settle" rather than "stop." */
+    --duration-instant: 100ms;        /* press feedback, focus ring */
+    --duration-fast: 150ms;           /* hover, color */
+    --duration-base: 200ms;           /* state changes, accordion */
+    --duration-slow: 300ms;           /* overlay enter/exit */
+
+    --ease-out: cubic-bezier(0.32, 0.72, 0, 1);     /* HIG-flavoured deceleration */
+    --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);  /* symmetric for transitions */
+    --ease-spring: cubic-bezier(0.34, 1.4, 0.64, 1); /* mild overshoot for press feedback */
   }
 
   .dark {
+    /* DARK MODE ────────────────────────────────────────────────────
+       Deep slate, never pure black. Pure black on a tool reads as OLED
+       theatre and crushes the elevation ladder (you can't show a
+       layered surface above an absolute-black canvas). The 6% / 8% /
+       7% lightness ladder gives us readable layers in dark mode while
+       holding the original cool-slate hue family.
+    */
     --background: 224 40% 6%;
     --foreground: 210 20% 96%;
 
@@ -57,6 +158,8 @@
     --popover: 224 40% 7%;
     --popover-foreground: 210 20% 96%;
 
+    /* Primary brightens for dark-mode contrast. Same hue, lighter
+       lightness — keeps the brand voice consistent across themes. */
     --primary: 160 84% 45%;
     --primary-foreground: 160 100% 8%;
 
@@ -78,14 +181,29 @@
     --warning: 38 92% 55%;
     --warning-foreground: 30 100% 12%;
 
+    --info: 210 75% 60%;
+    --info-foreground: 224 40% 6%;
+
     --border: 222 30% 18%;
+    --border-strong: 222 25% 26%;
     --input: 222 30% 18%;
     --ring: 160 84% 45%;
 
-    --shadow-subtle: 0 1px 2px 0 rgb(0 0 0 / 0.3);
-    --shadow-card: 0 1px 3px 0 rgb(0 0 0 / 0.4), 0 1px 2px -1px rgb(0 0 0 / 0.3);
-    --shadow-elevated: 0 10px 38px -10px rgb(0 0 0 / 0.6),
-      0 10px 20px -15px rgb(0 0 0 / 0.4);
+    /* Dark-mode shadows lean on opacity rather than colour. We're
+       casting onto a black canvas, so a tinted shadow vanishes; raw
+       black at higher opacity is what reads as elevation. */
+    --shadow-e1: 0 1px 0 0 rgb(0 0 0 / 0.30);
+    --shadow-e2: 0 1px 2px 0 rgb(0 0 0 / 0.40),
+                 0 1px 3px -1px rgb(0 0 0 / 0.30);
+    --shadow-e3: 0 4px 8px -2px rgb(0 0 0 / 0.50),
+                 0 2px 4px -2px rgb(0 0 0 / 0.40),
+                 0 0 0 1px rgb(255 255 255 / 0.06);
+    --shadow-e4: 0 16px 32px -8px rgb(0 0 0 / 0.60),
+                 0 8px 16px -8px rgb(0 0 0 / 0.50),
+                 0 4px 8px -4px rgb(0 0 0 / 0.30);
+    --shadow-e5: 0 8px 24px -4px rgb(0 0 0 / 0.70),
+                 0 4px 8px -2px rgb(0 0 0 / 0.50),
+                 0 0 0 1px rgb(255 255 255 / 0.06);
   }
 }
 
@@ -96,10 +214,63 @@
   html,
   body {
     @apply bg-background text-foreground antialiased;
-    font-feature-settings: "cv11", "ss01";
+    /* Inter OpenType features:
+       cv11 = single-storey 'a' (more legible at UI sizes)
+       ss01 = stylistic alternates (clean punctuation)
+       ss03 = curved 'l' (avoids the ambiguous straight-l) */
+    font-feature-settings: "cv11", "ss01", "ss03";
+    /* Disable ligatures in UI text — "fi", "fl" ligatures look
+       beautiful in body copy but cause subpixel weight inconsistency
+       in dense table rows where the same word appears repeatedly. */
+    font-variant-ligatures: none;
+  }
+  /* Headings — monochrome hierarchy via weight + scale. No serif
+     face-swap. The premium feeling comes from the deliberate scale
+     ladder defined in the .text-h{n} utilities below, not from
+     decoration.
+
+     Tracking tightens at the larger sizes — a long display heading at
+     48px with default tracking reads loose; -0.02em pulls it together
+     without losing clarity. */
+  h1, .text-h1 {
+    @apply text-[2rem] font-semibold leading-10 tracking-tight;
+  }
+  h2, .text-h2 {
+    @apply text-2xl font-semibold leading-8 tracking-tight;
+  }
+  h3, .text-h3 {
+    @apply text-xl font-semibold leading-7 tracking-tight;
+  }
+  h4, .text-h4 {
+    @apply text-base font-semibold leading-6;
+  }
+  /* Display = the rare hero/marketing headline. Goes bigger than h1
+     and pulls in tracking aggressively — that's the move that reads
+     "this is the moment." */
+  .text-display {
+    @apply text-5xl font-semibold leading-[3.5rem];
+    letter-spacing: -0.025em;
+  }
+  /* Body / labels / caption — the workhorses. */
+  .text-body {
+    @apply text-sm leading-[1.4rem];   /* 14 / 22.4 */
+  }
+  .text-body-lg {
+    @apply text-base leading-6;        /* 16 / 24 */
+  }
+  .text-label {
+    @apply text-xs font-medium leading-4 tracking-wide uppercase text-muted-foreground;
+  }
+  .text-caption {
+    @apply text-xs leading-4 text-muted-foreground;
   }
   :focus-visible {
     @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
+    transition: box-shadow var(--duration-instant) var(--ease-out);
+  }
+  ::selection {
+    background: hsl(var(--primary) / 0.18);
+    color: hsl(var(--foreground));
   }
 }
 
@@ -112,28 +283,49 @@
     height: 8px;
   }
   .scrollbar-thin::-webkit-scrollbar-thumb {
-    background: hsl(var(--border));
+    background: hsl(var(--border-strong));
     border-radius: 4px;
   }
-
-  .shadow-subtle {
-    box-shadow: var(--shadow-subtle);
-  }
-  .shadow-card {
-    box-shadow: var(--shadow-card);
-  }
-  .shadow-elevated {
-    box-shadow: var(--shadow-elevated);
+  .scrollbar-thin::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground) / 0.4);
   }
 
-  /* Kbd-style keyboard hint */
+  /* Elevation utilities — every shadow in the app should resolve to
+     one of these five tokens. Hand-rolling shadows in component code
+     is what makes a design system drift. */
+  .elevation-1 { box-shadow: var(--shadow-e1); }
+  .elevation-2 { box-shadow: var(--shadow-e2); }
+  .elevation-3 { box-shadow: var(--shadow-e3); }
+  .elevation-4 { box-shadow: var(--shadow-e4); }
+  .elevation-5 { box-shadow: var(--shadow-e5); }
+
+  /* Compatibility aliases — existing code uses .shadow-{subtle,card,
+     elevated}. Keep them mapped to the new tokens so nothing breaks. */
+  .shadow-subtle { box-shadow: var(--shadow-e1); }
+  .shadow-card { box-shadow: var(--shadow-e2); }
+  .shadow-elevated { box-shadow: var(--shadow-e4); }
+
+  /* Glass — backdrop blur for the three places it earns its complexity.
+     Applied via these utilities only, never inline, so any future
+     decision to drop browser blur (perf) is one CSS change. */
+  .glass {
+    background: hsl(var(--background) / 0.72);
+    backdrop-filter: blur(12px) saturate(180%);
+    -webkit-backdrop-filter: blur(12px) saturate(180%);
+  }
+  .glass-strong {
+    background: hsl(var(--background) / 0.85);
+    backdrop-filter: blur(20px) saturate(180%);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+  }
+
+  /* Kbd hint — flush-fit keyboard chip used in tooltips and command
+     palettes. No shadow (it's a passive label, not an action). */
   .kbd {
-    @apply inline-flex h-5 min-w-5 items-center justify-center rounded border border-border bg-muted px-1 font-mono text-[10px] font-medium text-muted-foreground shadow-subtle;
+    @apply inline-flex h-5 min-w-5 items-center justify-center rounded border border-border bg-muted px-1.5 font-mono text-[10px] font-medium text-muted-foreground;
   }
 
-  /* Marketing-page floating gradient blobs (used by AnimatedMesh).
-     Kept in CSS rather than tailwind.config so the @media reduced-motion
-     guard sits with them. */
+  /* Marketing hero blobs — kept as-is. Reduced-motion guard preserved. */
   @keyframes blob-1 {
     0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
     33%      { transform: translate3d(40px, -30px, 0) scale(1.08); }
@@ -156,16 +348,18 @@
     .animate-blob-1, .animate-blob-2, .animate-blob-3 { animation: none; }
   }
 
-  /* Subtle surface gradient used for hero/stat cards */
+  /* Subtle radial wash for hero / stat surfaces. Restrained — no more
+     than 6% opacity of the primary, applied off-axis so it reads as
+     environment lighting rather than a "premium gradient" clichรฉ. */
   .surface-gradient {
     background-image: radial-gradient(
         circle at 0% 0%,
-        hsl(var(--primary) / 0.06),
+        hsl(var(--primary) / 0.05),
         transparent 50%
       ),
       radial-gradient(
         circle at 100% 100%,
-        hsl(var(--primary) / 0.04),
+        hsl(var(--accent) / 0.4),
         transparent 40%
       );
   }

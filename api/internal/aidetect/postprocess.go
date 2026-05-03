@@ -330,6 +330,16 @@ func polishProposals(proposals []Proposal) []Proposal {
 		}
 	}
 
+	// Pass 3: label-semantic enrichment. Runs AFTER slugging+dedupe so
+	// applySemantics sees both the final Label and the final DataKey
+	// (the latter matters for tier outputs that ship empty labels but
+	// snake_case keys — "pan_number" still triggers the PAN rule). All
+	// three tiers funnel through here so this single call site enriches
+	// acroform / heuristic / vision proposals uniformly.
+	for i := range proposals {
+		applySemantics(&proposals[i])
+	}
+
 	return proposals
 }
 

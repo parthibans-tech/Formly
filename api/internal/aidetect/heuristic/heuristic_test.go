@@ -662,3 +662,208 @@ func TestDetect_Grid_SectionPrefixApplied(t *testing.T) {
 		t.Errorf("Label = %q, want %q", got[0].Label, want)
 	}
 }
+
+// pageWithCheckboxes builds a LayoutPage carrying both OCR boxes AND
+// the CV-detected checkbox bboxes the sidecar emits. Mirrors
+// pageWithGrids — separate helper so tests stay self-documenting about
+// which late-pass they're exercising.
+func pageWithCheckboxes(w, h int, boxes []ocr.LayoutBox, cbs []ocr.LayoutCheckbox) ocr.LayoutPage {
+	return ocr.LayoutPage{W: w, H: h, Boxes: boxes, Checkboxes: cbs}
+}
+
+func checkbox(x, y, w, h float64) ocr.LayoutCheckbox {
+	return ocr.LayoutCheckbox{
+		X: x, Y: y, W: w, H: h,
+		Bbox: [4]float64{x, y, w, h},
+	}
+}
+
+// TestDetect_Checkbox_BindsRightLabel — canonical "[ ] Savings" row.
+// CV detector finds the empty square; binder picks up the right-side
+// OCR text as the label.
+func TestDetect_Checkbox_BindsRightLabel(t *testing.T) {
+	boxes := []ocr.LayoutBox{
+		box("Savings", 100, 200, 80, 20),
+	}
+	cbs := []ocr.LayoutCheckbox{
+		checkbox(60, 200, 18, 18),
+	}
+	got := Detect([]ocr.LayoutPage{pageWithCheckboxes(800, 1100, boxes, cbs)})
+	if len(got) != 1 {
+		t.Fatalf("got %d, want 1: %+v", len(got), got)
+	}
+	if got[0].Type != "checkbox" {
+		t.Errorf("Type = %q, want checkbox", got[0].Type)
+	}
+	if got[0].Label != "Savings" {
+		t.Errorf("Label = %q, want Savings", got[0].Label)
+	}
+}
+
+// TestDetect_Checkbox_StripsTrailingColon — "Tatkal:" right-side label
+// gets the colon trimmed so the slugged key downstream is "tatkal" not
+// "tatkal_". Mirrors the colon-trim that the per-box passes do.
+//
+// Note: "Tatkal:" with empty space to its right also triggers the
+// per-box colon-gap text emitter, so the page may produce an extra
+// text field. We assert on the checkbox label, not the field count.
+func TestDetect_Checkbox_StripsTrailingColon(t *testing.T) {
+	boxes := []ocr.LayoutBox{
+		box("Tatkal:", 100, 200, 80, 20),
+		// Cap the colon-gap with another label far to the right so the
+		// gap detector at least has a defined endpoint; not strictly
+		// necessary for the assertion but keeps the fixture honest.
+		box("End", 760, 200, 30, 20),
+	}
+	cbs := []ocr.LayoutCheckbox{
+		checkbox(60, 200, 18, 18),
+	}
+	got := Detect([]ocr.LayoutPage{pageWithCheckboxes(800, 1100, boxes, cbs)})
+	cb, ok := findFirst(got, "checkbox", "Tatkal")
+	if !ok {
+		t.Fatalf("expected checkbox bound to 'Tatkal' (colon trimmed); got %+v", got)
+	}
+	if strings.HasSuffix(cb.Label, ":") {
+		t.Errorf("Label %q still has trailing colon", cb.Label)
+	}
+}
+
+// TestDetect_Checkbox_LeftFallback — "Form 60   [ ]" pattern: no text
+// to the right, so the binder falls back to the same-row left side.
+func TestDetect_Checkbox_LeftFallback(t *testing.T) {
+	boxes := []ocr.LayoutBox{
+		box("Form 60", 60, 200, 80, 20),
+	}
+	cbs := []ocr.LayoutCheckbox{
+		checkbox(180, 200, 18, 18), // checkbox to the RIGHT of the text
+	}
+	got := Detect([]ocr.LayoutPage{pageWithCheckboxes(800, 1100, boxes, cbs)})
+	if len(got) != 1 {
+		t.Fatalf("got %d, want 1: %+v", len(got), got)
+	}
+	if got[0].Label != "Form 60" {
+		t.Errorf("Label = %q, want %q (left fallback)", got[0].Label, "Form 60")
+	}
+}
+
+// TestDetect_Checkbox_RightWindowCap — adjacent checkboxes "[ ]
+// Savings   [ ] Current" must NOT have the second checkbox steal the
+// first's label. The right-lookahead cap (~120px) is what enforces
+// this; if it ever loosens, this test catches the regression.
+func TestDetect_Checkbox_RightWindowCap(t *testing.T) {
+	boxes := []ocr.LayoutBox{
+		box("Savings", 100, 200, 80, 20),
+		box("Current", 300, 200, 80, 20),
+	}
+	cbs := []ocr.LayoutCheckbox{
+		checkbox(60, 200, 18, 18),  // [ ] Savings
+		checkbox(260, 200, 18, 18), // [ ] Current
+	}
+	got := Detect([]ocr.LayoutPage{pageWithCheckboxes(800, 1100, boxes, cbs)})
+	if len(got) != 2 {
+		t.Fatalf("got %d, want 2: %+v", len(got), got)
+	}
+	// Reading order: leftmost first.
+	if got[0].Label != "Savings" {
+		t.Errorf("[0] Label = %q, want Savings", got[0].Label)
+	}
+	if got[1].Label != "Current" {
+		t.Errorf("[1] Label = %q, want Current", got[1].Label)
+	}
+}
+
+// TestDetect_Checkbox_IgnoresGlyphLabels — the OCR sometimes reads an
+// empty checkbox as a "[ ]" or "□" glyph. We must not let a CV-detected
+// checkbox bind to a neighbouring OCR'd glyph as its label, because
+// that glyph IS another checkbox slot, not text.
+func TestDetect_Checkbox_IgnoresGlyphLabels(t *testing.T) {
+	boxes := []ocr.LayoutBox{
+		box("[ ]", 100, 200, 18, 18), // OCR'd glyph (another checkbox)
+		box("Savings", 130, 200, 80, 20),
+	}
+	cbs := []ocr.LayoutCheckbox{
+		checkbox(60, 200, 18, 18),
+	}
+	got := Detect([]ocr.LayoutPage{pageWithCheckboxes(800, 1100, boxes, cbs)})
+	// We expect the checkbox label to skip the "[ ]" glyph and bind to
+	// "Savings". The OCR glyph itself may also produce its own field
+	// from the per-box passes — that's fine, what we're guarding here
+	// is that the CV-detected checkbox's label isn't "[ ]".
+	cb, ok := findFirst(got, "checkbox", "Savings")
+	if !ok {
+		t.Fatalf("no checkbox bound to Savings; got %+v", got)
+	}
+	if cb.Label == "[ ]" {
+		t.Fatalf("checkbox bound to glyph instead of text label")
+	}
+}
+
+// TestDetect_Checkbox_SuppressesOverlappingTextField — when the OCR's
+// per-box pass produces a text field whose bbox sits on top of a CV-
+// detected checkbox (e.g. a "[Savings]" run mistaken as a text widget),
+// the CV checkbox wins and the duplicate text field is dropped.
+func TestDetect_Checkbox_SuppressesOverlappingTextField(t *testing.T) {
+	// "Account Type:" + a long underline that overlaps the checkbox row
+	// would normally produce a text field across the underline. We
+	// stage the underline so its widget bbox overlaps the checkbox.
+	boxes := []ocr.LayoutBox{
+		box("[ ]", 60, 200, 18, 18), // OCR-glyph at the SAME spot as the CV checkbox
+		box("Savings", 100, 200, 80, 20),
+	}
+	cbs := []ocr.LayoutCheckbox{
+		checkbox(60, 200, 18, 18),
+	}
+	got := Detect([]ocr.LayoutPage{pageWithCheckboxes(800, 1100, boxes, cbs)})
+	// Exactly one checkbox emerges (the CV-detected one). Whatever the
+	// per-box pass tried to produce at the same coords gets suppressed
+	// by the intersection-over-min-area filter.
+	cbCount := 0
+	for _, f := range got {
+		if f.Type == "checkbox" {
+			cbCount++
+		}
+	}
+	if cbCount != 1 {
+		t.Fatalf("got %d checkbox fields, want 1: %+v", cbCount, got)
+	}
+}
+
+// TestDetect_Checkbox_SectionPrefixApplied — checkbox fields get the
+// same "SECTION - label" prefix the per-box and grid fields get,
+// because all three flow through appendWithSection inside detectPage.
+func TestDetect_Checkbox_SectionPrefixApplied(t *testing.T) {
+	boxes := []ocr.LayoutBox{
+		box("ACCOUNT PREFERENCES", 60, 100, 240, 20),
+		box("Savings", 100, 400, 80, 20),
+	}
+	cbs := []ocr.LayoutCheckbox{
+		checkbox(60, 400, 18, 18),
+	}
+	got := Detect([]ocr.LayoutPage{pageWithCheckboxes(800, 1100, boxes, cbs)})
+	cb, ok := findFirst(got, "checkbox", "ACCOUNT PREFERENCES - Savings")
+	if !ok {
+		t.Fatalf("expected section-prefixed checkbox label, got %+v", got)
+	}
+	if cb.Type != "checkbox" {
+		t.Errorf("Type = %q, want checkbox", cb.Type)
+	}
+}
+
+// TestDetect_Checkbox_NoLabelFallback — a checkbox with no nearby OCR
+// text emits with empty label; downstream polish assigns a synthetic
+// field_N. Just verifies we don't panic and the field is preserved.
+func TestDetect_Checkbox_NoLabelFallback(t *testing.T) {
+	cbs := []ocr.LayoutCheckbox{
+		checkbox(60, 500, 18, 18),
+	}
+	got := Detect([]ocr.LayoutPage{pageWithCheckboxes(800, 1100, nil, cbs)})
+	if len(got) != 1 {
+		t.Fatalf("got %d, want 1: %+v", len(got), got)
+	}
+	if got[0].Type != "checkbox" {
+		t.Errorf("Type = %q, want checkbox", got[0].Type)
+	}
+	if got[0].Label != "" {
+		t.Errorf("Label = %q, want empty", got[0].Label)
+	}
+}

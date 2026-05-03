@@ -1,6 +1,34 @@
 import "./globals.css";
 import type { Metadata, Viewport } from "next";
+import { Inter, JetBrains_Mono } from "next/font/google";
 import { ToastProvider } from "@/components/toast";
+
+// Two font families, monochromatic hierarchy. The system uses Inter
+// for everything user-facing and JetBrains Mono for code / IDs /
+// tabular numerics. Hierarchy comes from weight + scale, not from
+// face changes.
+//
+// next/font self-hosts and subsets at build time so first paint never
+// shows the system fallback face (no FOUT) and we avoid an extra DNS
+// round-trip to fonts.googleapis.com on cold sessions. Each export
+// produces a CSS variable that tailwind.config.ts references — adding
+// or swapping a face later is one import, one variable name, nothing
+// else touched.
+const fontSans = Inter({
+  subsets: ["latin"],
+  display: "swap",
+  variable: "--font-sans",
+});
+
+const fontMono = JetBrains_Mono({
+  subsets: ["latin"],
+  display: "swap",
+  variable: "--font-mono",
+  // Three weights cover regular code, emphasis, and the kbd-chip
+  // semibold. Loading the full 100..800 range would ship ~60KB of
+  // weights we never use.
+  weight: ["400", "500", "600"],
+});
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ConfirmProvider } from "@/components/ui/confirm";
@@ -52,9 +80,14 @@ export const metadata: Metadata = {
 };
 
 export const viewport: Viewport = {
+  // themeColor mirrors the page canvas so mobile browser chrome blends
+  // into the surface instead of cutting a stark band above the UI.
+  // Hex equivalents of HSL(0 0% 100%) and HSL(224 40% 6%) from
+  // app/globals.css's `--background` token — keep them in sync if those
+  // tokens move.
   themeColor: [
     { media: "(prefers-color-scheme: light)", color: "#ffffff" },
-    { media: "(prefers-color-scheme: dark)", color: "#0b1020" },
+    { media: "(prefers-color-scheme: dark)", color: "#0a0d17" },
   ],
   width: "device-width",
   initialScale: 1,
@@ -64,7 +97,17 @@ const themeInitScript = `(function(){try{var s=localStorage.getItem('df_theme');
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en" suppressHydrationWarning>
+    <html
+      lang="en"
+      suppressHydrationWarning
+      // Font variables propagate down the cascade so every component
+      // that reaches for `font-sans` or `font-mono` resolves through
+      // next/font's optimized fonts. We attach them to <html> (not
+      // <body>) so iframed content and portaled overlays — toasts,
+      // dialogs, popovers rendered through Radix Portal — inherit the
+      // same stack without a second wiring step.
+      className={`${fontSans.variable} ${fontMono.variable}`}
+    >
       <head>
         <script dangerouslySetInnerHTML={{ __html: themeInitScript }} />
       </head>

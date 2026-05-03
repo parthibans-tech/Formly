@@ -176,10 +176,11 @@ func Detect(pages []ocr.LayoutPage) []Field {
 }
 
 func detectPage(pageNum int, page ocr.LayoutPage) []Field {
-	// Short-circuit only when BOTH inputs are empty. A page with grids
-	// but no OCR boxes (rare but possible — a pure character-grid form
-	// with no instructions) still needs the grid pass to run.
-	if len(page.Boxes) == 0 && len(page.Grids) == 0 {
+	// Short-circuit only when ALL inputs are empty. A page with grids
+	// or checkboxes but no OCR boxes (rare but possible — a pure
+	// character-grid form, or a "tick-the-box" preference page with no
+	// instructions) still needs the corresponding CV pass to run.
+	if len(page.Boxes) == 0 && len(page.Grids) == 0 && len(page.Checkboxes) == 0 {
 		return nil
 	}
 
