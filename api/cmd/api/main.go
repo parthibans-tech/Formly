@@ -743,6 +743,11 @@ func main() {
 
 		r.Post("/v1/files/upload-url", f.CreateUploadURL)
 		r.Post("/v1/files/{id}/complete", f.Complete)
+		// One-shot create-blank-office endpoint. Generates a minimal
+		// valid .docx/.xlsx/.pptx server-side and writes it directly
+		// to MinIO, bypassing the presigned-PUT round-trip so the
+		// caller can navigate straight into the OnlyOffice editor.
+		r.Post("/v1/files/blank-office", f.BlankOffice)
 		// Backfill: run DetectAndCreate on a pre-existing file that
 		// has no template yet. Lets the Drive click handler open
 		// images / HTML / markdown uploaded before their detector

@@ -16,8 +16,11 @@ import {
   BookTemplate,
   ClipboardList,
   FileCode2,
+  FileSpreadsheet,
+  FileText,
   FileType2,
   Hash,
+  Presentation,
   FolderPlus,
   FolderUp,
   FolderOpen,
@@ -118,6 +121,7 @@ import { useFolderPicker } from "@/components/folder-picker";
 import { createHtmlTemplate } from "@/lib/create-html";
 import { createDocTemplate } from "@/lib/create-doc";
 import { createMarkdownTemplate } from "@/lib/create-markdown";
+import { createBlankOffice, type OfficeKind } from "@/lib/create-office";
 import { createBlankPdfTemplate, type BlankPdfOpts } from "@/lib/create-pdf";
 import { AppShell } from "@/components/app-shell";
 import { StarterBrowser } from "@/components/starter-browser";
@@ -863,6 +867,54 @@ export default function DrivePage() {
       toast.show("error", "Couldn't create template", {
         description: e.message,
       });
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  // Create-blank-office handler. The server endpoint generates the
+  // OOXML bytes, uploads them, and marks the row active in one shot —
+  // we just need to navigate into the OnlyOffice editor on success.
+  // We reuse the prompt → toast → router.push pattern so the UX is
+  // consistent with the other "Start blank" entries.
+  async function createOffice(kind: OfficeKind) {
+    const labels: Record<OfficeKind, { title: string; defaultName: string; opening: string }> = {
+      docx: {
+        title: "Create Word document",
+        defaultName: "Untitled document",
+        opening: "Opening Word editor…",
+      },
+      xlsx: {
+        title: "Create Excel spreadsheet",
+        defaultName: "Untitled spreadsheet",
+        opening: "Opening Excel editor…",
+      },
+      pptx: {
+        title: "Create PowerPoint presentation",
+        defaultName: "Untitled presentation",
+        opening: "Opening PowerPoint editor…",
+      },
+    };
+    const meta = labels[kind];
+    const name = await prompt({
+      title: meta.title,
+      label: "Document name",
+      defaultValue: meta.defaultName,
+      confirmLabel: "Create",
+      validate: (v) => (v.trim().length < 1 ? "Name is required" : null),
+    });
+    if (!name) return;
+    setCreating(true);
+    try {
+      const { fileId } = await createBlankOffice({
+        kind,
+        name: name.trim(),
+        folderId: currentFolderId || undefined,
+      });
+      toast.show("success", "Document created", { description: meta.opening });
+      router.push(`/editor/${fileId}`);
+    } catch (e: any) {
+      toast.show("error", "Couldn't create document", { description: e.message });
     } finally {
       setCreating(false);
     }
@@ -1677,6 +1729,27 @@ export default function DrivePage() {
                   <DropdownMenuLabel className="text-[10px]">
                     Start blank
                   </DropdownMenuLabel>
+                  <DropdownMenuItem onClick={() => createOffice("docx")}>
+                    <FileText className="h-4 w-4" />
+                    Word document
+                    <span className="ml-auto text-[10px] text-muted-foreground">
+                      .docx
+                    </span>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => createOffice("xlsx")}>
+                    <FileSpreadsheet className="h-4 w-4" />
+                    Excel spreadsheet
+                    <span className="ml-auto text-[10px] text-muted-foreground">
+                      .xlsx
+                    </span>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => createOffice("pptx")}>
+                    <Presentation className="h-4 w-4" />
+                    PowerPoint presentation
+                    <span className="ml-auto text-[10px] text-muted-foreground">
+                      .pptx
+                    </span>
+                  </DropdownMenuItem>
                   <DropdownMenuItem onClick={createHtml}>
                     <FileCode2 className="h-4 w-4" />
                     HTML template
