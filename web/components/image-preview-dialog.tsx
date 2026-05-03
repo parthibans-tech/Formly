@@ -318,7 +318,7 @@ export function ImagePreviewDialog({
                   almost always want first. Switches to outline when
                   active so the panel toggle role is obvious. Always
                   available; not gated on AI being enabled because
-                  /extract-text is a pure tesseract call. The chevron
+                  /extract-text is a pure OCR sidecar call. The chevron
                   to its right opens the document-type picker so the
                   user can tune OCR for Aadhaar/PAN/Receipt before the
                   request fires. */}

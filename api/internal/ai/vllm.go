@@ -21,6 +21,7 @@ package ai
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -64,16 +65,49 @@ func (c *vllmClient) Capabilities() Capabilities {
 }
 
 type oaiChatReq struct {
-	Model       string        `json:"model"`
-	Messages    []ChatMessage `json:"messages"`
-	Temperature float64       `json:"temperature,omitempty"`
-	MaxTokens   int           `json:"max_tokens,omitempty"`
+	Model       string       `json:"model"`
+	Messages    []oaiMessage `json:"messages"`
+	Temperature float64      `json:"temperature,omitempty"`
+	MaxTokens   int          `json:"max_tokens,omitempty"`
+}
+
+// oaiMessage is the OpenAI-compat wire shape. Content is `any` so a
+// text-only message stays a plain string (most efficient on the wire)
+// while a multimodal message becomes the typed-parts array OpenAI's
+// vision schema expects.
+type oaiMessage struct {
+	Role    string `json:"role"`
+	Content any    `json:"content"`
+}
+
+// oaiTextPart / oaiImagePart are the entries in a multimodal content
+// array. The image_url's url can be either an http(s) URL or a
+// data-URI; we always emit data-URIs because (a) most OpenAI-compat
+// servers running locally don't have outbound HTTP, (b) data-URIs are
+// self-contained for replay/log, (c) we already have the bytes.
+type oaiTextPart struct {
+	Type string `json:"type"` // "text"
+	Text string `json:"text"`
+}
+
+type oaiImagePart struct {
+	Type     string         `json:"type"` // "image_url"
+	ImageURL oaiImageURLRef `json:"image_url"`
+}
+
+type oaiImageURLRef struct {
+	URL string `json:"url"`
 }
 
 type oaiChatResp struct {
 	Model   string `json:"model"`
 	Choices []struct {
-		Message ChatMessage `json:"message"`
+		// Choices come back with text-only content (the model isn't
+		// returning images), so a plain string suffices.
+		Message struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"message"`
 	} `json:"choices"`
 }
 
@@ -84,7 +118,7 @@ func (c *vllmClient) Chat(ctx context.Context, req ChatRequest) (ChatResponse, e
 	}
 	body := oaiChatReq{
 		Model:       model,
-		Messages:    req.Messages,
+		Messages:    oaiMessages(req.Messages),
 		Temperature: req.Temperature,
 		MaxTokens:   req.MaxTokens,
 	}
@@ -95,7 +129,10 @@ func (c *vllmClient) Chat(ctx context.Context, req ChatRequest) (ChatResponse, e
 	if len(out.Choices) == 0 {
 		return ChatResponse{}, errors.New("vllm chat: empty response")
 	}
-	return ChatResponse{Content: out.Choices[0].Message.Content, Model: out.Model}, nil
+	return ChatResponse{
+		Content: out.Choices[0].Message.Content,
+		Model:   out.Model,
+	}, nil
 }
 
 type oaiEmbedReq struct {
@@ -124,6 +161,38 @@ func (c *vllmClient) Embed(ctx context.Context, req EmbedRequest) (EmbedResponse
 		return EmbedResponse{}, errors.New("vllm embed: empty response")
 	}
 	return EmbedResponse{Embedding: out.Data[0].Embedding, Model: out.Model}, nil
+}
+
+// oaiMessages translates the public ChatMessage slice into the
+// OpenAI wire shape. Text-only messages keep a string content;
+// messages with image parts become a typed-parts array (text + one
+// image_url per ImagePart, encoded as a data URI).
+func oaiMessages(in []ChatMessage) []oaiMessage {
+	out := make([]oaiMessage, 0, len(in))
+	for _, m := range in {
+		if len(m.Images) == 0 {
+			out = append(out, oaiMessage{Role: m.Role, Content: m.Content})
+			continue
+		}
+		parts := make([]any, 0, len(m.Images)+1)
+		for _, img := range m.Images {
+			mt := img.MIME
+			if mt == "" {
+				mt = "image/png"
+			}
+			parts = append(parts, oaiImagePart{
+				Type: "image_url",
+				ImageURL: oaiImageURLRef{
+					URL: "data:" + mt + ";base64," + base64.StdEncoding.EncodeToString(img.Data),
+				},
+			})
+		}
+		if m.Content != "" {
+			parts = append(parts, oaiTextPart{Type: "text", Text: m.Content})
+		}
+		out = append(out, oaiMessage{Role: m.Role, Content: parts})
+	}
+	return out
 }
 
 func (c *vllmClient) post(ctx context.Context, path string, body, out any) error {

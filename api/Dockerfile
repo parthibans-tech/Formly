@@ -8,10 +8,18 @@
 #   net resolver make the binary fully self-contained.
 #
 # Stage 2 (runtime): minimal image with only the binary + the OS
-#   tools the OCR / PDF pipelines shell out to (tesseract, pdftoppm,
-#   pdftotext). We use debian-slim instead of distroless because we
-#   need apt-installed packages — distroless would force us to
-#   bundle Tesseract language data manually.
+#   tools the PDF text-extraction pipeline shells out to (pdftotext
+#   from poppler-utils for the embedded text layer of clean PDFs).
+#
+#   OCR no longer runs in this image — the api/internal/ocr package
+#   is now an HTTP client to the paddle-ocr sidecar (see
+#   infra/paddle-ocr/). That side handles tesseract's old job plus
+#   PDF rasterization, so we dropped the tesseract-ocr / tesseract-ocr-tam
+#   / tesseract-ocr-hin / imagemagick packages from this stage. The
+#   image is ~600 MB smaller as a result.
+#
+#   We keep debian-slim (vs distroless) because pdftotext still wants
+#   poppler-utils + the tini PID-1 reaper.
 #
 # Migrations folder is copied alongside the binary; runMigrations()
 # in main.go globs migrations/*.sql relative to WORKDIR at startup.
@@ -70,32 +78,23 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # ---------- runtime ----------
 FROM debian:bookworm-slim
 
-# Tesseract + Tamil/Hindi packs for the OCR pipeline (see
-# api/internal/ocr/), poppler-utils for pdftoppm/pdftotext, and the
-# CA bundle for outbound HTTPS (S3, AI providers).
+# poppler-utils ships pdftotext, used by api/internal/extract/pdf.go to
+# pull the embedded text layer out of clean PDFs in-process (no OCR
+# required). OCR itself runs in the paddle-ocr sidecar — see
+# infra/paddle-ocr/ — so tesseract / tesseract-ocr-* / imagemagick
+# are no longer in this image.
 #
 # tini = PID 1 that reaps zombies and forwards SIGTERM. Without it,
 # Ctrl-C / `docker stop` send SIGTERM to PID 1 which Go binaries
-# handle, but child processes (tesseract subprocess) don't get
-# cleaned up if the API gets killed mid-OCR.
+# handle, but child processes (pdftotext subprocess) don't get
+# cleaned up if the api gets killed mid-extraction.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         ca-certificates \
-        tesseract-ocr tesseract-ocr-tam tesseract-ocr-hin \
         poppler-utils \
-        imagemagick \
         tini \
         curl \
  && rm -rf /var/lib/apt/lists/*
-
-# Drop the ImageMagick PDF policy — Ubuntu/Debian ship a CVE-era
-# blanket deny. Our pipeline goes through pdftoppm directly, but
-# loosening this avoids surprise breakage if a downstream feature
-# reaches for `convert`.
-RUN if [ -f /etc/ImageMagick-6/policy.xml ]; then \
-      sed -i 's|<policy domain="coder" rights="none" pattern="PDF" />|<!-- pdf coder allowed for drive360 -->|' \
-        /etc/ImageMagick-6/policy.xml || true; \
-    fi
 
 # Non-root runtime user.
 RUN groupadd --system --gid 1000 drive360 \

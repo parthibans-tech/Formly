@@ -1,0 +1,45 @@
+# OCR sidecar runtime deps. Pinned to known-good versions so a
+# `docker compose build` in 6 months produces the same image. Bump
+# intentionally with a smoke test against the warmup image.
+#
+# # Engine choice: RapidOCR (not PaddleOCR)
+#
+# We originally pinned paddlepaddle + paddleocr. PyPI removed the
+# 2.5.x and 2.6.0/2.6.1 wheels (only 2.6.2 and 3.x remain for
+# Python 3.11), and the surviving 2.6.2 wheel segfaults on import
+# under x86_64 emulation on Apple Silicon (both QEMU and Rosetta).
+# Paddle ships no Linux arm64 wheel, so any M-series dev hits this.
+#
+# RapidOCR uses the SAME PP-OCRv4 detection + recognition models,
+# just exported to ONNX. The models are byte-identical to what
+# PaddleOCR ships; only the runtime differs (onnxruntime vs paddle's
+# own inference engine). onnxruntime publishes manylinux + arm64
+# wheels, so the sidecar builds and runs natively on every host
+# arch without an emulation layer.
+#
+# Detection quality is unchanged. The API surface in app.py adapts
+# RapidOCR's `engine(img) → ([(quad, text, conf), ...], elapse)`
+# call into the same per-language engine cache the Go side expects;
+# /ocr/* and /layout/* response shapes are byte-identical to what
+# the prior PaddleOCR build returned.
+#
+# Multi-language note: rapidocr-onnxruntime ships English + Chinese
+# PP-OCRv4 mobile models out of the box. For Hindi/Tamil/etc., the
+# operator drops the model files into /app/models and points at them
+# via env vars (see app.py engine cache). Same approach Paddle took
+# with /root/.paddleocr/ — just explicit paths instead of magic
+# language codes.
+
+rapidocr-onnxruntime==1.3.24
+pdf2image==1.17.0
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.12
+Pillow==10.4.0
+numpy==1.26.4
+# opencv-python-headless powers the character-grid detector in app.py
+# (_detect_char_grids). Headless variant avoids the libgl1 system dep
+# the GUI build needs — we never render, only do morphology + contour
+# analysis on the page raster. ~30 MB on disk, no extra runtime cost
+# when grids=false.
+opencv-python-headless==4.10.0.84

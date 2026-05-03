@@ -134,6 +134,41 @@ services:
       timeout: 5s
       retries: 6
 
+  # PaddleOCR sidecar — replaces the previous tesseract+poppler+
+  # imagemagick stack the api process used to shell out to. The Go
+  # api/internal/ocr package now talks to this service over HTTP at
+  # PADDLE_OCR_URL (default http://localhost:8868 when running api on
+  # the host, http://paddle-ocr:8868 when running it inside compose).
+  #
+  # Built from infra/paddle-ocr/. Models for English / Hindi / Tamil
+  # are pre-downloaded at image build time so the first request after
+  # a container restart doesn't pay a 30s download cost — additional
+  # languages download lazily on first request and are cached in the
+  # paddle_models volume across restarts.
+  #
+  # Memory: ~1GB resident with the three default engines warmed up
+  # (PaddleOCR holds models in process memory; one engine ≈ 600MB,
+  # subsequent langs share less weight). Scale with separate
+  # containers, not extra workers in one container — uvicorn workers
+  # multiply RAM linearly.
+  paddle-ocr:
+    build:
+      context: ./paddle-ocr
+      dockerfile: Dockerfile
+    ports:
+      - "8868:8868"
+    volumes:
+      # Cache downloaded model artifacts so a `docker compose down`
+      # doesn't force re-download. Pre-baked models live in /root/.paddleocr;
+      # the volume covers any extra languages a deploy adds at runtime.
+      - paddle_models:/root/.paddleocr
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8868/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
   # One-shot init container — pulls the embedding + chat models once
   # so the first inference call doesn't time out waiting on a multi-GB
   # download. Idempotent: `ollama pull` is a no-op when the model is
@@ -538,6 +573,7 @@ volumes:
   onlyoffice_log:
   onlyoffice_cache:
   ollama_data:
+  paddle_models:
   promdata:
   alertmanagerdata:
   tempodata:

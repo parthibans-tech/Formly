@@ -36,7 +36,7 @@ const FEATURES = [
   {
     icon: Sparkles,
     title: "AI extract & summarize",
-    body: "Tesseract + LLM pipeline pulls fields out of PDFs, IDs, receipts, and scans — with a human-in-the-loop review queue.",
+    body: "PaddleOCR + LLM pipeline pulls fields out of PDFs, IDs, receipts, and scans — with a human-in-the-loop review queue.",
   },
   {
     icon: Webhook,

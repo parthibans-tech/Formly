@@ -268,10 +268,12 @@ export function PdfViewerDialog({
             <div className="flex items-center gap-1.5">
               {actions}
               {/* Fast OCR-only path. Always shown when we have a
-                  file ID — pure tesseract, no AI required. Sub-second
-                  for typical text-extractable PDFs; for image-only
-                  scans it goes through the PDF→PPM→tesseract pipeline
-                  which adds a couple of seconds per page. */}
+                  file ID — pure OCR sidecar, no LLM required.
+                  Sub-second for typical text-extractable PDFs; for
+                  image-only scans it round-trips through the
+                  PaddleOCR sidecar (PDF rasterized + PP-OCRv4
+                  detection/recognition) which adds a couple of
+                  seconds per page. */}
               {textAvailable ? (
                 <div className="flex items-center">
                   <Tooltip>

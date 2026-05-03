@@ -55,6 +55,7 @@ import {
   LockOpen,
   Maximize2,
   MessageSquare,
+  Sparkles,
   Minimize2,
   Minus,
   MoreHorizontal,
@@ -121,6 +122,10 @@ import { Input } from "@/components/ui/input";
 import { InlineRenameTitle } from "@/components/designer/inline-rename-title";
 import { ApiGuideSheet } from "@/components/api-guide-trigger";
 import { CollabDrawer } from "@/components/collab-drawer";
+import {
+  AIDetectFieldsModal,
+  type DetectedProposal,
+} from "@/components/ai-detect-fields-modal";
 import { DocAITools } from "@/components/doc-ai-tools";
 import { Label } from "@/components/ui/label";
 import { TYPOGRAPHY_PRESETS, FONT_FAMILIES } from "@/lib/font-presets";
@@ -404,6 +409,10 @@ export default function StaticDesigner({
   // the same "Request review" entry point. The drawer is purely a
   // dialog; no canvas state depends on it.
   const [collabOpen, setCollabOpen] = useState(false);
+  // AI auto-detect-fields modal. Opens via toolbar button or command
+  // palette; never opens on its own. Hits POST /ai/detect-fields,
+  // surfaces proposals, merges accepted ones into widgets state.
+  const [aiDetectOpen, setAiDetectOpen] = useState(false);
   const [showRulers, setShowRulers] = useState(true);
   const [showThumbs, setShowThumbs] = useState(true);
   // Page rendering mode. "continuous" stacks every page top-to-bottom (the
@@ -596,6 +605,36 @@ export default function StaticDesigner({
     const created = makeWidget(type, page, pdf.x, pdf.y, pdf.w, pdf.h, widgets.length);
     setWidgets((prev) => [...prev, created]);
     setSelectedIds([created.id]);
+  }
+
+  // Merge AI-detected proposals into the widgets list. Coordinates
+  // come back from the server already in PDF user-space (origin
+  // bottom-left), so no translation is needed — they slot straight
+  // into the same coordinate convention the rest of the canvas uses.
+  // Each proposal becomes a fresh widget with a new id; we push them
+  // at the end of the z-stack so they sit above existing decoration
+  // and the user can immediately click-to-select to fine-tune.
+  function applyDetectedProposals(proposals: DetectedProposal[]) {
+    if (!proposals.length) return;
+    const startZ = widgets.length;
+    const created: Widget[] = proposals.map((p, i) => ({
+      id: newId(),
+      type: p.type,
+      page: p.page || 1,
+      x: p.x,
+      y: p.y,
+      w: p.w,
+      h: p.h,
+      dataKey: p.dataKey || `field_${startZ + i + 1}`,
+      zIndex: startZ + i,
+      props: { ...defaultProps(p.type), ...(p.props || {}) },
+    }));
+    setWidgets((prev) => [...prev, ...created]);
+    setSelectedIds(created.map((w) => w.id));
+    toast.show(
+      "success",
+      `Added ${created.length} field${created.length === 1 ? "" : "s"} from auto-detect`,
+    );
   }
 
   // Quick-insert: spawn a widget at a sensible default position on page 1.
@@ -2081,6 +2120,7 @@ export default function StaticDesigner({
       // would silently disappear.
       { id: "file:batch", label: "Batch generate from CSV", group: "File", run: async () => { if (!readOnly) await save(); setBatchOpen(true); } },
       { id: "view:collab", label: "Open comments & reviews", group: "Share", run: () => setCollabOpen(true) },
+      { id: "ai:detect-fields", label: "Auto-detect form fields", group: "AI", run: () => { if (!readOnly) setAiDetectOpen(true); } },
       { id: "help:shortcuts", label: "Keyboard shortcuts", hint: "?", group: "Help", run: () => setHelpOpen(true) },
     ];
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2243,6 +2283,16 @@ export default function StaticDesigner({
               external review-links. Surfaces the same drawer the
               markdown / HTML designers expose so PDF authors aren't a
               second-class citizen for review workflows. */}
+          <button
+            type="button"
+            title="Auto-detect form fields from PDF"
+            onClick={() => setAiDetectOpen(true)}
+            disabled={readOnly}
+            className="inline-flex items-center gap-1 px-2 py-2 text-sm border rounded hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed text-violet-700 border-violet-200 hover:bg-violet-50"
+          >
+            <Sparkles className="h-4 w-4" />
+            <span className="hidden lg:inline">Auto-detect</span>
+          </button>
           <button
             type="button"
             title="Comments & reviews"
@@ -4315,6 +4365,14 @@ export default function StaticDesigner({
         onOpenChange={setCollabOpen}
         templateId={tpl.id}
         templateName={tpl.name}
+      />
+
+      <AIDetectFieldsModal
+        open={aiDetectOpen}
+        onOpenChange={setAiDetectOpen}
+        templateId={tpl.id}
+        existingDataKeys={widgets.map((w) => w.dataKey).filter(Boolean)}
+        onAccept={applyDetectedProposals}
       />
 
       <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} commands={commands} />

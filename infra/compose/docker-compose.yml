@@ -93,13 +93,18 @@ services:
       AI_VISION_MODEL: ${AI_VISION_MODEL:-}
       AI_TIMEOUT_SEC: ${AI_TIMEOUT_SEC:-180}
       DOCCHAT_TIMEOUT_SEC: ${DOCCHAT_TIMEOUT_SEC:-180}
-      # ── OCR (tesseract + poppler-utils, baked into api Dockerfile) ──
-      # Without OCR_ENABLED=1, scanned PDFs and image uploads return 415
-      # not_textual from /v1/files/{id}/extract-text. Set to "1" in .env
-      # to turn it on. OCR_LANG passes through to tesseract -l.
+      # ── OCR (PaddleOCR sidecar) ──
+      # The api talks HTTP to the paddle-ocr service in this compose.
+      # Without OCR_ENABLED=1, scanned PDFs and image uploads return
+      # 415 not_textual from /v1/files/{id}/extract-text. OCR_LANG uses
+      # PaddleOCR's ISO codes (en, hi, ta, ch, ja, ko, fr, ...). The
+      # legacy tesseract codes (eng/hin/tam/...) are auto-translated
+      # by the sidecar so old config + DB rows keep working through a
+      # rolling upgrade.
       OCR_ENABLED: ${OCR_ENABLED:-1}
-      OCR_LANG: ${OCR_LANG:-eng}
+      OCR_LANG: ${OCR_LANG:-en}
       OCR_MAX_PAGES: ${OCR_MAX_PAGES:-30}
+      PADDLE_OCR_URL: ${PADDLE_OCR_URL:-http://paddle-ocr:8868}
       # ── ONLYOFFICE ──
       # ONLYOFFICE_PUBLIC_URL is the URL the BROWSER loads api.js from.
       # Must be HTTPS in prod (matches DOMAIN_OFFICE behind nginx).
@@ -121,6 +126,13 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      # paddle-ocr is best-effort: api boots fine if the sidecar
+      # is still warming up (the OCR call returns a 502 ai_error
+      # at request time and the rest of the api keeps working).
+      # Use service_started rather than service_healthy so a slow
+      # model load doesn't block api startup on cold deploys.
+      paddle-ocr:
+        condition: service_started
     # Memory hint to docker. Not a hard cap (no `mem_limit`) — that
     # would OOM-kill rather than swap, which is harsher than we want
     # on a single VPS where bursts are normal.
@@ -352,6 +364,14 @@ services:
       AI_EMBED_MODEL: ${AI_EMBED_MODEL:-nomic-embed-text}
       AI_VISION_MODEL: ${AI_VISION_MODEL:-}
       AI_TIMEOUT_SEC: ${AI_TIMEOUT_SEC:-180}
+      # Worker shares the api's OCR config so async embeddings of
+      # scanned PDFs use the same PaddleOCR sidecar the inline path
+      # does. Without these vars the worker silently falls back to
+      # "no OCR" and embeds a placeholder body string.
+      OCR_ENABLED: ${OCR_ENABLED:-1}
+      OCR_LANG: ${OCR_LANG:-en}
+      OCR_MAX_PAGES: ${OCR_MAX_PAGES:-30}
+      PADDLE_OCR_URL: ${PADDLE_OCR_URL:-http://paddle-ocr:8868}
       # Worker exposes /metrics on :9090 for Prometheus. Bound to
       # the docker network only (no host port published) — scrape
       # via the prometheus service in infra/observability.
@@ -406,6 +426,60 @@ services:
       resources:
         limits:
           memory: 1500M
+
+  # ────────────────────────────────────────────────────────────
+  # PaddleOCR sidecar — replaces tesseract+poppler+imagemagick.
+  # The api/internal/ocr package speaks HTTP to this service.
+  #
+  # Image is built locally from infra/paddle-ocr/. Pre-downloads
+  # PP-OCRv4 weights for English, Hindi, and Tamil during the image
+  # build so the first request after a deploy doesn't pay model-load
+  # latency. Additional languages lazy-download on first use and
+  # cache in the paddle_models volume.
+  #
+  # Memory budget: ~200 MB resident for the RapidOCR engine (ONNX
+  # session + PP-OCRv4 mobile weights), plus a transient ~500 MB
+  # headroom for /raster/pdf and /layout/pdf when called against a
+  # 30-page document (pdf2image holds all pages in PIL Image objects
+  # before iteration in the OCR loop). 1 GB gives a safety cushion
+  # without competing with onlyoffice / ollama on a 4 GB VPS. Down
+  # from the prior 2 GB cap that targeted PaddlePaddle's heavier
+  # ~600 MB resident footprint.
+  # No public port — the api reaches it on the docker network as
+  # paddle-ocr:8868.
+  # ────────────────────────────────────────────────────────────
+  paddle-ocr:
+    image: ${PADDLE_OCR_IMAGE:-ghcr.io/your-org/drive360-paddle-ocr:latest}
+    # Service name is `paddle-ocr` for historical reasons (the sidecar
+    # originally wrapped PaddleOCR). Runtime is now RapidOCR (ONNX),
+    # which has multi-arch wheels — builds and runs natively on both
+    # linux/amd64 (VPS) and linux/arm64 (Apple Silicon dev) without
+    # any platform pin or emulation.
+    build:
+      context: ../paddle-ocr
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    volumes:
+      # External model directory for non-latin scripts (Hindi, Tamil,
+      # Bengali, ...). Operators populate ./paddle-ocr/models/<lang>/
+      # with det.onnx + rec.onnx + keys.txt downloaded from the
+      # RapidOCR releases page. Empty by default — the bundled latin
+      # multilingual model in the wheel covers en/fr/de/es/pt/it/nl
+      # without anything mounted here. The prior PaddleOCR build
+      # mounted /root/.paddleocr/ for the same purpose; the new
+      # location is explicit (under /app) so operators don't ship
+      # state-into-home-dir hacks.
+      - ../paddle-ocr/models:/app/models:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8868/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
 
   # ────────────────────────────────────────────────────────────
   # Ollama — local AI. Big (~4 GB image, models are 2-7 GB each

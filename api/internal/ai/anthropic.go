@@ -12,6 +12,7 @@ package ai
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -70,9 +71,31 @@ type anthropicChatReq struct {
 	Temp      float64            `json:"temperature,omitempty"`
 }
 
+// anthropicMessage's Content is `any` so we can emit either a plain
+// string (text-only message — keeps the wire compact) or an array of
+// content blocks (multimodal message with one or more image parts).
+// The Anthropic API accepts both shapes interchangeably.
 type anthropicMessage struct {
 	Role    string `json:"role"`
-	Content string `json:"content"`
+	Content any    `json:"content"`
+}
+
+// anthropicTextBlock / anthropicImageBlock are the typed entries in
+// the content-blocks array used for multimodal messages.
+type anthropicTextBlock struct {
+	Type string `json:"type"` // "text"
+	Text string `json:"text"`
+}
+
+type anthropicImageBlock struct {
+	Type   string                    `json:"type"` // "image"
+	Source anthropicImageBlockSource `json:"source"`
+}
+
+type anthropicImageBlockSource struct {
+	Type      string `json:"type"`       // "base64"
+	MediaType string `json:"media_type"` // "image/png", "image/jpeg", ...
+	Data      string `json:"data"`       // base64-encoded
 }
 
 type anthropicChatResp struct {
@@ -103,7 +126,7 @@ func (c *anthropicClient) Chat(ctx context.Context, req ChatRequest) (ChatRespon
 			system += m.Content
 			continue
 		}
-		msgs = append(msgs, anthropicMessage{Role: m.Role, Content: m.Content})
+		msgs = append(msgs, anthropicMessage{Role: m.Role, Content: anthropicContent(m)})
 	}
 	maxTok := req.MaxTokens
 	if maxTok <= 0 {
@@ -134,6 +157,42 @@ func (c *anthropicClient) Chat(ctx context.Context, req ChatRequest) (ChatRespon
 
 func (c *anthropicClient) Embed(context.Context, EmbedRequest) (EmbedResponse, error) {
 	return EmbedResponse{}, fmt.Errorf("anthropic embed: %w", ErrUnsupported)
+}
+
+// anthropicContent returns the request-shape Content for one
+// ChatMessage. For text-only messages we emit a plain string (keeps
+// the wire compact); for multimodal messages we emit the typed
+// content-blocks array Anthropic requires for image input.
+//
+// Image ordering matters for the model — text-then-images means "here
+// is the question, here are the images to look at"; reversed would
+// imply "look at these images, then read the question". We emit
+// images first then text, matching Anthropic's recommendation for
+// vision prompts (model attends to images before reading the
+// instruction).
+func anthropicContent(m ChatMessage) any {
+	if len(m.Images) == 0 {
+		return m.Content
+	}
+	blocks := make([]any, 0, len(m.Images)+1)
+	for _, img := range m.Images {
+		mt := img.MIME
+		if mt == "" {
+			mt = "image/png"
+		}
+		blocks = append(blocks, anthropicImageBlock{
+			Type: "image",
+			Source: anthropicImageBlockSource{
+				Type:      "base64",
+				MediaType: mt,
+				Data:      base64.StdEncoding.EncodeToString(img.Data),
+			},
+		})
+	}
+	if m.Content != "" {
+		blocks = append(blocks, anthropicTextBlock{Type: "text", Text: m.Content})
+	}
+	return blocks
 }
 
 func (c *anthropicClient) post(ctx context.Context, path string, body, out any) error {

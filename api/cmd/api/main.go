@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/docforge/api/internal/ai"
+	"github.com/docforge/api/internal/aidetect"
 	"github.com/docforge/api/internal/aisearch"
 	"github.com/docforge/api/internal/apikeys"
 	"github.com/docforge/api/internal/audit"
@@ -180,6 +181,19 @@ func main() {
 	}
 	t := templates.New(pool, store)
 	t.Queue = qc
+	// OCR is shared between docchat (text extraction for /extract-text
+	// and /ask) and aidetect (heuristic field detection for the static
+	// designer). Loaded once here so both consumers see the same
+	// PADDLE_OCR_URL / OCR_LANG / OCR_DPI knobs. Probe + log happen
+	// further down once the AI client is also up so the startup banner
+	// stays grouped.
+	ocrCfg := ocr.FromEnv()
+	// AI-assisted form-field detection is constructed further down
+	// (search for `aid := aidetect.New`) because its third tier needs
+	// the AI client, which is built later in main. The route mount
+	// happens unconditionally — a Disabled AI client + disabled OCR
+	// just means the cascade short-circuits at AcroForm.
+	var aid *aidetect.Handler
 	// Surface the org-level iframe-sandbox token in PreviewURL responses
 	// so the frontend's <iframe sandbox="..."> stays in lockstep with
 	// the active upload policy. Wired after upSvc is constructed below.
@@ -269,6 +283,13 @@ func main() {
 	logger.Info("ai", "enabled", aiClient.Enabled(), "provider", aiClient.Provider())
 	aiH := ai.NewHandler(aiClient)
 
+	// Form-field auto-detection cascade. Wired here (not earlier)
+	// because the third tier (vision-LLM) needs the AI client. When
+	// AI is disabled OR the active provider lacks vision capability
+	// the third tier silently no-ops — the OCR-disabled / AcroForm-
+	// only paths still work the same way.
+	aid = aidetect.New(pool, store, ocrCfg, aiClient)
+
 	// Tell the files handler to enqueue TaskEmbedFile from Complete()
 	// only when AI is on AND the active provider supports embeddings.
 	// Anthropic-only deployments keep search disabled (no Embed API);
@@ -295,19 +316,26 @@ func main() {
 	//
 	// OCR is layered on via WithOCR. When OCR_ENABLED is unset the call
 	// is a no-op so the docchat handler still 415s on scanned PDFs and
-	// images — exactly the behaviour pre-OCR. We probe the binaries on
-	// startup and log a clear warning if they're missing so an operator
-	// who flips the flag without installing tesseract+pdftoppm sees the
-	// problem immediately rather than per-request.
-	ocrCfg := ocr.FromEnv()
+	// images — exactly the behaviour pre-OCR. We probe the paddle-ocr
+	// sidecar on startup and log a clear warning if it's unreachable so
+	// an operator who flips the flag without bringing the sidecar up
+	// sees the problem immediately rather than per-request.
+	//
+	// ocrCfg itself is loaded earlier (above aidetect.New) because
+	// aidetect's heuristic tier also depends on it. We just probe and
+	// log here.
 	if ocrCfg.Enabled {
 		if err := ocrCfg.Probe(); err != nil {
 			logger.Warn("ocr.probe_failed",
 				"error", err.Error(),
-				"hint", "install tesseract-ocr and poppler-utils, or unset OCR_ENABLED")
+				"hint", "start the paddle-ocr sidecar (docker compose up paddle-ocr) or unset OCR_ENABLED")
 		} else {
 			logger.Info("ocr.enabled",
-				"lang", ocrCfg.Lang, "max_pages", ocrCfg.MaxPages, "dpi", ocrCfg.DPI)
+				"backend", "paddle-ocr",
+				"url", ocrCfg.BaseURL,
+				"lang", ocrCfg.Lang,
+				"max_pages", ocrCfg.MaxPages,
+				"dpi", ocrCfg.DPI)
 		}
 	}
 	// OCR profile registry + CRUD. The handler owns the DBRegistry
@@ -854,6 +882,11 @@ func main() {
 		r.Get("/v1/templates/{id}/widgets", t.ListWidgets)
 		r.Put("/v1/templates/{id}/widgets", t.ReplaceWidgets)
 		r.Put("/v1/templates/{id}/acroform/structure", t.UpdateAcroformStructure)
+
+		// AI auto-detect form fields. Returns proposed widgets only;
+		// the static designer's "Auto-detect" modal lets the user
+		// review/edit and then writes via the regular widgets PUT.
+		r.Post("/v1/templates/{id}/ai/detect-fields", aid.DetectFields)
 
 		// Image designer — runs the transform pipeline (crop / rotate /
 		// flip / resize / quality / upscale / filters) against the image

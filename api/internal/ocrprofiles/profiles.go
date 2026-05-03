@@ -1,10 +1,9 @@
 // Package ocrprofiles is the "document type" layer in front of the
-// raw tesseract pipeline. End users pick a profile ("Aadhaar", "PAN",
+// raw OCR pipeline. End users pick a profile ("Aadhaar", "PAN",
 // "Receipt", or one their org admin authored) in the UI and we
 // translate that into:
 //
-//  1. Tesseract knobs tuned for that document family (PSM, language,
-//     preprocess on/off).
+//  1. PaddleOCR knobs tuned for that document family (language).
 //  2. A small set of regex extractors that pull structured fields out
 //     of the raw OCR text — IDs, dates, amounts.
 //  3. An optional LLM cleanup prompt that re-reads the OCR text with
@@ -19,14 +18,16 @@
 // their own org. The list endpoint UNION-merges the two sets so a
 // user always sees built-ins followed by their org's customisations.
 //
-// # Why per-profile PSM matters
+// # PSM is deprecated
 //
-// Tesseract's default PSM 3 ("auto, no OSD") hedges across page
-// types and consistently misreads ID-card-shaped uniform text — PAN
-// and Aadhaar both improve dramatically under PSM 6 ("single uniform
-// block"). The profile knob lets us pick the right setting per
-// document type without making the operator-level OCR_PSM env
-// override do double-duty.
+// The previous tesseract backend exposed a per-profile PSM
+// (page-segmentation mode) knob because tesseract's auto mode misread
+// ID-card-shaped text and operators wanted to flip it to PSM 6
+// per-document-type. PaddleOCR auto-detects layout via its detection
+// model and has no equivalent — the PSM field on Profile is preserved
+// for source/DB compatibility but never sent to the OCR backend.
+// Migration 054 nulls out the column so the admin UI doesn't show
+// stale numbers.
 //
 // # DB vs hardcoded fallback
 //
@@ -73,15 +74,28 @@ type Profile struct {
 	// "id-card" → <IdCard /> and falls back to a generic document
 	// icon for unknown values.
 	Icon string `json:"icon"`
-	// Lang is the tesseract -l value to use. Empty → inherit from
-	// the operator's OCR_LANG default.
+	// Lang is the OCR language code to use. PaddleOCR ISO codes
+	// ("en", "hi", "ta", "ch", "ja", "ko", "fr", ...). Multi-language
+	// is "+"-joined for backwards compatibility with the previous
+	// tesseract config (e.g. "en+hi"); the sidecar splits and uses
+	// the primary. Empty → inherit from the operator's OCR_LANG
+	// default. Legacy tesseract codes ("eng", "hin", "tam") are
+	// auto-aliased by the sidecar.
 	Lang string `json:"lang,omitempty"`
-	// PSM is the tesseract --psm to use. -1 → inherit default.
+	// PSM is a deprecated compatibility field. PaddleOCR auto-detects
+	// layout — there's no equivalent of tesseract's page-segmentation
+	// mode. -1 means "no override"; any other value is preserved on
+	// the row but never sent to the OCR backend.
+	//
+	// Deprecated: ignored by the PaddleOCR backend; kept for source
+	// + DB compatibility through migration 054.
 	PSM int `json:"psm"`
-	// Preprocess overrides the imagemagick preprocessing toggle.
-	// nil → inherit. Pointer-to-bool (rather than tri-state int) so
-	// the JSON shape reads cleanly: omitted = inherit, true/false =
-	// explicit override.
+	// Preprocess was a tesseract-era flag controlling the imagemagick
+	// deskew/sharpen pass. PaddleOCR preprocesses internally so this
+	// is now a no-op — kept on the struct for source compatibility
+	// (admin UI still sees the field, sets it, and ignores it).
+	//
+	// Deprecated: ignored by the PaddleOCR backend.
 	Preprocess *bool `json:"preprocess,omitempty"`
 	// Fields is the ordered display list for the result table.
 	Fields []string `json:"fields,omitempty"`
@@ -391,15 +405,19 @@ func builtinSpecs() []rawSpec {
 			Name:        "Aadhaar Card",
 			Description: "Indian Aadhaar — front or back. Tuned for the 12-digit number, name, DOB, gender.",
 			Icon:        "id-card",
-			// eng+tam+hin: Aadhaars print labels in Tamil/Hindi alongside
-			// English. Running tesseract with "eng" alone forces it to
-			// fit Tamil glyphs to Latin letterforms, producing garbage
-			// fragments ("ee ee Me", "SS 53 omagiayh") that pollute
-			// the regex output and confuse the LLM cleanup. Requires
-			// `tesseract-ocr-tam` and `tesseract-ocr-hin` packs at
-			// deploy time. See migration 048 for the rollout note.
-			Lang:       "eng+tam+hin",
-			PSM:        6,
+			// en+hi+ta: Aadhaars print labels in Tamil/Hindi alongside
+			// English. PaddleOCR's sidecar splits on "+" and uses the
+			// primary language ("en" here) for the recognition pass —
+			// the trailing codes signal which extra engines we expect
+			// to be warmed up. The sidecar's warmup script pre-loads
+			// en/hi/ta at image build time so the first request after
+			// a deploy doesn't pay model-load latency.
+			//
+			// (Migration 054 rewrote this from the legacy "eng+tam+hin"
+			// tesseract codes; the sidecar still aliases the legacy
+			// codes for any DB rows that haven't been migrated yet.)
+			Lang:       "en+hi+ta",
+			PSM:        -1, // PaddleOCR auto-detects layout
 			Preprocess: boolPtr(true),
 			Fields:     []string{"aadhaar_number", "name", "dob", "gender"},
 			Extractors: map[string]string{

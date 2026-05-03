@@ -75,11 +75,27 @@ type Capabilities struct {
 	Vision bool `json:"vision"`
 }
 
-// ChatMessage is a minimal role/content pair. Extended later (tool
-// calls, image parts) without breaking callers.
+// ChatMessage is a minimal role/content pair plus optional image
+// parts for multimodal calls. Image parts are Go-only (json:"-") so
+// the wire format stays provider-specific — Anthropic wants a
+// content-blocks array, Ollama wants a top-level images field per
+// message, vLLM wants OpenAI image_url parts. Each provider's Chat
+// implementation translates as needed.
 type ChatMessage struct {
-	Role    string `json:"role"`    // "system" | "user" | "assistant"
-	Content string `json:"content"`
+	Role    string      `json:"role"`    // "system" | "user" | "assistant"
+	Content string      `json:"content"`
+	Images  []ImagePart `json:"-"`
+}
+
+// ImagePart is one image attached to a ChatMessage. Data is the raw
+// bytes (PNG/JPEG/etc.); MIME tells the provider how to label them
+// when base64-encoding for the wire. Providers that can't accept
+// images (or operators who haven't configured a vision model) will
+// either silently drop these parts or return ErrUnsupported — the
+// caller should gate on Capabilities().Vision before sending images.
+type ImagePart struct {
+	MIME string // "image/png", "image/jpeg", "image/webp"
+	Data []byte // raw bytes; provider base64-encodes as needed
 }
 
 // ChatRequest is provider-agnostic. We deliberately keep the surface

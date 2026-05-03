@@ -95,19 +95,32 @@ type ProfileDTO = {
   updatedAt?: string;
 };
 
-// PSM list from tesseract docs. -1 is our internal sentinel for
-// "inherit operator default"; 0 (osd-only) and 1 (auto+osd) are
-// excluded because they don't return text. The remaining values are
-// the ones a profile author would realistically pick.
-const PSM_CHOICES: Array<{ value: number; label: string }> = [
-  { value: -1, label: "Inherit (operator default)" },
-  { value: 3, label: "3 — Auto, no OSD (default)" },
-  { value: 4, label: "4 — Single column of variable text" },
-  { value: 6, label: "6 — Single uniform block (recommended for IDs)" },
-  { value: 7, label: "7 — Single text line" },
-  { value: 8, label: "8 — Single word" },
-  { value: 11, label: "11 — Sparse text" },
-  { value: 13, label: "13 — Raw line, no layout analysis" },
+// PaddleOCR language options surfaced in the editor. The sidecar
+// supports ~80 languages; we expose the ones we pre-warm + the
+// most-commonly-asked-for additional codes. Authors who need
+// something exotic can type any PaddleOCR ISO code directly into the
+// input fallback (the Select doesn't validate against this list at
+// submit time — the sidecar will reject unknown codes with a 400).
+//
+// Multi-language strings ("en+hi") are constructed by typing into the
+// free-text fallback shown when "Custom…" is picked; the sidecar
+// splits on "+" and uses the primary engine.
+const LANG_CHOICES: Array<{ value: string; label: string }> = [
+  { value: "", label: "Inherit (operator default)" },
+  { value: "en", label: "English (en)" },
+  { value: "hi", label: "Hindi (hi)" },
+  { value: "ta", label: "Tamil (ta)" },
+  { value: "en+hi", label: "English + Hindi (en+hi)" },
+  { value: "en+ta", label: "English + Tamil (en+ta)" },
+  { value: "en+hi+ta", label: "English + Hindi + Tamil (en+hi+ta)" },
+  { value: "ch", label: "Chinese — simplified (ch)" },
+  { value: "chinese_cht", label: "Chinese — traditional" },
+  { value: "japan", label: "Japanese (japan)" },
+  { value: "korean", label: "Korean (korean)" },
+  { value: "fr", label: "French (fr)" },
+  { value: "german", label: "German" },
+  { value: "es", label: "Spanish (es)" },
+  { value: "__custom__", label: "Custom…" },
 ];
 
 // Lucide icon string → component. The picker tiles in the designer use
@@ -130,7 +143,9 @@ function ProfileIcon({ name, className }: { name: string; className?: string }) 
   return <C className={className} />;
 }
 
-// Fresh DTO for "+ New profile". PSM=-1 = inherit, no overrides yet.
+// Fresh DTO for "+ New profile". PSM is a deprecated compat field
+// (PaddleOCR has no equivalent); we send -1 = "no override" so the
+// backend doesn't store stale data on new rows.
 function emptyDraft(): ProfileDTO {
   return {
     id: "",
@@ -306,8 +321,8 @@ export default function OcrProfilesPage() {
           <h1 className="text-2xl font-semibold tracking-tight">OCR profiles</h1>
           <p className="text-sm text-muted-foreground">
             Document-type presets the Extract Text picker reads from.
-            Each profile bundles tesseract knobs, regex extractors, and an
-            optional LLM cleanup prompt.
+            Each profile bundles PaddleOCR knobs (language), regex
+            extractors, and an optional LLM cleanup prompt.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -541,14 +556,6 @@ function ProfileEditor({
     set({ extractors: next });
   };
 
-  const canTogglePreprocess = value.preprocess !== undefined;
-  const preprocessValue: "inherit" | "on" | "off" =
-    value.preprocess === null || value.preprocess === undefined
-      ? "inherit"
-      : value.preprocess
-        ? "on"
-        : "off";
-
   // Slug is immutable post-create — surface that with a disabled input
   // rather than removing the field entirely so users see what slug a
   // row was saved with.
@@ -563,7 +570,7 @@ function ProfileEditor({
           </DialogTitle>
           <DialogDescription>
             {isNew
-              ? "Configure tesseract knobs and field extractors for a new document type."
+              ? "Configure OCR language and field extractors for a new document type."
               : "Slug cannot be changed — clients persist it in localStorage."}
           </DialogDescription>
         </DialogHeader>
@@ -605,7 +612,7 @@ function ProfileEditor({
             />
           </div>
 
-          <div className="grid grid-cols-3 gap-3">
+          <div className="grid grid-cols-2 gap-3">
             <div className="space-y-1.5">
               <Label htmlFor="icon">Icon</Label>
               <Select
@@ -629,53 +636,59 @@ function ProfileEditor({
             </div>
             <div className="space-y-1.5">
               <Label htmlFor="lang">Language</Label>
-              <Input
-                id="lang"
-                value={value.lang ?? ""}
-                onChange={(e) => set({ lang: e.target.value })}
-                placeholder="eng (blank = inherit)"
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="psm">Page-segmentation mode</Label>
+              {/* PaddleOCR language picker. The "Custom…" entry flips
+                  the dropdown to a free-text input so authors can pick
+                  any code the sidecar accepts (full list ~80 langs)
+                  without us baking the entire menu in. */}
               <Select
-                value={String(value.psm)}
-                onValueChange={(v) => set({ psm: Number(v) })}
+                value={
+                  LANG_CHOICES.some((c) => c.value === (value.lang ?? ""))
+                    ? value.lang ?? ""
+                    : "__custom__"
+                }
+                onValueChange={(v) => {
+                  if (v === "__custom__") {
+                    // Seed with current value (or empty) and let the
+                    // input below take over.
+                    set({ lang: value.lang ?? "" });
+                  } else {
+                    set({ lang: v });
+                  }
+                }}
               >
-                <SelectTrigger id="psm">
+                <SelectTrigger id="lang">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {PSM_CHOICES.map((c) => (
-                    <SelectItem key={c.value} value={String(c.value)}>
+                  {LANG_CHOICES.map((c) => (
+                    <SelectItem key={c.value} value={c.value}>
                       {c.label}
                     </SelectItem>
                   ))}
                 </SelectContent>
               </Select>
+              {/* Custom-code fallback. Shown whenever the current value
+                  isn't one of the canned options — covers both an
+                  explicit "Custom…" pick and an admin who pasted a code
+                  the platform doesn't pre-list. */}
+              {!LANG_CHOICES.some((c) => c.value === (value.lang ?? "")) && (
+                <Input
+                  value={value.lang ?? ""}
+                  onChange={(e) => set({ lang: e.target.value })}
+                  placeholder="PaddleOCR code (e.g. ar, ru, vi)"
+                  className="mt-1.5"
+                />
+              )}
             </div>
           </div>
 
-          <div className="space-y-1.5">
-            <Label>Imagemagick preprocessing</Label>
-            <Select
-              value={preprocessValue}
-              onValueChange={(v) =>
-                set({
-                  preprocess: v === "inherit" ? null : v === "on",
-                })
-              }
-            >
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="inherit">Inherit operator default</SelectItem>
-                <SelectItem value="on">Force on (deskew + denoise)</SelectItem>
-                <SelectItem value="off">Force off (already-rectified scans)</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
+          {/* Page-segmentation mode and Imagemagick preprocessing were
+              tesseract-era knobs that no longer apply — PaddleOCR
+              auto-detects layout and preprocesses internally. We keep
+              the Profile DTO fields for API/DB compatibility but hide
+              the editor UI so authors don't waste time tuning dead
+              settings. New rows ship with psm=-1 / preprocess=null;
+              migration 054 reset existing rows. */}
 
           {/* Display fields — ordered list, drives the result-table column
               order. Empty rows are stripped at save time so the user can

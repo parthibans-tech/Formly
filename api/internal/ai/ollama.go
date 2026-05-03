@@ -18,6 +18,7 @@ package ai
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -60,10 +61,21 @@ func (c *ollamaClient) Capabilities() Capabilities {
 }
 
 type ollamaChatReq struct {
-	Model    string        `json:"model"`
-	Messages []ChatMessage `json:"messages"`
-	Stream   bool          `json:"stream"`
-	Options  map[string]any `json:"options,omitempty"`
+	Model    string          `json:"model"`
+	Messages []ollamaMessage `json:"messages"`
+	Stream   bool            `json:"stream"`
+	Options  map[string]any  `json:"options,omitempty"`
+}
+
+// ollamaMessage matches the wire shape Ollama's /api/chat expects.
+// Differs from the public ChatMessage in two ways: omits the Go-only
+// Images []ImagePart field, and adds an Images []string field that
+// Ollama populates with base64-encoded image bytes per message (one
+// of the few non-OpenAI-shaped chat APIs).
+type ollamaMessage struct {
+	Role    string   `json:"role"`
+	Content string   `json:"content"`
+	Images  []string `json:"images,omitempty"`
 }
 
 type ollamaChatResp struct {
@@ -81,7 +93,7 @@ func (c *ollamaClient) Chat(ctx context.Context, req ChatRequest) (ChatResponse,
 	}
 	body := ollamaChatReq{
 		Model:    model,
-		Messages: req.Messages,
+		Messages: ollamaMessages(req.Messages),
 		Stream:   false,
 	}
 	if req.Temperature > 0 || req.MaxTokens > 0 {
@@ -122,6 +134,24 @@ func (c *ollamaClient) Embed(ctx context.Context, req EmbedRequest) (EmbedRespon
 		return EmbedResponse{}, fmt.Errorf("ollama embed: %w", err)
 	}
 	return EmbedResponse{Embedding: out.Embedding, Model: model}, nil
+}
+
+// ollamaMessages translates the public ChatMessage slice into the
+// Ollama wire shape. Image bytes are base64-encoded; the MIME prefix
+// is dropped because Ollama infers from the bytes.
+func ollamaMessages(in []ChatMessage) []ollamaMessage {
+	out := make([]ollamaMessage, 0, len(in))
+	for _, m := range in {
+		om := ollamaMessage{Role: m.Role, Content: m.Content}
+		if len(m.Images) > 0 {
+			om.Images = make([]string, 0, len(m.Images))
+			for _, img := range m.Images {
+				om.Images = append(om.Images, base64.StdEncoding.EncodeToString(img.Data))
+			}
+		}
+		out = append(out, om)
+	}
+	return out
 }
 
 func (c *ollamaClient) post(ctx context.Context, path string, body, out any) error {

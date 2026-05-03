@@ -21,17 +21,17 @@ import (
 	"github.com/docforge/api/internal/ocr"
 )
 
-// bogusOCR builds an OCR config that's enabled but points at fake
-// binary paths and has a real (non-zero) per-page timeout so the
-// underlying exec.CommandContext doesn't fire its deadline before
-// even running. Tests that want to assert "OCR was attempted" use
-// this config and check for any OCR-shaped error in the result.
+// bogusOCR builds an OCR config that's enabled but points at a
+// localhost port nothing's listening on, with a real (non-zero)
+// per-page timeout so the HTTP client gets a fast connection-refused
+// error rather than blocking on a deadline. Tests that want to
+// assert "OCR was attempted" use this config and check for any
+// OCR-shaped error in the result.
 func bogusOCR() ocr.Config {
 	return ocr.Config{
 		Enabled:        true,
-		TesseractBin:   "/nope/tesseract",
-		PdftoppmBin:    "/nope/pdftoppm",
-		Lang:           "eng",
+		BaseURL:        "http://127.0.0.1:1", // refused fast
+		Lang:           "en",
 		MaxPages:       1,
 		DPI:            72,
 		PerPageTimeout: 5 * time.Second,
@@ -39,21 +39,21 @@ func bogusOCR() ocr.Config {
 }
 
 // looksLikeOCRError returns true for any error message that could only
-// come from the OCR path — exec failures on the bogus binary, LookPath
-// misses, or our own sentinel errors.
+// come from the OCR path — sidecar unreachable, sidecar HTTP error,
+// or our own sentinel errors.
 func looksLikeOCRError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, ocr.ErrTesseractMissing) || errors.Is(err, ocr.ErrPdftoppmMissing) {
+	if errors.Is(err, ocr.ErrSidecarUnavailable) {
 		return true
 	}
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "tesseract") ||
-		strings.Contains(msg, "pdftoppm") ||
-		strings.Contains(msg, "ocr ") ||
-		strings.Contains(msg, "rasterize") ||
-		strings.Contains(msg, "/nope")
+	return strings.Contains(msg, "ocr ") ||
+		strings.Contains(msg, "sidecar") ||
+		strings.Contains(msg, "paddle") ||
+		strings.Contains(msg, "127.0.0.1:1") ||
+		strings.Contains(msg, "connection refused")
 }
 
 // pdfToTextStub / imageToTextStub are method-shaped helpers that

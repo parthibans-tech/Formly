@@ -28,8 +28,9 @@
  * is persisted in localStorage so the next click on a similar file
  * inherits it. The chosen profile drives:
  *
- *   - Tesseract knobs (PSM, language, preprocessing) tuned for that
- *     document family.
+ *   - PaddleOCR knobs (language) tuned for that document family.
+ *     Legacy PSM / preprocess flags from the tesseract era are still
+ *     on the DTO for compat but ignored by the backend.
  *   - Regex extractors that pull structured fields (Aadhaar number,
  *     name, DOB) out of the raw OCR.
  *   - An optional LLM cleanup pass that fixes O↔0 / I↔1 mistranscriptions

@@ -15,7 +15,7 @@ const ITEMS = [
   },
   {
     q: "Do you support OCR and scanned PDFs?",
-    a: "Yes. Tesseract + poppler power the OCR pipeline; combined with the AI extract step you can pull structured fields out of scans, IDs, and receipts, with per-field confidence and a human review queue.",
+    a: "Yes. PaddleOCR (PP-OCRv4 detection + recognition) powers the OCR pipeline; combined with the AI extract step you can pull structured fields out of scans, IDs, and receipts, with per-field confidence and a human review queue.",
   },
   {
     q: "What about embedding forms on our own site?",
