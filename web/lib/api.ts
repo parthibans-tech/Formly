@@ -183,9 +183,36 @@ export async function api<T = any>(path: string, init: RequestInit = {}): Promis
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: { message: res.statusText } }));
     const err = body.error ?? {};
+    const code = err.code ?? "request_failed";
+    // Auto-logout on session-expiry style 401s. Without this the UI
+    // keeps the dead token in localStorage, every subsequent request
+    // 401s the same way, and the user sees a "session expired" toast
+    // on every click instead of being kicked back to the login page.
+    //
+    // We carve out `invalid_credentials` (wrong password on /login)
+    // and `invalid_mfa` (wrong TOTP code) — those are 401s for a user
+    // who's actively trying to sign in, not a stale-session signal.
+    // Already on /login? Skip the redirect to avoid a self-loop.
+    if (
+      res.status === 401 &&
+      code !== "invalid_credentials" &&
+      code !== "invalid_mfa" &&
+      typeof window !== "undefined"
+    ) {
+      clearSession();
+      const here = window.location.pathname + window.location.search;
+      if (!window.location.pathname.startsWith("/login")) {
+        // `next=` lets the login page bounce the user back to the page
+        // they were on. encodeURIComponent because pathnames can carry
+        // query string + hash characters that would otherwise corrupt
+        // the redirect URL.
+        const next = encodeURIComponent(here);
+        window.location.replace(`/login?next=${next}`);
+      }
+    }
     throw new ApiError(
       res.status,
-      err.code ?? "request_failed",
+      code,
       err.message ?? "request failed",
       body,
       Array.isArray(err.fields) ? err.fields : undefined
